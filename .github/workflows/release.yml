@@ -1,0 +1,278 @@
+name: release
+
+# push main 自动发版：patch 自增 → 写回 appVersion → 多平台构建 → 打 tag → Release。
+#
+# 为什么构建放在这里、而不是复用 go-binaries.yml：
+#   `GITHUB_TOKEN` 推送的 tag **不会触发**任何其他 workflow。若本文件只负责打 tag，
+#   go-binaries 的 tag 触发永远不会跑，Release 会是一个没有附件的空壳。
+#   所以打 tag、构建、上传必须在同一个 run 里完成。
+#
+# 与 go-binaries.yml 的分工：
+#   - 本文件：push main → 自动 patch+1 → 构建 → 打 tag → Release
+#   - go-binaries.yml：PR / push main 的构建验证 + **人工 tag** 的发版路径
+#   两者都监听 tag 会重复发布，所以本文件刻意不监听 tags。
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要补发的 tag（须已存在，如 v1.13.0）；留空则按 patch 自增'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+# 同一分支串行：并发发版会各自读到同一个 tag 再各自自增，必然撞版本。
+# 不能改成按 sha 分组——那会丢掉「同一分支串行」这层保护。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # prepare 把「算版本 + 写回版本号 + 提交」合成一个 job。
+  # 拆成两个 job 时，bump 被 skip（补发模式）会级联 skip 依赖它的 test/build。
+  prepare:
+    runs-on: ubuntu-latest
+    # 逃生阀：bump 提交自身带 [skip release]（否则 bump → 新 push → 再发版，无限循环）。
+    # workflow_dispatch 没有 head_commit，用 || '' 兜底。
+    if: ${{ !contains(github.event.head_commit.message || '', '[skip release]') }}
+    outputs:
+      version: ${{ steps.ver.outputs.version }}   # 1.13.1（无 v 前缀）
+      tag: ${{ steps.ver.outputs.tag }}           # v1.13.1
+      prev: ${{ steps.ver.outputs.prev }}
+      mode: ${{ steps.ver.outputs.mode }}         # auto | tag
+      # bump 之后的提交（补发模式下 commit 被 skip，回落到 resolve 的 sha）
+      sha: ${{ steps.commit.outputs.sha || steps.ver.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # 缺这个拿不到历史 tag，版本号永远是 v0.0.1
+          ref: ${{ github.sha }}  # 分支 push 必须钉住 sha：github.ref 是会移动的分支指针
+
+      - name: Resolve version
+        id: ver
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          HEAD_SHA="$(git rev-parse HEAD)"
+
+          # 上一个版本 tag（只认 vX.Y.Z，别把 latest 这类滚动指针算进来）
+          PREV="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)"
+
+          # 补发模式：锁定指定 tag，不递增、不改代码
+          if [ -n "${INPUT_TAG}" ]; then
+            echo "mode=tag" >> "$GITHUB_OUTPUT"
+            echo "tag=${INPUT_TAG}" >> "$GITHUB_OUTPUT"
+            echo "version=${INPUT_TAG#v}" >> "$GITHUB_OUTPUT"
+            echo "prev=${PREV}" >> "$GITHUB_OUTPUT"
+            echo "sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 冷启动：仓库零 tag 时用源码 appVersion 作基线。
+          # 直接按 v0.0.0 起算会把已经在跑的 1.13.0 倒退成 0.0.1。
+          if [ -z "$PREV" ]; then
+            SRC="$(grep -oP 'appVersion = "\K[^"]+' cmd/server/main.go | sed 's/-panel$//')"
+            PREV="v${SRC}"
+            echo "冷启动：无历史 tag，基线取 appVersion=${SRC}"
+          fi
+
+          CORE="${PREV#v}"
+          CORE="${CORE%%[-+]*}"          # 剥掉 -rc.1 之类后缀，否则算术会炸
+          MAJOR="${CORE%%.*}"
+          REST="${CORE#*.}"
+          MINOR="${REST%%.*}"
+          PATCH="${REST#*.}"
+          VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          TAG="v${VERSION}"
+
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::tag ${TAG} 已存在（并发发版，或有人手打了同一版本）"
+            exit 1
+          fi
+
+          echo "mode=auto" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "prev=${PREV}" >> "$GITHUB_OUTPUT"
+          echo "sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          echo "next=${TAG}（基线 ${PREV}）"
+
+      - name: 写回 appVersion 并提交
+        if: steps.ver.outputs.mode == 'auto'
+        id: commit
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # tag 与 appVersion 必须同步：go-binaries.yml 的 publish 会断言
+          # tag == appVersion（剥 -panel 后）。只打 tag 会让二进制自报旧版本。
+          sed -i "s/appVersion = \"[^\"]*\"/appVersion = \"${VERSION}-panel\"/" cmd/server/main.go
+          grep -n 'appVersion =' cmd/server/main.go
+
+          if git diff --quiet; then
+            echo "appVersion 已是 ${VERSION}，跳过提交（幂等）"
+            echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # runner 没有全局 git 身份，commit / annotated tag 都需要
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add cmd/server/main.go
+          # [skip release] 让这次 push 不再触发本 workflow（否则 bump 会自激）
+          git commit -m "chore(release): ${TAG} [skip release]"
+          # checkout 按 sha 检出是 detached HEAD，本地没有 main 分支，必须 HEAD:main
+          git push origin HEAD:main
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test ./...
+
+  build:
+    needs: [prepare, test]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: windows, goarch: amd64 }
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: 构建
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: go build -trimpath -ldflags "-s -w" -o "wb2api${{ matrix.goos == 'windows' && '.exe' || '' }}" ./cmd/server
+
+      - name: 断言二进制版本串
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          GOOS: ${{ matrix.goos }}
+        run: |
+          BIN="wb2api${{ matrix.goos == 'windows' && '.exe' || '' }}"
+          if ! grep -qa "${VERSION}" "$BIN"; then
+            echo "::error::binary missing version string ${VERSION}"
+            exit 1
+          fi
+
+      - name: 打包
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          case "${GOOS}" in
+            windows)
+              NAME="wb2api-panel-v${VERSION}-windows-amd64.zip"
+              zip -q "$NAME" wb2api.exe config.example.json README.md
+              ;;
+            *)
+              NAME="wb2api-panel-v${VERSION}-${GOOS}-${GOARCH}.tar.gz"
+              tar czf "$NAME" wb2api config.example.json README.md
+              ;;
+          esac
+          echo "name=${NAME}" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.name }}
+          path: ${{ env.name }}
+          retention-days: 7
+
+  release:
+    needs: [prepare, test, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify dist
+        run: |
+          set -euo pipefail
+          ls -la dist
+          # 空目录会让 gh release create 直接报错，提前给出可读原因
+          test -n "$(find dist -type f | head -n1)" || { echo "::error::dist/ 为空"; exit 1; }
+          cd dist && sha256sum *.zip *.tar.gz > checksums.txt
+
+      - name: 打 tag + 建 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PREV: ${{ needs.prepare.outputs.prev }}
+          MODE: ${{ needs.prepare.outputs.mode }}
+        run: |
+          set -euo pipefail
+
+          # 幂等：同一个 tag 重跑不应变红（补发/失败重试都依赖这条）
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release ${TAG} 已存在，跳过创建"
+            exit 0
+          fi
+
+          if [ "$MODE" = "auto" ]; then
+            if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+              echo "::error::tag ${TAG} 已存在但 Release 不存在，请人工核查（可能上次推到一半失败）"
+              exit 1
+            fi
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$TAG" -m "release ${TAG}"
+            git push origin "$TAG"
+          fi
+
+          # changelog：左端点是上一个版本 tag，右端点是本次构建的提交
+          END="$(git rev-parse HEAD)"
+          if [ -n "$PREV" ] && git rev-parse -q --verify "refs/tags/${PREV}" >/dev/null; then
+            RANGE="${PREV}..${END}"
+          else
+            RANGE="--max-count=50 ${END}"   # 首个 release：全量历史太长
+          fi
+
+          {
+            echo "## ${TAG}"
+            echo
+            git log --no-merges --pretty='- %s (%h)' $RANGE
+            if [ -n "$PREV" ]; then
+              echo
+              echo "**Full Changelog**: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${PREV}...${TAG}"
+            fi
+          } > notes.md
+          cat notes.md
+
+          gh release create "$TAG" dist/* \
+            --title "wb2api-panel ${TAG}" \
+            --notes-file notes.md
