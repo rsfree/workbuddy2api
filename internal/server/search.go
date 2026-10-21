@@ -101,8 +101,13 @@ func (h *Handler) runSearch(ctx context.Context, query string, maxResults int, m
 		}
 
 		// 记账：搜索没有 chatStat，账号信息直接写进 trace，面板才能看出「这次搜索用了哪个号」。
+		// 出口一并记下：搜索同样走该账号的出口绑定，「配了代理但没生效」在搜索路径上
+		// 也得能从日志看出来。
 		if tr := requestTraceFromContext(ctx); tr != nil {
 			tr.account = logfmt.Label(acct.UID, acct.Nickname)
+			if h.cfg.Upstream != nil {
+				tr.egress = h.cfg.Upstream.EgressLabel(acct)
+			}
 		}
 		// meta 在循环外构造（会话头透传 + 轮级聚合键），此处直接复用：
 		// 同一次搜索的换号重试属于同一请求，必须复用同一组会话 ID。

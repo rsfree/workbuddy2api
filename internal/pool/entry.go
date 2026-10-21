@@ -71,6 +71,10 @@ type ExpiryBucket struct {
 type Status struct {
 	UID          string `json:"uid"`
 	Nickname     string `json:"nickname,omitempty"`
+	// Egress 该账号当前绑定的出口标签（local 模式=源 IP，代理模式=proxy:host，
+	// 未启用/回落直连=direct）。由 main 注入的解析器填充，只读展示、不参与选号。
+	// 槽位由身份哈希决定，因此长期稳定；唯一例外是出口冷却时按顺延地址顶上。
+	Egress       string `json:"egress,omitempty"`
 	Credits      int64  `json:"credits"`
 	CreditsTotal int64  `json:"credits_total,omitempty"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）
 	// CreditsExpiring / CreditsEarliestExpiry / CreditsEarliestRemaining 描述当前积分中

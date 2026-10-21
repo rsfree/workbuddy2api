@@ -236,3 +236,47 @@ func isEgressError(err error) bool {
 	}
 	return false
 }
+
+// EgressLabel 返回该账号本次请求的出口标签，供请求流水行与面板展示。
+//
+// 取值语义（「代理有没有生效」就看这一列）：
+//   - "direct"：未启用出口隔离，或解析失败回落直连——出现它即说明本次请求没走专属出口；
+//   - "<ip>"：local 模式绑定的源地址（真实出口 IP）；
+//   - "proxy:<host>" / "proxy:<host>/<user>"：代理模式的入口与身份（用户名即出口键）。
+//
+// 与 bindFor 同源同算法，因此出口冷却顺延时标签跟着变——展示的永远是**本次真实出口**。
+func (c *Client) EgressLabel(a *auth.Auth) string {
+	if a == nil {
+		return "direct"
+	}
+	return c.EgressLabelFor(a.UID, a.Nickname, a.Group())
+}
+
+// EgressLabelFor 是 EgressLabel 的原始参数版本：panel/pool 侧按 uid 反查出口时用
+// （它们不持有 *auth.Auth，也不该为了展示去读凭证）。
+func (c *Client) EgressLabelFor(uid, nickname, group string) string {
+	r := c.egress.Load()
+	if r == nil || !r.Enabled() {
+		return "direct"
+	}
+	b, err := r.Bind(uid, nickname, group)
+	if err != nil {
+		return "direct"
+	}
+	return egressLabelOf(b)
+}
+
+// egressLabelOf 把绑定渲染成稳定短标签（不含口令）。
+func egressLabelOf(b egress.Binding) string {
+	switch {
+	case b.Proxy != nil:
+		if u := b.Proxy.User; u != nil && u.Username() != "" {
+			return "proxy:" + b.Proxy.Host + "/" + u.Username()
+		}
+		return "proxy:" + b.Proxy.Host
+	case b.LocalIP != nil:
+		return b.LocalIP.String()
+	default:
+		return "direct"
+	}
+}

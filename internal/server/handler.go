@@ -848,6 +848,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.uid = acct.UID
 		// 同步昵称：请求流水行只写 uid8 时无法直观看是哪一号，昵称随本次选号带入日志行。
 		st.nick = acct.Nickname
+		// 出口标签：本次请求真实从哪个出口出去（src 是入口，这是出口）。
+		// 只读解析，不发请求；未启用出口策略时得到 "direct"。
+		if h.cfg.Upstream != nil {
+			st.egress = h.cfg.Upstream.EgressLabel(acct)
+		}
 		if crossRealm && h.cfg.Upstream != nil && acct.Realm() != realm {
 			// 跨域回退命中：按实际服务域取积分倍率，用量/账本记的是真实域口径，
 			// 而不是请求前缀声明的域。

@@ -145,6 +145,9 @@ func main() {
 	}
 	eg := egress.New(egressCfg)
 	up.SetEgress(eg)
+	// 面板/状态接口的「出口」列：把 upstream 的出口解析器接进 pool（只读透出，不参与选号）。
+	// 不接也不会报错——只是 /status 里没有 egress 字段、面板那行不显示。
+	p.SetEgressLabel(up.EgressLabelFor)
 	logEgressSummary(eg, p)
 
 	// 积分保底的「收费」兜底判据：接上游模型目录的积分倍率表。本地实测台账无观测

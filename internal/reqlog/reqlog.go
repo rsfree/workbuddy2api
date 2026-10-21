@@ -80,10 +80,17 @@ type Event struct {
 	HasCredit        bool      `json:"credit_known"`
 	// CacheHitTokens / CacheMissTokens 上游前缀缓存命中/未命中 token（issue #92）。
 	// 上游未回该维度时两者皆零值省略；hit=0 + miss>0 即整段未命中。
-	CacheHitTokens  int64 `json:"cache_hit_tokens,omitempty"`
-	CacheMissTokens int64 `json:"cache_miss_tokens,omitempty"`
-	ClientIP         string    `json:"client_ip,omitempty"`
-	UserAgent        string    `json:"user_agent,omitempty"`
+	CacheHitTokens  int64  `json:"cache_hit_tokens,omitempty"`
+	CacheMissTokens int64  `json:"cache_miss_tokens,omitempty"`
+	ClientIP        string `json:"client_ip,omitempty"`
+	UserAgent       string `json:"user_agent,omitempty"`
+	// Egress 本次请求**实际走出去**的出口标签（出口隔离的落地证据）。
+	// 与 ClientIP 是相反方向：ClientIP 是谁调进来，Egress 是从哪个出口出去。
+	// 取值：local 模式是绑定的源地址（"154.40.45.140"）；代理模式是
+	// "proxy:<host>"（带用户名时 "proxy:<host>/<user>"）；未启用出口策略或解析
+	// 失败回落直连是 "direct"。看到 direct 就说明这一请求没走专属出口——排查
+	// 「代理配了但没生效」的第一现场。旧归档行没有该字段（omitempty）。
+	Egress string `json:"egress,omitempty"`
 }
 
 // Filter 用于从归档中筛选最近记录。字符串字段一律「包含」匹配（大小写不敏感），
@@ -95,6 +102,7 @@ type Filter struct {
 	Model     string
 	ClientIP  string
 	UserAgent string
+	Egress    string
 	From      time.Time
 	To        time.Time
 }
@@ -583,6 +591,9 @@ func (f Filter) match(e Event) bool {
 		return false
 	}
 	if !containsFold(e.UserAgent, f.UserAgent) {
+		return false
+	}
+	if !containsFold(e.Egress, f.Egress) {
 		return false
 	}
 	if !f.From.IsZero() && e.Time.Before(f.From) {

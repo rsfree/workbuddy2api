@@ -596,6 +596,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		// 普通软冷却（无模型级表）/硬冷却不产生台账（零回归）。
 		RateLimitedModels:        p.rateLimitedModelsLocked(e, now),
 		Realm:                    e.a.Realm(),
+		Egress:                   p.egressLabelOf(e),
 		Enterprise:               e.a.IsEnterprise(),
 		Nickname:                 e.a.Nickname,
 		Credits:                  e.credits,

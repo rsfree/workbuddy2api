@@ -435,7 +435,7 @@ function renderAccounts(list) {
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div>' + (s.egress ? '<div class="id egress" title="出口 ' + esc(s.egress) + '">出口 ' + esc(s.egress) + '</div>' : '') + '</td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -993,7 +993,7 @@ function reqMatch(e, f) {
   f = f || reqFilter;
   if (f.outcome && String(e && e.outcome || '') !== f.outcome) return false;
   if (f.q) {
-    const text = [e && e.client_ip, e && e.user_agent, e && e.model, e && e.account, e && e.request_id]
+    const text = [e && e.client_ip, e && e.egress, e && e.user_agent, e && e.model, e && e.account, e && e.request_id]
       .filter(Boolean).join(' ').toLowerCase();
     for (const kw of f.q.toLowerCase().split(/\s+/).filter(Boolean)) {
       if (!text.includes(kw)) return false;
@@ -1032,6 +1032,10 @@ function renderRequestTable() {
   tb.innerHTML = list.map(e => {
     const when = e && e.time ? new Date(e.time).toLocaleTimeString('zh-CN', { hour12: false }) : '—';
     const ip = e && e.client_ip ? e.client_ip : '';
+    // 出口 IP：与来源 IP 是相反方向（来源=谁调进来，出口=从哪出去）。同一列里
+    // 第二行展示，避免再加一列撑宽表格 / 打乱移动端按列序写死的栅格。
+    const eg = e && e.egress ? e.egress : '';
+    const egCls = eg === 'direct' ? 'egress off' : 'egress';
     const ua = e && e.user_agent ? e.user_agent : '';
     const rid = e && e.request_id ? e.request_id : '';
     return '<tr title="' + esc(requestLogText(e)) + '">' +
@@ -1039,7 +1043,8 @@ function renderRequestTable() {
       '<td>' + reqOutcomeTag(e) + '</td>' +
       '<td>' + esc(e && e.model || '—') + '</td>' +
       '<td>' + esc(e && e.account || '—') + '</td>' +
-      '<td>' + (ip ? '<span class="clip ip" title="' + esc(ip) + '">' + esc(ip) + '</span>' : '<span class="muted">—</span>') + '</td>' +
+      '<td>' + (ip ? '<span class="clip ip" title="' + esc(ip) + '">' + esc(ip) + '</span>' : '<span class="muted">—</span>') +
+        (eg ? '<div class="' + egCls + '" title="出口 ' + esc(eg) + '">→ ' + esc(eg) + '</div>' : '') + '</td>' +
       '<td>' + (ua ? '<span class="clip" title="' + esc(ua) + '">' + esc(ua) + '</span>' : '<span class="muted">—</span>') + '</td>' +
       '<td class="num">' + fmtMs(e && e.duration_ms) + '</td>' +
       '<td class="num">' + reqTokenCell(e) + '</td>' +
@@ -1095,6 +1100,7 @@ function requestLogText(e) {
     e && e.model || '—',
     e && e.account || '—',
     e && e.client_ip || '—',
+    e && e.egress ? '出口 ' + e.egress : '',
     e && e.user_agent || '—',
     fmtMs(e && e.duration_ms),
     fmtTok(token) + ' tok',

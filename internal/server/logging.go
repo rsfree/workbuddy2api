@@ -66,6 +66,10 @@ type chatStat struct {
 	cacheMiss int64
 	hasCache  bool
 
+	// egress 本次请求的出口标签（"154.40.45.140" / "proxy:host" / "direct"）。
+	// 选号后由 upstream.EgressLabel 取值：与调用来源是**相反方向**，回答
+	// 「这个请求从哪个 IP 出去」。空 = 未采集（非 chat 路径 / 上游不可用）。
+	egress string
 	// 调用来源（客户端 IP / User-Agent）。空 = 未采集（logging.request_client_info
 	// 关闭，或非 chat 路径），展示层一律以 "-" 兜底。
 	clientIP  string
@@ -90,7 +94,7 @@ func (s *chatStat) done() {
 	}
 	s.logged = true
 	logChatRowEx(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.nick, s.status, s.toks,
-		s.requestID, s.outcome, s.attempts, s.credit, s.hasCredit, s.clientIP, s.userAgent)
+		s.requestID, s.outcome, s.attempts, s.credit, s.hasCredit, s.egress, s.clientIP, s.userAgent)
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -379,7 +383,9 @@ type requestTrace struct {
 	// model 非 chat 路径的模型标识（搜索写 "WorkBuddy搜索工具"）。chat 路径由
 	// chatStat.model 覆盖，二者不会同时生效。
 	model string
-	stat    *chatStat
+	stat  *chatStat
+	// egress 非 chat 路径的出口标签；chat 路径由 chatStat.egress 覆盖。
+	egress string
 	// 调用来源，进入 handler 时一次性采集（见 ServeHTTP / captureClientInfo）。
 	clientIP  string
 	userAgent string
@@ -477,6 +483,10 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		e.HasCredit = s.hasCredit
 		e.CacheHitTokens = s.cacheHit
 		e.CacheMissTokens = s.cacheMiss
+		e.Egress = s.egress
+	}
+	if e.Egress == "" {
+		e.Egress = t.egress
 	}
 	e.ClientIP = t.clientIP
 	e.UserAgent = t.userAgent
@@ -542,14 +552,18 @@ const (
 //     uid8 时人眼无法判断是哪个号，要辨认必须再查 auths/，排障多一跳；
 //   - toks<0 表示 usage 缺失，显示 "-"。
 func logChatRow(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int) {
-	logChatRowEx(ttfb, total, model, mode, uid, nick, status, toks, "", "", 0, 0, false, "", "")
+	logChatRowEx(ttfb, total, model, mode, uid, nick, status, toks, "", "", 0, 0, false, "", "", "")
 }
 
-// logChatRowEx 是带请求 ID、结果、重试、积分与调用来源字段的扩展流水行。旧调用保持
-// 原格式；requestID 非空时才追加扩展字段；来源两参均为空时不追加来源段。
+// logChatRowEx 是带请求 ID、结果、重试、积分、出口与调用来源字段的扩展流水行。旧调用
+// 保持原格式；requestID 非空时才追加扩展字段；egress/clientIP/userAgent 全空时不追加尾段。
+//
+// egress 是**出**口（本次请求从哪个源 IP / 代理出去），clientIP 是**入**口（谁调进来）。
+// 两者并排落一行，才能回答「出口隔离到底有没有生效」——此前只有 src，看到的是客户端
+// IP，配没配出口在流水里根本看不出来，只能翻启动日志的 [egress] 段人工对账。
 func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int,
 	requestID, outcome string, attempts int, credit float64, hasCredit bool,
-	clientIP, userAgent string) {
+	egress, clientIP, userAgent string) {
 	if !chatLogEnabled {
 		return
 	}
@@ -588,16 +602,24 @@ func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, stat
 		}
 		extra = fmt.Sprintf(" rid=%s | out=%s | try=%d | credit=%s |", requestID, outcome, attempts, creditField)
 	}
-	// 调用来源：IP 用可解析的裸值（便于 grep），UA 用 ShortUA 压缩后的客户端标签
-	// 并加引号（标签内可能含空格，如 `OpenAI/Python 1.30.0` 只会取到 OpenAI/Python）。
-	// 两者都未采集时不追加，旧行格式保持不变。
+	// 尾段：出口 + 调用来源。IP 用可解析的裸值（便于 grep），UA 用 ShortUA 压缩后的
+	// 客户端标签并加引号（标签内可能含空格，如 `OpenAI/Python 1.30.0` 只会取到
+	// OpenAI/Python）。三者都未采集时不追加，旧行格式保持不变。
+	// egress 排在 src 之前：先看「从哪出去」，再看「谁调进来」。
 	src := ""
+	fields := ""
+	if egress != "" {
+		fields = "egress=" + egress + " "
+	}
 	if clientIP != "" || userAgent != "" {
 		ua := "-"
 		if s := logfmt.ShortUA(userAgent); s != "" {
 			ua = `"` + s + `"`
 		}
-		src = fmt.Sprintf(" src=%s ua=%s |", dashIfEmpty(clientIP), ua)
+		fields += fmt.Sprintf("src=%s ua=%s", dashIfEmpty(clientIP), ua)
+	}
+	if fields = strings.TrimSpace(fields); fields != "" {
+		src = " " + fields + " |"
 	}
 	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | %s | TTFB=%s | tok=%s | %s | total=%.1fs |%s%s\n",
 		seq,

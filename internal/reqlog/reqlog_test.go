@@ -261,3 +261,47 @@ func TestArchivePruneHonorsSize(t *testing.T) {
 		t.Fatalf("remaining = %+v, want newest file only", entries)
 	}
 }
+
+// Egress 随事件落盘并可被 egress 过滤（包含匹配、大小写不敏感）。
+// 用途：面板按出口 IP 反查「这条请求是不是从预期出口出去的」。
+func TestArchiveFilterByEgress(t *testing.T) {
+	dir := t.TempDir()
+	r := New(Config{Enabled: true, Dir: dir, MaxBytes: 1 << 20, RetentionDays: 7})
+	base := time.Now().Add(-time.Minute)
+	rows := []Event{
+		{RequestID: "a", Status: 200, OK: true, Outcome: OutcomeSuccess, Egress: "154.40.45.140"},
+		{RequestID: "b", Status: 200, OK: true, Outcome: OutcomeSuccess, Egress: "38.246.255.95"},
+		{RequestID: "c", Status: 200, OK: true, Outcome: OutcomeSuccess, Egress: "direct"},
+	}
+	for i, e := range rows {
+		e.Time = base.Add(time.Duration(i) * time.Second)
+		r.Record(e)
+	}
+	r.Close()
+
+	got, err := r.ReadArchive(10, Filter{Egress: "154.40.45."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].RequestID != "a" || got[0].Egress != "154.40.45.140" {
+		t.Fatalf("egress filter = %+v", got)
+	}
+
+	// 大小写不敏感：面板搜索框直接透传用户输入。
+	got, err = r.ReadArchive(10, Filter{Egress: "DIRECT"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].RequestID != "c" {
+		t.Fatalf("egress filter (case-insensitive) = %+v", got)
+	}
+
+	// 不设 egress 谓词时三条全出（零过滤，不改变既有行为）。
+	got, err = r.ReadArchive(10, Filter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("unfiltered rows = %d, want 3", len(got))
+	}
+}

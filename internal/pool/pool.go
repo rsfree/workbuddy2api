@@ -94,11 +94,30 @@ type Pool struct {
 	strategies   RegionStrategies
 	accountOrder RegionAccountOrder
 	scheduling   map[string]scheduleCursor
+	// egressLabel 出口标签解析器（main 启动期注入；nil = /status 不输出出口字段）。
+	// pool 不依赖 upstream/egress 包（分层倒置），「出口怎么算」由注入方决定；
+	// 这里只透出、不参与选号，也不进状态快照落盘。
+	egressLabel func(uid, nickname, group string) string
 	// stopCh 关闭信号：Close 关闭它使 startFlusher 的后台 goroutine 退出。
 	// nil = 未启动 flusher（stateFp 为空时 New 不起 flusher）。
 	stopCh chan struct{}
 	// closeOnce 保证 Close 幂等（多次调用不重复 close channel）。
 	closeOnce sync.Once
+}
+
+// SetEgressLabel 注入出口标签解析器（main 启动期调用一次；nil = 不输出出口）。
+func (p *Pool) SetEgressLabel(fn func(uid, nickname, group string) string) {
+	p.mu.Lock()
+	p.egressLabel = fn
+	p.mu.Unlock()
+}
+
+// egressLabelOf 取账号的出口标签；调用方必须持有 p.mu（读锁即可）。
+func (p *Pool) egressLabelOf(e *entry) string {
+	if p.egressLabel == nil || e == nil || e.a == nil {
+		return ""
+	}
+	return p.egressLabel(e.a.UID, e.a.Nickname, e.a.Group())
 }
 
 // defaultBreaker* 熔断器默认参数（FreeBuff2API 参考口径）。
