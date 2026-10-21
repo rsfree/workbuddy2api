@@ -256,13 +256,52 @@ func TestPickAntiThunderingHerd(t *testing.T) {
 			counts[uid]++
 		}
 	}
-	// 选号必须覆盖多个账号，且最热门的账号不超过一半。
+	// 选号必须覆盖多个账号，且最热门的账号不得超过七成。
+	//
+	// 阈值从 50% 放宽到 70% 的实测依据：idle 补偿让「从未使用」的号权重为
+	// 1+5=6，而刚用过的号是 1+0=1 —— 并发窗口里出现「1 个新号 + 4 个刚用过」
+	// 是常态，此时新号的抽中概率就是 6/10 = 60%（实测 CI/Linux 54~56，
+	// macOS 50~56）。旧写锁版因为串行逐个消耗，把这份权重差距掩盖了；
+	// 读锁化后并发窗口诚实暴露了它，但这不是惊群——真正的惊群是 100 个请求
+	// 全砸同一个号（len(counts)==1 那条断言），而单号超过 70% 才说明权重
+	// 结构本身出了问题。
 	if len(counts) < 2 {
 		t.Fatalf("anti-thundering-herd failed: all %d picks hit %d account(s) %v", N, len(counts), counts)
 	}
 	for uid, n := range counts {
-		if n > N/2 {
-			t.Errorf("account %s picked %d/%d (>50%%): thundering herd", uid, n, N)
+		if n > N*7/10 {
+			t.Errorf("account %s picked %d/%d (>70%%): thundering herd", uid, n, N)
+		}
+	}
+}
+
+// 串行分布：关掉防撞号窗口后，加权随机本身必须能把请求铺开。
+// 与上面的并发用例互补——并发测的是「窗口内不会全砸一个」，这里测「权重抽签
+// 本身不偏科」（10 个等积分号，理想各 10%）。
+func TestPickWeightedSpreadSerially(t *testing.T) {
+	old := minPickGap
+	minPickGap = 0
+	t.Cleanup(func() { minPickGap = old })
+
+	p := New("")
+	defer p.Close()
+	for i := 0; i < 10; i++ {
+		p.Add(&auth.Auth{UID: fmt.Sprintf("c%02d", i)})
+	}
+
+	const N = 200
+	counts := map[string]int{}
+	for i := 0; i < N; i++ {
+		if a := p.Pick(); a != nil {
+			counts[a.UID]++
+		}
+	}
+	if len(counts) != 10 {
+		t.Fatalf("串行选号未覆盖全部账号: %d/10 %v", len(counts), counts)
+	}
+	for uid, n := range counts {
+		if n > N/5 {
+			t.Errorf("account %s picked %d/%d (>20%%): 加权抽签偏科", uid, n, N)
 		}
 	}
 }
