@@ -902,6 +902,21 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if errors.As(terr, &uerr) {
 			status = uerr.Status
 		}
+		// 出站链路故障（代理握手失败 / 本机源地址不可达）：**账号没有问题**。
+		// 不罚号、不喂熔断/连败，只让出口自己进冷却（upstream 侧已记账），本轮换号
+		// 继续——换号即换出口，是有意义的尝试。
+		if uerr != nil && uerr.Kind == upstream.ErrEgress {
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+			st.status = http.StatusBadGateway
+			lastErr = uerr
+			log.Printf("WARN: [server] egress failure acct=%s: %v (account not penalized, rotating to another exit)",
+				logfmt.Label(acct.UID, acct.Nickname), terr)
+			fail(acct.UID)
+			if !rotateBackoff(i, r.Context()) {
+				break
+			}
+			continue
+		}
 		if uerr == nil && terr != nil {
 			// 上游超时 / 停滞：**不换号、不罚号**。
 			//
@@ -1258,6 +1273,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 含 requestId，客户端按 SDK 退避重试即可。
 			code = "upstream_busy"
 			msg = "upstream capacity is full (queue.full); retry after a short wait"
+		case upstream.ErrEgress:
+			// 全部账号的出口都不通（代理层故障 / 本机地址全不可用）：
+			// 502 而非 503 —— 这是网关侧链路问题，不是「账号池暂时过载」，
+			// 客户端按 5xx 退避重试即可，不必换模型。
+			code = "egress_unavailable"
+			status = http.StatusBadGateway
 		case upstream.ErrModelBlocked:
 			// 11102「该后端无此模型」：上游原文（下方统一透传）已经写清了原因，但
 			// code 此前停在默认的 no_healthy_account —— 那是"服务端过载"的语义，

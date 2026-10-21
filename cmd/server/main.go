@@ -19,6 +19,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/egress"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -31,7 +32,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
 
-// appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
+// appVersion 网关版本（面板 + 任务体系），透出到 /panel/api/overview。
 const appVersion = "1.13.0-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
@@ -135,6 +136,16 @@ func main() {
 	}
 
 	up := upstream.New()
+
+	// 出口隔离（风控增强）：账号 → 出口 IP/代理 的确定性绑定。
+	// 默认 direct = 直连，老配置零行为变化。装配期一次性解析；改动需重启。
+	egressCfg, err := cfg.EgressConfig()
+	if err != nil {
+		log.Fatalf("egress config: %v", err)
+	}
+	eg := egress.New(egressCfg)
+	up.SetEgress(eg)
+	logEgressSummary(eg, p)
 
 	// 积分保底的「收费」兜底判据：接上游模型目录的积分倍率表。本地实测台账无观测
 	// 时用它判收费——否则「没学过」恒等于「放行」，高价新模型会把触底号一笔打穿
@@ -435,6 +446,58 @@ func warmModelRates(ctx context.Context, up *upstream.Client, p *pool.Pool) {
 	}
 }
 
+// logEgressSummary 启动日志：出口策略与「账号 → 出口」分配概览。
+//
+// 只打印出口标识与账号分布，绝不打印代理口令/盐——日志常被收集、粘贴到
+// issue，凭据一旦进日志就等于泄露。
+func logEgressSummary(eg *egress.Resolver, p *pool.Pool) {
+	if eg == nil {
+		return
+	}
+	if !eg.Enabled() {
+		if eg.Mode() == egress.ModeLocal {
+			log.Printf("WARN: [egress] local 模式未发现可用出口地址: %v（回落直连）", eg.LocalError())
+		}
+		return
+	}
+	switch eg.Mode() {
+	case egress.ModeLocal:
+		ips := eg.LocalIPs()
+		log.Printf("[egress] %s：按身份哈希分配出口（group_by=%s）", eg.Describe(), eg.GroupByMode())
+		perIP := map[string][]string{}
+		for _, st := range p.List() {
+			a := p.AuthByUID(st.UID)
+			if a == nil {
+				continue
+			}
+			b, err := eg.Bind(a.UID, a.Nickname, a.Group())
+			if err != nil || b.LocalIP == nil {
+				continue
+			}
+			k := b.LocalIP.String()
+			name := a.Nickname
+			if name == "" {
+				name = shortUID(a.UID)
+			}
+			perIP[k] = append(perIP[k], name)
+		}
+		for _, ip := range ips {
+			names := perIP[ip.String()]
+			log.Printf("[egress]   %-15s ← %d 账号 %v", ip.String(), len(names), names)
+		}
+	default:
+		log.Printf("[egress] %s：账号 → 出口确定性绑定", eg.Describe())
+	}
+}
+
+// shortUID 取 UID 前 8 位（日志里可读且不占宽）。
+func shortUID(uid string) string {
+	if len(uid) <= 8 {
+		return uid
+	}
+	return uid[:8]
+}
+
 // panelListenPath 从 listen 地址提取 ":port" 形式，用于启动日志拼面板 URL
 // （":7863" 或 "0.0.0.0:7863" → ":7863"；异常输入原样返回）。
 func panelListenPath(listen string) string {
@@ -588,6 +651,9 @@ func restartRequiredFields(c *Config) []string {
 	out = append(out, "session_sticky.ttl", "session_sticky.gc_interval")
 	out = append(out, "logging.request_archive_enabled", "logging.request_retention_days", "logging.request_archive_max_mb")
 	out = append(out, "server.read_timeout")
+	// 出口策略在装配期写进 upstream client（Transport 缓存/源地址绑定），
+	// 运行期不重读，改动需重启进程。
+	out = append(out, "egress")
 	return out
 }
 

@@ -122,7 +122,7 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
-	_, err = c.doJSON(req)
+	_, err = c.doJSON(a, req)
 	return err
 }
 
@@ -221,7 +221,7 @@ func (c *Client) SetAppearanceTheme(a *auth.Auth, resourceKey string) error {
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
-	_, err = c.doJSON(req)
+	_, err = c.doJSON(a, req)
 	return err
 }
 
@@ -290,7 +290,7 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
-	_, err = c.doJSON(req)
+	_, err = c.doJSON(a, req)
 	return err
 }
 
@@ -402,7 +402,7 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 	var out struct {
 		Experts []MarketExpert `json:"experts"`
 	}
-	data, err := c.doJSON(req)
+	data, err := c.doJSON(a, req)
 	if err != nil {
 		return nil, err
 	}
@@ -462,7 +462,7 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 			fmt.Printf("[dbg] %s: %s\n", k, req.Header.Get(k))
 		}
 	}
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.httpFor(a).Do(req)
 	if err != nil {
 		return "", "", err
 	}

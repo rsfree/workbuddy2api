@@ -37,7 +37,11 @@ type Auth struct {
 	UID          string
 	EnterpriseID string
 	Nickname     string
-	FilePath     string // 来源文件；refresh 后原子写回此处
+	// group 出口分组（auth 文件 account.group / 顶层 group）。
+	// 空 = 未分组，按账号维度分配出口。命名同 realm：持久化字段未导出，
+	// 跨包读取走 Group()，避免与未来可能的方法名冲突。
+	group    string
+	FilePath string // 来源文件；refresh 后原子写回此处
 
 	// DeviceToken 设备风控 Token（X-Device-Token 头），来源 auth 文件的 device_token 键。
 	// 缺省为空 = 不注入该头（容器内无桌面端 Turing SDK 的常见部署）。
@@ -51,6 +55,17 @@ func (a *Auth) Lock() { a.mu.Lock() }
 
 // Unlock 释放 a.Lock 获取的锁。
 func (a *Auth) Unlock() { a.mu.Unlock() }
+
+// Group 返回该账号的出口分组名（空 = 未分组）。
+//
+// 不加锁：group 只在 Parse/LoadDir 阶段写入，运行期只读（与 UID/Nickname 同
+// 生命周期语义），没有 refresh 会改写它。
+func (a *Auth) Group() string {
+	if a == nil {
+		return ""
+	}
+	return a.group
+}
 
 // AccessTokenValue 加锁读取 AccessToken（出站请求头一律经此取值，勿直读字段）。
 //
@@ -300,6 +315,7 @@ func Parse(raw []byte) (*Auth, error) {
 				UID          string `json:"uid"`
 				EnterpriseID string `json:"enterpriseId"`
 				Nickname     string `json:"nickname"`
+				Group        string `json:"group"`
 			} `json:"account"`
 			// DeviceToken 顶层 device_token（嵌套形与扁平形共用；手写时无需嵌进 auth 对象）。
 			DeviceToken string `json:"device_token"`
@@ -316,6 +332,7 @@ func Parse(raw []byte) (*Auth, error) {
 			UID:          n.Account.UID,
 			EnterpriseID: n.Account.EnterpriseID,
 			Nickname:     n.Account.Nickname,
+			group:        n.Account.Group,
 			DeviceToken:  n.DeviceToken,
 		}
 	} else {
@@ -328,6 +345,7 @@ func Parse(raw []byte) (*Auth, error) {
 			UID          string `json:"uid"`
 			EnterpriseID string `json:"enterpriseId"`
 			Nickname     string `json:"nickname"`
+			Group        string `json:"group"`
 			DeviceToken  string `json:"device_token"`
 		}
 		if err := json.Unmarshal(raw, &f); err != nil {
@@ -342,6 +360,7 @@ func Parse(raw []byte) (*Auth, error) {
 			UID:          f.UID,
 			EnterpriseID: f.EnterpriseID,
 			Nickname:     f.Nickname,
+			group:        f.Group,
 			DeviceToken:  f.DeviceToken,
 		}
 	}
@@ -379,6 +398,10 @@ func (a *Auth) SaveAtomic() error {
 	}
 	// DeviceToken 非空才写回顶层 device_token：避免在无该字段的旧文件里引入空键
 	// （保持与插件 OAuth 输出形状一致，插件读取忽略未知键）。
+	// group 非空才写回：避免在未分组的旧文件里引入空键（与 device_token 同纪律）。
+	if a.group != "" {
+		doc["account"].(map[string]any)["group"] = a.group
+	}
 	if a.DeviceToken != "" {
 		doc["device_token"] = a.DeviceToken
 	}

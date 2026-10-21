@@ -32,7 +32,7 @@ func (c *Client) FetchAccountProfile(a *auth.Auth) (string, error) {
 	if ua := c.userAgent(a); ua != "" {
 		req.Header.Set("User-Agent", ua)
 	}
-	data, err := c.doJSON(req)
+	data, err := c.doJSON(a, req)
 	if err != nil {
 		return "", err
 	}

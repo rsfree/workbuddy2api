@@ -98,7 +98,7 @@ func (c *Client) growthJSONMP(a *auth.Auth, method, path string, body any) (json
 	}
 	c.BillingHeaders(req, a)
 	req.Header.Set("X-Client-Platform", mpPlatform)
-	return c.doJSON(req)
+	return c.doJSON(a, req)
 }
 
 // AcceptTasksMP 接受小程序限定任务（mp 头；缺头实测 task not found）。
@@ -119,7 +119,7 @@ func (c *Client) ClaimRewardMP(a *auth.Auth, taskCode string) (credit, energy in
 	}
 	c.BillingHeaders(req, a)
 	req.Header.Set("X-Client-Platform", mpPlatform)
-	data, err := c.doJSON(req)
+	data, err := c.doJSON(a, req)
 	if err != nil {
 		// chat 域对该路径 400（部分任务/租户形态）→ Web 域降级（已实测可领）。
 		if ue, ok := err.(*Error); ok && ue.Status == http.StatusBadRequest {
@@ -252,7 +252,7 @@ func (c *Client) ClaimReward(a *auth.Auth, taskCode string) (credit, energy int6
 		req.Header.Set("X-Domain", d)
 	}
 
-	data, err := c.doJSON(req)
+	data, err := c.doJSON(a, req)
 	if err != nil {
 		return 0, 0, err
 	}

@@ -57,7 +57,7 @@ func (c *Client) growthJSON(a *auth.Auth, method, path string, body any) (json.R
 		return nil, err
 	}
 	c.BillingHeaders(req, a)
-	return c.doJSON(req)
+	return c.doJSON(a, req)
 }
 
 // TravelStatus 查询猫猫旅行状态。

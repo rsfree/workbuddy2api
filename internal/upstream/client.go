@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/egress"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 )
 
@@ -44,6 +45,7 @@ const (
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
 	ErrUpstreamBusy                  // 6021「queue.full.title」渠道级容量满载（非账号问题）→ 不罚号、不轮转，末端 503 + upstream_busy
+	ErrEgress                        // 出站链路故障（代理握手失败 / 源地址不可达）→ 不罚号、喂**出口级**熔断，换号(=换出口)重试
 	ErrClient                        // 其他 4xx / 业务错误
 )
 
@@ -73,6 +75,8 @@ func (k ErrKind) String() string {
 		return "image_invalid"
 	case ErrUpstreamBusy:
 		return "upstream_busy"
+	case ErrEgress:
+		return "egress"
 	case ErrAccountFault:
 		return "account_fault"
 	case ErrChannelRefused:
@@ -789,6 +793,21 @@ type Client struct {
 	// creditObserver 余额查询观察者（见 CreditObserver / SetCreditObserver）。
 	// atomic：启动期挂载、运行期并发读，不参与任何出站决策。
 	creditObserver atomic.Pointer[CreditObserver]
+
+	// egress 出口策略（atomic：main 装配期写入、请求路径并发读）。
+	// nil 或未启用 = 直连，行为与历史完全一致。
+	egress atomic.Pointer[egress.Resolver]
+
+	// egressClients 按出口隔离的 client 缓存（见 upstream/egress.go）。
+	// 不同出口绝不共享连接池：连接一旦建好就绑定了当时的源地址/代理链路。
+	//
+	// 用 sync.Map 而不是 mutex+map：这是每请求都要读的热路径（命中率≈100%），
+	// 全局互斥会把所有请求串行化在一个与业务无关的点上。写入只在首次见到该
+	// 出口时发生，LoadOrStore 天然幂等。
+	egressClients sync.Map // string -> *egressClient
+
+	// egressWarnAt 出口告警节流时间戳（UnixNano）。
+	egressWarnAt atomic.Int64
 }
 
 // CreditObserver 余额查询观察者：每次**真实查到**余额后回调（uid + 余额绝对值）。
@@ -974,9 +993,14 @@ func (c *Client) webBase(a *auth.Auth) string {
 // doJSON 发请求并解信封；HTTP 非 2xx 或业务 code != 0 时返回带 body 片段的 *Error。
 // body 读失败（连接中断/空闲掐流/截断）返回普通错误（非 *Error）——半截 body 不进
 // Classify，不参与账号惩罚（传输层故障不该喂熔断误罚号）。
-func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
-	resp, err := c.HTTP.Do(req)
+func (c *Client) doJSON(a *auth.Auth, req *http.Request) (json.RawMessage, error) {
+	resp, err := c.httpFor(a).Do(req)
 	if err != nil {
+		if isEgressError(err) {
+			// 出站链路故障：不返回裸 error（handler 会当成"网络抖动"喂账号连败），
+			// 而是带 ErrEgress 分类，让调用方只对出口记账。
+			return nil, &Error{Kind: ErrEgress, Msg: "egress: " + err.Error()}
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -1134,7 +1158,7 @@ func (c *Client) refreshTokenOnce(a *auth.Auth) error {
 	c.RefreshHeaders(req, &hdrSnapshot)
 
 	// 网络 I/O（锁外，30s 上限）。
-	data, err := c.doJSON(req)
+	data, err := c.doJSON(a, req)
 	if err != nil {
 		return err
 	}
@@ -1216,6 +1240,10 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
 	}
+	// 出口绑定在循环外解析一次：同一账号本次请求的所有路径尝试共享同一出口，
+	// 也与「账号 ↔ 出口」绑定语义一致（路径 fallback 不该换 IP）。
+	egressBinding := c.bindFor(a)
+	_, chatClient := c.clientPairForBinding(egressBinding)
 	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 +
 	// 尾部不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
@@ -1230,16 +1258,27 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
 		reqCtx, cancel := context.WithCancel(ctx)
 		req = req.WithContext(reqCtx)
-		resp, err := c.chatHTTP().Do(req)
+		resp, err := chatClient.Do(req)
 		if err != nil {
 			cancel()
+			// 出站链路故障（代理握手失败 / 源地址不可达）：账号本身没问题。
+			// 单独分类 + 只对出口记账，避免把代理故障喂进账号熔断。
+			if isEgressError(err) {
+				c.noteEgressResult(egressBinding, false)
+				log.Printf("ERR: [upstream] chat_stream acct=%s: egress error (exit=%s): %v",
+					logfmt.Label(a.UID, a.Nickname), egressBinding.Key(), err)
+				roundTripCloseIdle(chatClient.Transport)
+				return nil, 0, nil, &Error{Kind: ErrEgress, Msg: "egress: " + err.Error()}
+			}
 			log.Printf("ERR: [upstream] chat_stream acct=%s: transport error: %v", logfmt.Label(a.UID, a.Nickname), err)
 			// 传输层失败 → 清空共享连接池的空闲连接（连接层加固）：失败连接可能仍
 			// 留在空闲池里，下一个请求会继续捡到它——仅靠 IdleConnTimeout 等过期
 			// 不够，主动清池才断根。
-			roundTripCloseIdle(c.chatHTTP().Transport)
+			roundTripCloseIdle(chatClient.Transport)
 			return nil, 0, nil, err
 		}
+		// Do 成功 = 链路通（业务 4xx/5xx 也是链路正常）。出口成功计数在这里清零。
+		c.noteEgressResult(egressBinding, true)
 		if resp.StatusCode >= 400 {
 			raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 			resp.Body.Close()
@@ -1519,7 +1558,7 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 	c.CommonHeaders(req, a) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
 	// AccessToken 加锁快照（见 auth.AccessTokenValue：keepalive 刷新在 a.mu 内改写）。
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.httpFor(a).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -1873,7 +1912,7 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 	}
 	req.Header.Set("User-Agent", ua)
 	c.injectCodeBuddyRequest(req)
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.httpFor(a).Do(req)
 	if err != nil {
 		return nil, err
 	}

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/egress"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 )
@@ -140,6 +141,60 @@ type Config struct {
 		// 该域海外出口可达，/v2/chat/completions、/v3/config 与模型目录路径同构。
 		ChatBase string `json:"chat_base"`
 	} `json:"cn"`
+
+	Egress struct {
+		// Mode 出口策略：direct（默认，直连）| local（本机多 IP，按身份 hash 分配）
+		// | static（共用静态代理）| pool-keyed（代理池·用户名即键）
+		// | pool-pin（代理池·客户端算槽位端口）。
+		Mode string `json:"mode"`
+		// StaticURL mode=static 时的代理 URL（http/https/socks5）。
+		StaticURL string `json:"static_url"`
+
+		Local struct {
+			// IPs 显式源地址列表；空 = 自动发现本机网卡地址。
+			IPs []string `json:"ips"`
+			// Interfaces 只在这些网卡上发现（空 = 全部）。
+			Interfaces []string `json:"interfaces"`
+			// IncludeIPv6 是否纳入 IPv6 地址（默认 false）。
+			IncludeIPv6 bool `json:"include_ipv6"`
+			// ExcludePrefixes 额外排除的网卡名前缀。
+			ExcludePrefixes []string `json:"exclude_prefixes"`
+		} `json:"local"`
+
+		Pool struct {
+			// Host 池入口主机（不含 scheme/端口）。
+			// 生产建议留空并改用 WB2A_EGRESS_HOST，避免入口拓扑进版本库。
+			Host string `json:"host"`
+			// Password SOCKS5 口令。建议留空，用 password_env 或 WB2A_EGRESS_PASSWORD。
+			Password string `json:"password"`
+			// PasswordEnv 存放口令的环境变量名（默认 WB2A_EGRESS_PASSWORD 优先）。
+			PasswordEnv string `json:"password_env"`
+			// UsernameTemplate 用户名模板，支持 {identity} 与 {hash}。
+			// 空 = "{identity}"；例："acct-{identity}"。
+			UsernameTemplate string `json:"username_template"`
+			// Salt {hash} 的派生盐；建议用 salt_env 注入。
+			Salt    string `json:"salt"`
+			SaltEnv string `json:"salt_env"`
+
+			KeyedPort   int `json:"keyed_port"`
+			PinBasePort int `json:"pin_base_port"`
+			PinSlots    int `json:"pin_slots"`
+			RoundPort   int `json:"round_port"`
+		} `json:"pool"`
+
+		// IdentitySource 身份来源："uid"（默认）| "nickname" | "group"。
+		IdentitySource string `json:"identity_source"`
+		// GroupBy "account"（默认）| "group"。
+		GroupBy string `json:"group_by"`
+		// Groups 账号 UID → 分组名（覆盖 auth 文件里的 group 字段）。
+		Groups map[string]string `json:"groups"`
+		// FailThreshold 出口连续失败多少次冷却；默认 5。
+		FailThreshold int `json:"fail_threshold"`
+		// FailCooldown 出口冷却时长，默认 "60s"。
+		FailCooldown string `json:"fail_cooldown"`
+		// MaxTransports 出口 Transport 缓存上限，默认 64。
+		MaxTransports int `json:"max_transports"`
+	} `json:"egress"`
 
 	Upstream struct {
 		// TimeoutSeconds 短 RPC（refresh/checkin/balance/FetchModels）总时长上限，默认 120。
@@ -332,6 +387,23 @@ func Default() *Config {
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
+	// 出口隔离默认 local：按账号 hash 分配**本机出口 IP**（多网卡/多 EIP 部署时
+	// 才真正分散；单 IP 机器上等价于直连，无副作用）。自动发现不到可用地址时
+	// Enabled() 为 false，运行期回落直连——不构成可用性单点。
+	c.Egress.Mode = string(egress.ModeLocal)
+	c.Egress.IdentitySource = "uid"
+	c.Egress.GroupBy = string(egress.GroupByAccount)
+	c.Egress.FailThreshold = 5
+	c.Egress.FailCooldown = "60s"
+	c.Egress.MaxTransports = 64
+	c.Egress.Pool.PasswordEnv = "WB2A_EGRESS_PASSWORD"
+	c.Egress.Pool.SaltEnv = "WB2A_EGRESS_SALT"
+	// 池模式默认值写进配置（此前只在代码里回落，生成出来的配置全是 0，运维看不出可用值）。
+	c.Egress.Pool.UsernameTemplate = "acct-{uid}"
+	c.Egress.Pool.KeyedPort = 2090
+	c.Egress.Pool.PinBasePort = 1188
+	c.Egress.Pool.PinSlots = 16
+	c.Egress.Pool.RoundPort = 2088
 	return c
 }
 
@@ -491,6 +563,113 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_DNS"); v != "" {
 		c.DNSServers = splitCSV(v)
 	}
+	// 出口：入口地址/口令/盐一律支持环境变量注入。敏感值（尤其是代理池口令）
+	// 建议只放 env，不落 config.json —— 后者可能被备份、分享或误提交。
+	if v := os.Getenv("WB2A_EGRESS_MODE"); v != "" {
+		c.Egress.Mode = v
+	}
+	if v := os.Getenv("WB2A_EGRESS_HOST"); v != "" {
+		c.Egress.Pool.Host = v
+	}
+	if v := os.Getenv("WB2A_EGRESS_STATIC_URL"); v != "" {
+		c.Egress.StaticURL = v
+	}
+}
+
+// EgressConfig 把配置段翻译成出口策略。
+//
+// 敏感值解析顺序（后者覆盖前者）：config 明文 → password_env/salt_env 指定的
+// 环境变量 → 固定变量名 WB2A_EGRESS_PASSWORD / WB2A_EGRESS_SALT。
+// 固定变量名优先级最高，便于容器里用 secret 注入而不改配置文件。
+func (c *Config) EgressConfig() (egress.Config, error) {
+	mode := egress.Mode(strings.ToLower(strings.TrimSpace(c.Egress.Mode)))
+	switch mode {
+	case "", egress.ModeDirect:
+		mode = egress.ModeDirect
+	case egress.ModeLocal, egress.ModeStatic, egress.ModePoolKeyed, egress.ModePoolPin:
+	default:
+		return egress.Config{}, fmt.Errorf("egress.mode 非法: %q（可选 direct/local/static/pool-keyed/pool-pin）", c.Egress.Mode)
+	}
+
+	groupBy := egress.GroupBy(strings.ToLower(strings.TrimSpace(c.Egress.GroupBy)))
+	switch groupBy {
+	case "", egress.GroupByAccount:
+		groupBy = egress.GroupByAccount
+	case egress.GroupByGroup:
+	default:
+		return egress.Config{}, fmt.Errorf("egress.group_by 非法: %q（可选 account/group）", c.Egress.GroupBy)
+	}
+
+	src := strings.ToLower(strings.TrimSpace(c.Egress.IdentitySource))
+	switch src {
+	case "", "uid":
+		src = "uid"
+	case "nickname", "group":
+	default:
+		return egress.Config{}, fmt.Errorf("egress.identity_source 非法: %q（可选 uid/nickname/group）", c.Egress.IdentitySource)
+	}
+
+	cooldown := 60 * time.Second
+	if v := strings.TrimSpace(c.Egress.FailCooldown); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return egress.Config{}, fmt.Errorf("egress.fail_cooldown 非法: %q（例「60s」「5m」）", v)
+		}
+		cooldown = d
+	}
+
+	password := c.Egress.Pool.Password
+	if name := strings.TrimSpace(c.Egress.Pool.PasswordEnv); name != "" {
+		if v := os.Getenv(name); v != "" {
+			password = v
+		}
+	}
+	if v := os.Getenv("WB2A_EGRESS_PASSWORD"); v != "" {
+		password = v
+	}
+	salt := c.Egress.Pool.Salt
+	if name := strings.TrimSpace(c.Egress.Pool.SaltEnv); name != "" {
+		if v := os.Getenv(name); v != "" {
+			salt = v
+		}
+	}
+	if v := os.Getenv("WB2A_EGRESS_SALT"); v != "" {
+		salt = v
+	}
+
+	if mode == egress.ModeStatic && strings.TrimSpace(c.Egress.StaticURL) == "" {
+		return egress.Config{}, fmt.Errorf("egress.mode=static 但 egress.static_url 为空")
+	}
+	if (mode == egress.ModePoolKeyed || mode == egress.ModePoolPin) && strings.TrimSpace(c.Egress.Pool.Host) == "" {
+		return egress.Config{}, fmt.Errorf("egress.mode=%s 但 egress.pool.host 为空（可用 WB2A_EGRESS_HOST 注入）", mode)
+	}
+
+	return egress.Config{
+		Mode:           mode,
+		StaticURL:      c.Egress.StaticURL,
+		Local: egress.Local{
+			IPs:             c.Egress.Local.IPs,
+			Interfaces:      c.Egress.Local.Interfaces,
+			IncludeIPv6:     c.Egress.Local.IncludeIPv6,
+			ExcludePrefixes: c.Egress.Local.ExcludePrefixes,
+		},
+		Pool: egress.Pool{
+			Host:             c.Egress.Pool.Host,
+			Password:         password,
+			UsernameTemplate: c.Egress.Pool.UsernameTemplate,
+			Salt:             salt,
+			KeyedPort:        c.Egress.Pool.KeyedPort,
+			PinBasePort:      c.Egress.Pool.PinBasePort,
+			PinSlots:         c.Egress.Pool.PinSlots,
+			RoundPort:        c.Egress.Pool.RoundPort,
+		},
+		IdentitySource: src,
+		GroupBy:        groupBy,
+		Groups:         c.Egress.Groups,
+		FailThreshold:  c.Egress.FailThreshold,
+		FailCooldown:   cooldown,
+		MaxTransports:  c.Egress.MaxTransports,
+	}, nil
 }
 
 func (c *Config) normalize() error {

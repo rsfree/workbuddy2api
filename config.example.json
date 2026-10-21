@@ -45,6 +45,35 @@
   "cn": {
     "chat_base": ""
   },
+  "egress": {
+    "_comment": "出口隔离（风控）。mode=direct 关闭；local=本机多 IP（ips 留空自动发现，按账号 hash 分配）；static=共用代理；pool-keyed/pool-pin=自建 SOCKS5 池。敏感项（host/password/salt）建议只走环境变量 WB2A_EGRESS_HOST / WB2A_EGRESS_PASSWORD / WB2A_EGRESS_SALT，不要写进本文件。",
+    "mode": "local",
+    "static_url": "",
+    "local": {
+      "ips": [],
+      "interfaces": [],
+      "include_ipv6": false,
+      "exclude_prefixes": []
+    },
+    "pool": {
+      "host": "",
+      "password": "",
+      "password_env": "WB2A_EGRESS_PASSWORD",
+      "username_template": "acct-{uid}",
+      "salt": "",
+      "salt_env": "WB2A_EGRESS_SALT",
+      "keyed_port": 2090,
+      "pin_base_port": 1188,
+      "pin_slots": 16,
+      "round_port": 2088
+    },
+    "identity_source": "uid",
+    "group_by": "account",
+    "groups": {},
+    "fail_threshold": 5,
+    "fail_cooldown": "60s",
+    "max_transports": 64
+  },
   "upstream": {
     "timeout_seconds": 120,
     "header_timeout_seconds": 120,

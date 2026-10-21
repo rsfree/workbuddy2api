@@ -148,7 +148,7 @@ func (c *Client) Search(ctx context.Context, a *auth.Auth, query string, maxResu
 		return nil, err
 	}
 	c.SearchHeaders(req, a, "", meta)
-	return c.doSearch(req)
+	return c.doSearch(a, req)
 }
 
 // doSearch 发搜索请求并解析扁平响应。
@@ -157,8 +157,8 @@ func (c *Client) Search(ctx context.Context, a *auth.Auth, query string, maxResu
 //   - HTTP >= 400 → Classify 出 Kind，包成 *Error
 //   - 2xx 但 code != 0 → 业务错误（ErrNone 时兜底 ErrClient），同样包成 *Error
 //   - 读体失败 → 普通 error（半截 body 不参与账号惩罚）
-func (c *Client) doSearch(req *http.Request) (*SearchOutcome, error) {
-	resp, err := c.HTTP.Do(req)
+func (c *Client) doSearch(a *auth.Auth, req *http.Request) (*SearchOutcome, error) {
+	resp, err := c.httpFor(a).Do(req)
 	if err != nil {
 		return nil, err
 	}
