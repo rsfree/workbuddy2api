@@ -54,6 +54,20 @@ const (
 	maxIdleConnsPerHost = 20
 )
 
+// 出口专属 Transport 的池上限。
+//
+// 为什么比主池小一个量级：主池只有一份，出口池是**每个出口一份**。上游只有
+// 一个 host，单出口服务的账号数通常是个位数，按主池的 100/20 配，50 个出口
+// 就是 5000 条空闲连接上限——内存、fd 与上游连接数都被放大，而命中率并不会
+// 更高（空闲连接 30s 就回收）。
+//
+// 取 8：覆盖「一个出口 2~3 个账号 × max_in_flight=3」的常见峰值；超出部分在
+// 突发时新建，代价是一次同机/同代理的 TCP 握手，远小于常驻 5000 条连接的代价。
+const (
+	egressMaxIdleConns        = 8
+	egressMaxIdleConnsPerHost = 8
+)
+
 // newDialer 构造出站拨号器（DialContext 的 Timeout/KeepAlive 参数集中于此，
 // 供测试回读断言）。
 func newDialer() *net.Dialer {

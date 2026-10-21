@@ -95,11 +95,7 @@ func (p *Pool) startFlusher() {
 		for {
 			select {
 			case <-t.C:
-				p.mu.Lock()
-				if p.dirty.Swap(false) {
-					p.saveLocked()
-				}
-				p.mu.Unlock()
+				p.flushDirty()
 			case <-stopCh:
 				return
 			}
@@ -109,11 +105,37 @@ func (p *Pool) startFlusher() {
 
 // Flush 同步把内存状态落盘（幂等：无变更不写盘）。供进程退出前调用。
 func (p *Pool) Flush() {
+	p.flushDirty()
+}
+
+// flushDirty 取快照（锁内）→ 落盘（锁外）。
+//
+// 为什么拆开：p.mu 同时保护选号（pick 走写锁）。旧实现整段持锁做
+// json.Marshal + WriteFile + Rename，磁盘一旦变慢（Docker volume / 网络盘 /
+// 磁盘满重试），所有聊天请求的选号都会排在一次 fsync 后面。账号越多、
+// state 越大，这段阻塞越长。
+func (p *Pool) flushDirty() {
 	p.mu.Lock()
-	if p.dirty.Swap(false) {
-		p.saveLocked()
+	// 顺带清理过期条目：旧实现在 pick 的写锁里做惰性清理，选号改读锁后
+	// 不能再写 map。5s 一次的频率足够——判定函数本身会跳过过期项，这里只
+	// 负责把内存条目真正删掉，防止 map 随模型数无限膨胀。
+	now := time.Now()
+	for _, e := range p.byUID {
+		e.pruneExpiredModelCooldowns(now)
+		e.pruneExpiredModelCosts(now)
 	}
+	if !p.dirty.Swap(false) {
+		p.mu.Unlock()
+		return
+	}
+	sf := p.snapshotLocked()
 	p.mu.Unlock()
+	p.persist(sf)
+}
+
+// snapshotLocked 锁内取状态快照（纯内存复制，不做任何 IO）。调用方必须持有 p.mu。
+func (p *Pool) snapshotLocked() stateFile {
+	return p.stateOverviewLocked()
 }
 
 // Add 加入账号；已存在则保留原状态、更新凭证（upsert 单账号，不影响其他账号）。
@@ -237,11 +259,16 @@ func (p *Pool) applySnapshotLocked(s snapshot) {
 	p.applyAccountsLocked(s.Accounts)
 	p.restoreSchedulingLocked(s.Scheduling)
 }
-func (p *Pool) saveLocked() {
+// persist 把快照写到本地 state.json 并镜像 Redis。
+//
+// 调用方**不得**持有 p.mu：这里会做 marshal/fsync/网络调用。串行化由 persistMu
+// 负责（不同 goroutine 的快照可以并发取，但写盘必须一个一个来）。
+func (p *Pool) persist(sf stateFile) {
 	if p.stateFp == "" {
 		return
 	}
-	sf := p.stateOverviewLocked()
+	p.persistMu.Lock()
+	defer p.persistMu.Unlock()
 	raw, err := json.MarshalIndent(sf, "", "  ")
 	if err != nil {
 		p.notePersistFail(err)
@@ -276,7 +303,7 @@ func (p *Pool) saveLocked() {
 // notePersistFail 记录一次本地 state.json 落盘失败，并按节流规则决定是否打日志：
 // 首败（状态成功→失败）打完整错误、每 persistLogEvery 次连续失败打一条提醒、
 // 其余连续失败静默（flusher 5s 一把，磁盘持续满时不刷屏）。
-// 恢复成功的日志由 saveLocked 在成功路径统一打。与 redisstore 三处异步写的
+// 恢复成功的日志由 persist 在成功路径统一打。与 redisstore 三处异步写的
 // "失败仅打日志、不向上抛"范式对齐，但落盘失败对运维是盲区，故多一层节流（notification）。
 func (p *Pool) notePersistFail(err error) {
 	if p.persistFails == 0 {
@@ -290,7 +317,15 @@ func (p *Pool) notePersistFail(err error) {
 // stateOverviewLocked 收集当前内存状态为 stateFile（供落盘 + 快照镜像复用）。调用方必须已持 p.mu。
 func (p *Pool) stateOverviewLocked() stateFile {
 	now := time.Now()
-	sf := stateFile{Accounts: map[string]stateAccount{}, Scheduling: p.scheduling}
+	// scheduling 单独复制：它与 byUID 不同锁，直接引用会让持久化期间的
+	// 并发选号把 map 写崩（fatal error: concurrent map iteration and map write）。
+	sched := make(map[string]scheduleCursor, len(p.scheduling))
+	p.schedulingMu.Lock()
+	for k, v := range p.scheduling {
+		sched[k] = v
+	}
+	p.schedulingMu.Unlock()
+	sf := stateFile{Accounts: map[string]stateAccount{}, Scheduling: sched}
 	for uid, e := range p.byUID {
 		s := stateAccount{
 			Credits:                  e.credits,

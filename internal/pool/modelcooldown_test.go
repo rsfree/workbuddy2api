@@ -203,7 +203,10 @@ func TestModelCooldownsSurviveRevive(t *testing.T) {
 	}
 }
 
-// TestModelCooldownsLazyCleanup 已过期的模型冷却在 pick（写锁路径）时被惰性清理。
+// TestModelCooldownsLazyCleanup 已过期的模型冷却由后台 flusher 清理。
+//
+// 清理点从 pick 迁到 flushDirty：pick 已改读锁，不能写 map。判定函数本身
+// 会跳过过期项（下面的 Pick 断言），物理删除只影响内存占用。
 func TestModelCooldownsLazyCleanup(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
@@ -217,11 +220,13 @@ func TestModelCooldownsLazyCleanup(t *testing.T) {
 	if got == nil || got.UID != "u1" {
 		t.Fatalf("过期模型冷却不应拦截 u1, got %+v", got)
 	}
+	// 触发一次后台清理（生产由 5s flusher 驱动）。
+	p.flushDirty()
 	p.mu.RLock()
 	_, still := e.modelCooldowns["old"]
 	p.mu.RUnlock()
 	if still {
-		t.Error("过期模型冷却条目应在 pick 时被清理")
+		t.Error("过期模型冷却条目应在后台清理时被删除")
 	}
 }
 

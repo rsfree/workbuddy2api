@@ -63,6 +63,7 @@ func (p *Pool) SetScheduling(s RegionStrategies, order RegionAccountOrder) error
 		Domestic:      append([]string(nil), order.Domestic...),
 		International: append([]string(nil), order.International...),
 	}
+	p.schedulingMu.Lock()
 	for key, cursor := range p.scheduling {
 		realm, _, _ := strings.Cut(key, "\x1f")
 		if cursor.Strategy != p.strategyForRealmLocked(realm) {
@@ -70,6 +71,7 @@ func (p *Pool) SetScheduling(s RegionStrategies, order RegionAccountOrder) error
 			p.dirty.Store(true)
 		}
 	}
+	p.schedulingMu.Unlock()
 	return nil
 }
 
@@ -95,6 +97,8 @@ func (p *Pool) StrategyForRealm(realm string) string {
 }
 
 func (p *Pool) restoreSchedulingLocked(cursors map[string]scheduleCursor) {
+	p.schedulingMu.Lock()
+	defer p.schedulingMu.Unlock()
 	p.scheduling = make(map[string]scheduleCursor, len(cursors))
 	for key, cursor := range cursors {
 		realm, _, ok := strings.Cut(key, "\x1f")
@@ -132,6 +136,12 @@ func (p *Pool) pickOrderedLocked(cands []*entry, tried map[string]bool, model, r
 	}
 	sort.Slice(cands, func(i, j int) bool { return lessUID(cands[i].a.UID, cands[j].a.UID) })
 	key := realm + "\x1f" + model
+	// 游标的「读 → 算 → 推进」必须在同一临界区：拆成三段时，并发选号会读到
+	// 同一个游标、选出同一个账号，轮询公平性直接退化成"谁先写谁赢"
+	//（实测 7 账号 200 轮的偏差从 ≤1 放大到 12）。
+	// 只锁这一条有序路径，加权随机路径不受影响。
+	p.schedulingMu.Lock()
+	defer p.schedulingMu.Unlock()
 	cursor := p.scheduling[key]
 	if cursor.Strategy != strategy {
 		cursor = scheduleCursor{Strategy: strategy}

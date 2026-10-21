@@ -421,14 +421,17 @@ func (p *Pool) AvailableUIDsForModel(model string) []string {
 // 这是粘性能"换得动"的关键：绑定只记 uid，若只按账号级 healthy 校验，
 // 被模型级限额的号（账号整体仍健康）会被持续选中直到轮换次数耗尽。
 func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	now := time.Now()
+	// 读锁校验 + 锁外提交（与 pick 同一套口径）：粘性命中是每请求都会走的路径，
+	// 在这里持写锁会把所有会话钉在同一个串行点上。
+	p.mu.RLock()
 	e, ok := p.byUID[uid]
 	if !ok {
+		p.mu.RUnlock()
 		return nil
 	}
-	now := time.Now()
 	if !e.healthyForModel(now, model) {
+		p.mu.RUnlock()
 		return nil
 	}
 	// 积分保底（粘性路径）：与 pick 的 floorBlocked 同判据——触底 + 收费即拦
@@ -437,39 +440,39 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	// 后下次会话重新绑定。
 	// 日志频次：天然每请求至多一条——首次返回 nil 即解绑，后续轮转不再调入本路径
 	// （无需额外节流）；粘性续期中每个新请求一条，恰好是「余额仍在线下」的持续提醒。
-	if p.floorBlockedForRealmModel(e, model, e.a.Realm(), now) {
+	blocked := p.floorBlockedForRealmModel(e, model, e.a.Realm(), now)
+	full := p.inFlightFull(e)
+	credits, floor := e.credits, p.creditFloor
+	p.mu.RUnlock()
+	if blocked {
 		log.Printf("WARN: [pool] credit floor: sticky acct=%s model=%s credits=%d < floor=%d, unbind (paid model held out)",
-			logfmt.Label(e.a.UID, e.a.Nickname), model, e.credits, p.creditFloor)
+			logfmt.Label(e.a.UID, e.a.Nickname), model, credits, floor)
 		return nil
 	}
-	if p.inFlightFull(e) {
+	if full {
 		return nil
 	}
-	e.lastUsed = now
-	p.pickSeq++
-	e.usedSeq = p.pickSeq
+	p.commitPick(e, now)
 	return e.a
 }
 
 // PickByUID 若 uid 当前 healthy 且未占满在途名额，返回其凭证（记录 lastUsed 防撞号）；
 // 否则返回 nil。供会话粘性路由命中校验与直取使用。
 func (p *Pool) PickByUID(uid string) *auth.Auth {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	now := time.Now()
+	p.mu.RLock()
 	e, ok := p.byUID[uid]
 	if !ok {
+		p.mu.RUnlock()
 		return nil
 	}
-	now := time.Now()
-	if !e.healthy(now) {
+	okHealthy := e.healthy(now)
+	full := okHealthy && p.inFlightFull(e)
+	p.mu.RUnlock()
+	if !okHealthy || full {
 		return nil
 	}
-	if p.inFlightFull(e) {
-		return nil
-	}
-	e.lastUsed = now
-	p.pickSeq++
-	e.usedSeq = p.pickSeq
+	p.commitPick(e, now)
 	return e.a
 }
 

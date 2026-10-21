@@ -72,12 +72,24 @@ type Pool struct {
 	// randInt64N 仅供测试注入确定性随机源；nil 时用 math/rand/v2 全局源。
 	// 生产代码不应设置此字段。
 	randInt64N func(n int64) int64
-	// persistFails 本地 state.json 连续落盘失败计数（仅 saveLocked 在持锁下读写，无需 atomic）。
+	// schedulingMu 保护 scheduling（有序策略的轮询/耗尽游标）。
+	// 选号读锁化后，游标不能再挂在 p.mu 下写：有序策略每次选号都要推进它。
+	// 锁序固定 p.mu → schedulingMu，无反向获取，不会死锁。
+	schedulingMu sync.Mutex
+	// exploreMu 保护 exploreLast / costExploreEvents（条件探索窗口）。
+	// 选号主路径已改读锁，这两个字段不能再挂在 p.mu 下写；单独一把低频锁，
+	// 只在「tier0 存在且含 tier1 候选」时才进入。
+	exploreMu sync.Mutex
+	// persistMu 串行化落盘：快照在 p.mu 内取（只读），写盘在锁外做，但多个
+	// 落盘动作之间必须串行——否则两个 goroutine 会互相覆盖同一个 .tmp 文件。
+	persistMu sync.Mutex
+	// persistFails 本地 state.json 连续落盘失败计数（persistMu 下读写）。
 	// 用于落盘失败的日志节流：首败/每 N 次提醒/恢复各打一条，避免磁盘满时刷屏。
 	persistFails int
 	// pickSeq 单调递增的选号序号：每次 pick 选中账号时自增并记到 entry.usedSeq，
 	// 为 LRU 兜底/防惊群提供与 time.Now() 精度无关的严格全序（Windows ~0.5ms 精度下
-	// lastUsed 墙钟会全等）。仅 pick 写锁路径读写，无需 atomic。
+	// lastUsed 墙钟会全等）。选号在读锁下读、commitPick 在写锁下写；
+	// 持久化快照也只在 p.mu 内读，因此无需 atomic。
 	pickSeq      uint64
 	strategies   RegionStrategies
 	accountOrder RegionAccountOrder
@@ -172,8 +184,8 @@ func (p *Pool) SetCostExploreInterval(d time.Duration) {
 // 「探索→毕业」全链路）。RLock 只读遍历；map 大小受「服务过的 (域, 模型)」集合
 // 约束（与 modelCost 同界，天然有界）。
 func (p *Pool) CostExploreStatus() (events int64, last map[string]time.Time) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.exploreMu.Lock()
+	defer p.exploreMu.Unlock()
 	last = make(map[string]time.Time, len(p.exploreLast))
 	for k, ts := range p.exploreLast {
 		// 键 realm+"\x1f"+model → 输出 "|"（JSON 安全可读；\x1f 不可打印）。
@@ -366,7 +378,6 @@ func (p *Pool) Add(a *auth.Auth) {
 // 剔除结果持久化回 state.json，避免已删账号在下次启动时被 load() 复活。
 func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	seen := make(map[string]bool, len(auths))
 	for _, a := range auths {
 		seen[a.UID] = true
@@ -379,8 +390,13 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 			changed = true
 		}
 	}
+	var sf stateFile
 	if changed {
-		p.saveLocked()
+		sf = p.snapshotLocked()
+	}
+	p.mu.Unlock()
+	if changed {
+		p.persist(sf)
 	}
 }
 
@@ -389,14 +405,16 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 // 在途请求的 Release 对已删条目是 no-op，无需等待。
 func (p *Pool) Remove(uid string) *auth.Auth {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
 	if !ok {
+		p.mu.Unlock()
 		return nil
 	}
 	delete(p.byUID, uid)
-	p.dirty.Store(true)
-	p.saveLocked()
+	sf := p.snapshotLocked()
+	p.mu.Unlock()
+	// 锁外落盘：面板删号不该让整池选号停在一次 fsync 上。
+	p.persist(sf)
 	return e.a
 }
 

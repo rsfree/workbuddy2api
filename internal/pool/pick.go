@@ -39,13 +39,52 @@ func (p *Pool) PickExcludingForRealm(tried map[string]bool, reqModel, realm stri
 	return p.pick(tried, reqModel, realm)
 }
 
-// pick 在 healthy 候选集中按权重加权随机选出账号，并记录 lastUsed（防并发撞号）。
+// pick 在 healthy 候选集中按权重加权随机选出账号。选号主体持读锁并发，
+// 「已用」标记在锁外用 commitPick 提交（并发撞号由 handler 的 Acquire CAS 兜底）。
 // reqModel 非空时把健康口径换成 healthyForModel（6004 模型豁免生效）。
 // realm 非空时候选过滤叠加 Realm()==realm 谓词（分池选号域）。
 func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	now := time.Now()
+	// 选号主体只读（遍历 + 权重 + 排序），用读锁并发；「已用」标记在锁外提交。
+	p.mu.RLock()
+	e := p.pickLocked(tried, reqModel, realm, now)
+	p.mu.RUnlock()
+	if e == nil {
+		return nil
+	}
+	p.commitPick(e, now)
+	return e.a
+}
+
+// commitPick 记录一次「已选中」。
+//
+// 锁内只做两次赋值：选号主体在读锁下并发，这里若一并放进去，等于把整段重新
+// 串行化，读锁化就白做了。代价是并发选号可能撞到同一个账号（彼此都没看到对方
+// 的 lastUsed），由 handler 的 Pool.Acquire CAS 兜底换号——那本来就有。
+func (p *Pool) commitPick(e *entry, now time.Time) {
+	p.mu.Lock()
+	p.pickSeq++
+	e.lastUsed = now
+	e.usedSeq = p.pickSeq
+	p.mu.Unlock()
+}
+
+// claimExplore 抢占一次「条件探索」窗口；true = 本次 pick 负责探索。
+// 独立小锁：该路径只在 tier0 存在且含 tier1 候选时进入，频率极低。
+func (p *Pool) claimExplore(key string, now time.Time) bool {
+	p.exploreMu.Lock()
+	defer p.exploreMu.Unlock()
+	if now.Sub(p.exploreLast[key]) < p.costExploreInterval {
+		return false
+	}
+	p.exploreLast[key] = now
+	p.costExploreEvents++
+	return true
+}
+
+// pickLocked 纯只读选号（遍历 / 权重 / 排序），返回候选 entry。
+// 调用方必须持有 p.mu（读锁即可）；「已用」标记由调用方在锁外 commitPick。
+func (p *Pool) pickLocked(tried map[string]bool, reqModel, realm string, now time.Time) *entry {
 	realmOK := func(e *entry) bool { return realm == "" || e.a.Realm() == realm }
 	healthyOf := func(e *entry) bool { return realmOK(e) && e.healthy(now) }
 	if reqModel != "" {
@@ -59,10 +98,8 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		if tried != nil && tried[uid] {
 			continue
 		}
-		// 惰性清理过期的模型级冷却与成本台账（两者的 map 都不无限膨胀；
-		// status 只读遍历天然跳过过期项，但内存条目必须在此真正删除）。
-		e.pruneExpiredModelCooldowns(now)
-		e.pruneExpiredModelCosts(now)
+		// 过期的模型级冷却/成本条目由后台 flusher 统一清理（见 flushDirty）：
+		// 这里已改成读锁，不能改 map；判定函数自身会跳过过期项，语义不变。
 		if !healthyOf(e) {
 			continue
 		}
@@ -136,9 +173,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 			}
 		}
 		key := realm + "\x1f" + reqModel
-		if hasTier1 && now.Sub(p.exploreLast[key]) >= p.costExploreInterval {
-			p.exploreLast[key] = now
-			p.costExploreEvents++
+		if hasTier1 && p.claimExplore(key, now) {
 			bestTier = 1
 			explored = true
 		}
@@ -165,13 +200,10 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 			ordered = append(ordered, w.e)
 		}
 		e := p.pickOrderedLocked(ordered, tried, reqModel, realm, strategy, explored, now)
-		e.lastUsed = now
-		p.pickSeq++
-		e.usedSeq = p.pickSeq
 		if explored {
 			log.Printf("[pool] cost explore model=%s realm=%q acct=%s window=%s", reqModel, realm, logfmt.Label(e.a.UID, e.a.Nickname), p.costExploreInterval)
 		}
-		return e.a
+		return e
 	}
 	// 等权重洗牌：仅当存在权重相等且候选数超过 top5 时，才对 ws 做 Fisher-Yates
 	// 洗牌（且**不消耗 p.randInt64N 注入源**，避免改变 pickWeighted 的确定性语义，
@@ -245,10 +277,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		log.Printf("[pool] cost explore model=%s realm=%q acct=%s window=%s",
 			reqModel, realm, logfmt.Label(e.a.UID, e.a.Nickname), p.costExploreInterval)
 	}
-	e.lastUsed = now // 锁内即时标记：下一个进入 pick 的 goroutine 立即看到本号已用
-	p.pickSeq++
-	e.usedSeq = p.pickSeq // 单调序号：保证 usedSeq 严格全序（防惊群/LRU 的权威依据）
-	return e.a
+	return e
 }
 
 // floorBlockedForModel 积分保底拦截判定（pick 普通轮换与 PickByUIDForModel 粘性
@@ -312,7 +341,7 @@ func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time
 // 这里，若兜底不看保底，触底号会被「捞回来」继续接收费模型——表现为同一条
 // floor WARN 反复刷同一个号（实测：credits=1 < floor=150 仍持续中选）。
 // 兜底是**最后一道**选号路径，保底在它之前挡不住就等于没挡。
-func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm, model string) *auth.Auth {
+func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm, model string) *entry {
 	var best *entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
@@ -345,14 +374,10 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		return nil
 	}
 	log.Printf("WARN: [pool] fallback_earliest_expiry acct=%s until=%s kind=%s", logfmt.Label(best.a.UID, best.a.Nickname), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
-	best.lastUsed = time.Now()
-	// 兜底同样是「选中」，必须与 pick() 正常路径、粘性命中路径（PickByUIDForModel）
-	// 一样推进 usedSeq/pickSeq：否则被兜底反复选中的账号 usedSeq 恒为 0，在 pick 的
-	// LRU 兜底（按 usedSeq 取最旧）眼里永远是「最旧」，刚被用过就被立刻再选——
-	// 防集中/防惊群失效（entry.usedSeq 契约：每次被选中时取 p.pickSeq 自增值）。
-	p.pickSeq++
-	best.usedSeq = p.pickSeq
-	return best.a
+	// 兜底同样是「选中」：lastUsed/usedSeq 由调用方 commitPick 推进（与正常路径
+	// 同一出口）。否则被兜底反复选中的账号 usedSeq 恒为 0，在 LRU 兜底（按
+	// usedSeq 取最旧）眼里永远「最旧」，刚用过就被立刻再选——防惊群失效。
+	return best
 }
 
 // inFlightFull 报告账号是否已占满在途名额（上限按 realm 分档，见 inFlightLimit；
@@ -418,7 +443,19 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	w := 1.0
 	// 1. credits 比例 ×10（会计入 mid-credit 锚点，避免全员 0 时 credits 项为 0）。
 	if maxCredits > 0 {
-		w += float64(e.credits) / float64(maxCredits) * 10
+		if e.creditsTotal == 0 && e.credits <= 0 {
+			// 积分未知（刚导入 / 余额查询尚未成功过）：按**满档**计入，与池内
+			// 最高积分号同权。此前按 0 计，权重只有 1+idle(≤5)=6，而存量号是
+			// 11~16 —— 新号永远进不了 top5，一次都不承接，也就永远查不到余额，
+			// 形成「越新越不用」的死锁（实测混合池：新号承接 0/500 次）。
+			//
+			// 代价：真正零余额的号会接一次请求并拿到 402（随后硬冷却到次日）。
+			// 这是发现「它确实没钱」的唯一途径，值这一次学费；查到余额后
+			// creditsTotal 落值，本分支自动失效。
+			w += 10
+		} else {
+			w += float64(e.credits) / float64(maxCredits) * 10
+		}
 	}
 	// 2. 闲置补偿。
 	if e.lastUsed.IsZero() {
