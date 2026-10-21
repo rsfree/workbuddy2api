@@ -265,7 +265,9 @@ jobs:
           {
             echo "## ${TAG}"
             echo
-            git log --no-merges --pretty='- %s (%h)' $RANGE
+            # 排除 bump 提交本身：它是发版机制的产物，不是用户可见的变更
+            git log --no-merges --invert-grep --grep='^chore(release):' \
+              --pretty='- %s (%h)' $RANGE
             if [ -n "$PREV" ]; then
               echo
               echo "**Full Changelog**: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${PREV}...${TAG}"
