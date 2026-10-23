@@ -299,9 +299,9 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 			continue
 		}
 		wg.Add(1)
-		go func(a *auth.Auth) {
+		go func(a *auth.Auth, credits int64) {
 			defer wg.Done()
-			one := queueAccount{a: a}
+			one := queueAccount{a: a, credits: credits}
 			// D4 门控：global 账号无 CN 成长任务体系，不发起任何上游调用。
 			if a.IsGlobal() {
 				return
@@ -340,9 +340,13 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 				accts = append(accts, one)
 				mu.Unlock()
 			}
-		}(a)
+		}(a, st.Credits)
 	}
 	wg.Wait()
+
+	// 0 积分优先：扫描是并发收集的，顺序本来是"谁先扫完谁在前"（非确定性），
+	// 这里按余额快照重排，让缺分的号先跑（理由见 sortQueueByCredits）。
+	sortQueueByCredits(accts)
 
 	// 组装队列（账号分组，保持顺序）。
 	var items []queueItem
@@ -505,6 +509,19 @@ func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurren
 type queueAccount struct {
 	a    *auth.Auth
 	grow []upstream.Task
+	// credits 入队时的余额快照，仅用于排队顺序（见 sortQueueByCredits）。
+	// 不用实时值：扫描期间余额会变，保持"同一时刻的快照"才能得到稳定排序。
+	credits int64
+}
+
+// sortQueueByCredits 按余额升序排列账号（0 积分最前），稳定排序保证同余额时
+// 保持扫描顺序。为什么这样排：成长任务本身是**挣积分**的手段，而 0 积分的号
+// 在补足前完全不能承载请求——同一轮队列里先跑它们，能最早把死号变成可用号；
+// 有余额的号晚几分钟跑不影响任何东西（每号配额独立，不存在互相抢占）。
+// 队列是全量扫描、并发受限（定时 1 / 手动最多 4），一旦本轮跑不完（上游限流、
+// 次日窗口重叠），排在后面的号就会被顺延到下一轮，顺序因此有实际意义。
+func sortQueueByCredits(accts []queueAccount) {
+	sort.SliceStable(accts, func(i, j int) bool { return accts[i].credits < accts[j].credits })
 }
 
 // snapshotAt 锁内读条目三元组（避免锁外持有指针）。
