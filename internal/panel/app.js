@@ -11,10 +11,11 @@ let logPin = true, loginState = null, loginTimer = null;
 let refTimer = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
 let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
-// 企业相关凭证两套清单（概览接口下发）：
-//   entSwitch  = token_source=enterprise_switch 但未绑定租户 —— 实测仍计分，灰标；
-//   entSession = 真正绑定企业租户/企业版 —— 行为事件被丢弃，任务动作被拦截，红标。
-let entSwitch = new Set(), entSession = new Set();
+// 会拦成长任务的只有「真绑定租户 / 企业版」这一种（概览接口的 enterprise_session）。
+// 注意 token_source=enterprise_switch（未绑定租户）**不等于企业号**：实测仍正常计分。
+// 2026-10-23 实测：50 个号里 22 个带这个标记、全是个人号，差别只在登录入口。
+// 因此前端不再为它渲染徽标 —— 一枚对「能否得分 / 会不会被拦」零判断力的标签，
+// 只会让人误以为账号有问题（早前那版把它写成「不计分」就是这么来的）。
 let mdAll = [], mdProbes = {}, mdProbeOf = () => undefined;
 let mdLocks = [], mdRecent = [];
 let reqFilter = { q: '', outcome: '' };
@@ -446,7 +447,7 @@ function renderAccounts(list) {
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') +
-        (entSwitch.has(s.uid) ? ' <span class="realm-tag mute" title="凭证带 token_source=enterprise_switch，但未绑定企业租户（enterprise_id 为空）。2026-10-23 实测：web 点击与对话两条判据都正常入账，不影响成长任务；仅作来源标注。">企业切换</span>' : '') + (entSession.has(s.uid) ? ' <span class="realm-tag warn" title="该凭证绑定企业租户/企业版：行为事件被上游静默丢弃（200 不计分），成长任务与签到不会入账，面板会拦截任务动作。修法：在浏览器退出企业空间，以个人身份重新登录后重新导入。">企业会话·不计分</span>' : '') + '</div><div class="id">' + esc(short) + '</div>' + (s.egress ? '<div class="id egress" title="出口 ' + esc(s.egress) + '">出口 ' + esc(s.egress) + '</div>' : '') + '</td>' +
+        (entSession.has(s.uid) ? ' <span class="realm-tag warn" title="该凭证绑定企业租户/企业版：行为事件被上游静默丢弃（200 不计分），成长任务与签到不会入账，面板会拦截任务动作。修法：在浏览器退出企业空间，以个人身份重新登录后重新导入。">企业会话·不计分</span>' : '') + '</div><div class="id">' + esc(short) + '</div>' + (s.egress ? '<div class="id egress" title="出口 ' + esc(s.egress) + '">出口 ' + esc(s.egress) + '</div>' : '') + '</td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -516,7 +517,6 @@ async function loadOverview(quiet) {
   try {
     const d = await api('overview');
     overviewData = d;
-    entSwitch = new Set(d.enterprise_switch || []);
     entSession = new Set(d.enterprise_session || []);
     $('sTotal').textContent = d.total;
     $('sHealthy').textContent = d.healthy;
@@ -2092,7 +2092,7 @@ function groupItems(d) {
       // auto=false：任务还没有自动动作（新增任务待适配）；new=true：任务目录里首次出现。
       rows.push({ kind: 'growth', code: t.task_code, prog: t.target ? t.current + '/' + t.target : '—', status: 'scan', auto: t.auto, isNew: !!t.new });
     }
-    if (rows.length) groups.push({ uid: a.uid, nick: a.nickname, rows, entSwitch: !!a.enterprise_switch });
+    if (rows.length) groups.push({ uid: a.uid, nick: a.nickname, rows });
   }
   return groups;
 }
@@ -2128,7 +2128,6 @@ function renderQueue(groups, progress, emptyTitle, emptyDesc) {
   list.innerHTML = groups.map(g => {
     total += g.rows.length;
     return '<div class="qgroup"><header><span class="nm">' + esc(g.nick || g.uid.slice(0, 12)) + '</span>' +
-      (g.entSwitch ? '<span class="tag mute" title="凭证带 enterprise_switch 标记但未绑定企业租户：实测仍计分，不影响执行">企业切换</span>' : '') +
       '<span class="cnt">' + g.rows.length + ' 项待办</span></header>' +
       g.rows.map(qrowHTML).join('') + '</div>';
   }).join('');

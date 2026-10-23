@@ -288,9 +288,10 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	}
 	// 两类企业相关凭证，展示口径不同（2026-10-23 实测修正后）：
 	//   - enterprise_switch：JWT 带 token_source=enterprise_switch 但**未绑定租户**
-	//     （enterprise_id 空）。实测仍正常计分，只做中性标注「凭证走过企业空间」；
+	//     （enterprise_id 空）。它只是登录入口标记，实测仍正常计分 —— 前端**不渲染**
+	//     徽标（一枚对"能否得分"零判断力的标签只会误导，2026-10-23 已撤）；
 	//   - enterprise_session：真正绑定企业租户 / 企业版 → 行为事件被上游静默丢弃，
-	//     任务动作会被拦截，前端标红「不计分」。
+	//     任务动作会被拦截，前端标红「企业会话·不计分」。
 	switchUIDs := make([]string, 0, 4)
 	sessionUIDs := make([]string, 0, 4)
 	for _, st := range accounts {

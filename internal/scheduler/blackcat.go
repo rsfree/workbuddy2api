@@ -39,7 +39,7 @@ func (s *Scheduler) RunBlackcatNow() {
 			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
 		}
 		if a.IsEnterpriseSession() {
-			continue // 企业版 / 企业切换会话门控：无成长体系（growth 403 / claim-gift 400「企业账号不支持该操作」；切换会话不计分）
+			continue // 企业版 / 绑定租户的企业会话门控：无成长体系（growth 403 / claim-gift 400「企业账号不支持该操作」；绑定租户的会话不计分）
 		}
 		need, err := s.cfg.Upstream.BlackcatNeed(a)
 		if err != nil {

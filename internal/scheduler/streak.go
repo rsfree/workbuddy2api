@@ -30,7 +30,7 @@ func (s *Scheduler) RunStreakBonusNow() {
 			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
 		}
 		if a.IsEnterpriseSession() {
-			continue // 企业版 / 企业切换会话门控：无成长体系（/activity/growth/streak 企业号 403；切换会话 200 但不计分）
+			continue // 企业版 / 绑定租户的企业会话门控：无成长体系（/activity/growth/streak 企业号 403；绑定租户的会话 200 但不计分）
 		}
 		s.streakBonusAccount(a)
 	}

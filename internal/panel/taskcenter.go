@@ -149,8 +149,9 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 			if a.IsEnterprise() {
 				return
 			}
-			// 企业切换标记（未绑定租户）：仅中性标注凭证来源——实测仍计分，
-			// 不能当成「跑了也不入账」的证据（2026-10-23 实测修正）。
+			// 企业切换标记（只带 token_source=enterprise_switch、未绑定租户）：实测
+			// 仍正常计分，不能当成「跑了也不入账」的证据（2026-10-23 实测修正）。
+			// 接口保留这个来源信息，但前端**不再渲染徽标**——它对"能否得分"零判断力。
 			it.EnterpriseSwitch = a.EnterpriseSwitchOnly()
 			// 默认 + 小程序口径合并（mp 是默认超集，按 code 去重；mp 失败静默）。
 			tasks, _, err := p.listTasksBoth(a)
@@ -307,15 +308,17 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 				return
 			}
 			// 企业版门控：同上（企业版无个人成长体系，任务端点上游一律 403）。
-			// 企业切换会话（token_source=enterprise_switch）同跳：任务列表读得到，
-			// 但执行后行为事件被上游静默丢弃（200 不计分）——每项都是零收益白跑
-			// （含 expert_5 等真实对话配额），故不入队并给出重登指引（见
-			// auth.IsEnterpriseSession）。
+			// 绑定租户的企业会话同跳：任务列表读得到，但执行后行为事件被上游静默
+			// 丢弃（200 不计分）——每项都是零收益白跑（含 expert_5 等真实对话配额），
+			// 故不入队并给出重登指引。
+			// 🔴 口径是「**是否绑定租户**」（auth.IsEnterpriseSession 要求 enterprise_id
+			// 非空），不是 token_source：只带 enterprise_switch 而未绑定的凭证照常计分，
+			// 必须入队（2026-10-23 线上 22 个号被误伤过）。
 			if a.IsEnterprise() {
 				return
 			}
 			if a.IsEnterpriseSession() {
-				log.Printf("panel: WARN 队列跳过 uid=%s nickname=%q：凭证为企业切换会话（token_source=enterprise_switch），成长任务行为事件会被上游静默丢弃；请移除该账号，在浏览器退出企业切换（个人身份）后重新登录", a.UID, a.Nickname)
+				log.Printf("panel: WARN 队列跳过 uid=%s nickname=%q：凭证已绑定企业租户（无个人成长体系），成长任务行为事件会被上游静默丢弃；请移除该账号，在浏览器退出企业空间（个人身份）后重新登录", a.UID, a.Nickname)
 				return
 			}
 			if growth {
