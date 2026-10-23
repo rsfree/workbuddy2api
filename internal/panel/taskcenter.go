@@ -33,7 +33,8 @@ type scanAccountItem struct {
 	Growth    []scanTask `json:"growth,omitempty"`
 	GrowthErr string     `json:"growth_error,omitempty"`
 	// EnterpriseSwitch 该凭证带 token_source=enterprise_switch 但未绑定企业租户：
-	// 实测仍能计分（2026-10-23 两条主判据都点亮），只做中性标注，不影响执行。
+	// 实测仍能计分（2026-10-23 两条主判据都点亮），不影响执行。前端已不渲染徽标，
+	// 字段保留仅供 API 排查「token 从哪个入口签发」。
 	EnterpriseSwitch bool `json:"enterprise_switch,omitempty"`
 }
 

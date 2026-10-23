@@ -324,7 +324,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"in_flight_full": inFlightFull,
 		"accounts":       accounts,
 		// 企业相关凭证清单（uid）+ 计数：只影响展示，不改变选号/执行口径。
-		//   enterprise_switch  → 仅标记（实测可计分，中性灰标）
+		//   enterprise_switch  → 仅标记（实测可计分；前端已不渲染徽标）
 		//   enterprise_session → 真拦截（不参与成长任务，红标）
 		"enterprise_switch":        switchUIDs,
 		"enterprise_switch_count":  len(switchUIDs),
