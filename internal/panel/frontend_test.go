@@ -193,7 +193,10 @@ const end = src.indexOf('function rateLimitRowsHtml');
 if (start < 0 || end < 0) throw new Error('rate limit helpers not found');
 const ctx = { Date, Number, String, Math };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.rateLimitMeta=rateLimitMeta;', ctx);
+// 片段必须带 'use strict'：浏览器里 app.js 顶部就是严格模式，缺了它，未声明的隐式
+// 全局赋值会被静默接受——v1.13.6 之前的 rateLimitMeta 因此带着 detail 未声明的
+// ReferenceError 通过了测试，但线上账号池表格整片渲染失败。
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.rateLimitMeta=rateLimitMeta;', ctx);
 const now = new Date(2026, 8, 28, 14, 0, 0).getTime();
 const reset = new Date(2026, 8, 28, 16, 0, 0).getTime();
 const until = new Date(2026, 8, 28, 15, 0, 0).getTime();

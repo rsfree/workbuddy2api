@@ -264,6 +264,12 @@ function rateLimitMeta(row, now) {
     };
   }
   const title = [model, resetAt ? '上游重置：' + fmtLocalDateTime(resetAt) : '上游重置：时间未知'];
+  // detail 必须显式声明：下面两个分支都只在各自路径里赋值，原先缺声明 ⇒ 严格模式下
+  // 走「双时钟」分支时抛 ReferenceError（detail is not defined），renderAccounts 整个
+  // 中断、账号池表格变空白。那个分支要求池里真存在 until < reset_at 的账号，平时不
+  // 触发；单测把片段切出来单独求值、不带 'use strict'，隐式全局把错误吞了，所以一直
+  // 没被发现（v1.13.6 修复）。
+  let detail;
   if (until && resetAt && until < resetAt) {
     // 双时钟（issue #171 问题二）：黄框出现/消失由 until 决定（网关为防超长
     // 限流拖死全池，把重试封顶在 now+softRateMax），主文字却按 resetAt 显示，
