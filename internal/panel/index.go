@@ -11,8 +11,11 @@
 package panel
 
 import (
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"net/http"
+	"strings"
 )
 
 //go:embed index.html
@@ -52,35 +55,50 @@ func setSecurityHeaders(w http.ResponseWriter) {
 	w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
 }
 
+// writeStatic 输出内嵌静态资源，带 ETag + Cache-Control: no-cache。
+//
+// 为什么必须这么做：这些资源名是固定的（app.js / mobile.js，CSP 只允许同源固定名，
+// 没有内容哈希后缀），而先前**一个缓存头都不发**，浏览器就按启发式规则长期缓存，
+// 升级后仍然跑旧 app.js —— 面板出现「新后端 + 旧前端」的错位，例如已被修掉的企业
+// 切换徽标文案（2026-10-23 实测：线上 1.13.8 已改中性标注，用户侧仍显示旧的
+// 「企业切换·不计分」）。no-cache 的语义是「可缓存、但每次使用前必须校验」，
+// 配合 ETag 命中即回 304，代价只是一次条件请求。
+func writeStatic(w http.ResponseWriter, r *http.Request, contentType string, body []byte) {
+	sum := sha256.Sum256(body)
+	etag := `"` + hex.EncodeToString(sum[:8]) + `"`
+	h := w.Header()
+	h.Set("Content-Type", contentType)
+	h.Set("Cache-Control", "no-cache")
+	h.Set("ETag", etag)
+	if inm := r.Header.Get("If-None-Match"); inm != "" && strings.Contains(inm, etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
 // index 输出面板页面（静态无秘密；数据接口 /panel/api/* 才走鉴权）。
 func (p *Panel) index(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(indexHTML)
+	writeStatic(w, r, "text/html; charset=utf-8", indexHTML)
 }
 
 // appScript 输出前端逻辑（同源脚本，供 CSP script-src 'self' 加载）。
 func (p *Panel) appScript(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
-	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(appJS)
+	writeStatic(w, r, "text/javascript; charset=utf-8", appJS)
 }
 
 // mobileStyle 输出手机端适配样式（同源样式表，CSP style-src 'self' 加载）。
 // 单独成文而非写进 index.html：上游频繁改 index.html，独立文件可避免同步上游时反复冲突。
 func (p *Panel) mobileStyle(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
-	w.Header().Set("Content-Type", "text/css; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(mobileCSS)
+	writeStatic(w, r, "text/css; charset=utf-8", mobileCSS)
 }
 
 // mobileScript 输出手机端联动逻辑（同源脚本，须在 app.js 之后加载）。
 func (p *Panel) mobileScript(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
-	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(mobileJS)
+	writeStatic(w, r, "text/javascript; charset=utf-8", mobileJS)
 }
