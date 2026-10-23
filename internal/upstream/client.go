@@ -713,6 +713,12 @@ type Client struct {
 	// 与 HTTP 共享同一个 *http.Transport 实例，连接池不重复。
 	ChatHTTP *http.Client
 
+	// ImageHTTP 图像生成专用 client：无总时长上限，首字节上限用独立的
+	// imageHeaderTimeout（15m）。不能复用 ChatHTTP 的 Transport——生图请求在
+	// 上游排队时首字节可以到分钟级，chat 的 60s ResponseHeaderTimeout 会把它
+	// 误杀成传输层超时。独立 Transport 意味着独立连接池，生图流量占比低，可接受。
+	ImageHTTP *http.Client
+
 	// HeaderTimeout 聊天 SSE 首字节前（响应头）超时；<=0 表示未设置（回落 HTTP.Timeout）。
 	HeaderTimeout time.Duration
 	// IdleTimeout 聊天 SSE 流中空闲超时；<=0 表示禁用空闲监控。
@@ -730,6 +736,11 @@ type Client struct {
 	// modelRates 缓存各模型当前生效积分倍率（规范化数值，如 "0.5"）。
 	// 与 efforts 共用 realm 分层和锁；每次成功刷新模型目录时整体替换对应域。
 	modelRates map[string]map[string]string
+
+	// mediaMu/mediaModels 缓存各域媒体模型（image/video）目录，随 FetchModels
+	// 同一次上游探测刷新；只供 /v1/models 媒体区读取，不参与 chat 选号。
+	mediaMu     sync.RWMutex
+	mediaModels map[string][]ModelInfo
 
 	// globalModels 缓存 global 模型名目录探测结果（成功 ∩ 静态 overlay；
 	// 1h TTL + 5min 负缓存），见 global_models.go。按实例持有，测试新建 Client 即隔离。
@@ -821,9 +832,14 @@ type CreditObserver func(uid string, credits int64)
 // kongjianguan 4 连击实测经验）。
 func New() *Client {
 	tr := newTransport()
+	// 图像请求的 Transport 必须独立：ResponseHeaderTimeout 是 Transport 级字段，
+	// 与 chat 共用就无法既保住 chat 的 60s 快速失败、又给生图留分钟级排队时间。
+	imgTr := newTransport()
+	imgTr.ResponseHeaderTimeout = imageHeaderTimeout
 	c := &Client{
 		HTTP:          &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		ChatHTTP:      &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
+		ImageHTTP:     &http.Client{Timeout: 0, Transport: imgTr},
 		ChatBaseCN:    "https://copilot.tencent.com",
 		BillingBaseCN: "https://www.codebuddy.cn",
 		WebBaseCN:     "https://www.workbuddy.cn",
@@ -839,6 +855,14 @@ func New() *Client {
 func (c *Client) chatHTTP() *http.Client {
 	if c.ChatHTTP != nil {
 		return c.ChatHTTP
+	}
+	return c.HTTP
+}
+
+// imageHTTP 返回图像生成专用 client；未设置（测试只注入 HTTP）时回落 HTTP。
+func (c *Client) imageHTTP() *http.Client {
+	if c.ImageHTTP != nil {
+		return c.ImageHTTP
 	}
 	return c.HTTP
 }
@@ -1336,19 +1360,23 @@ type ModelInfo struct {
 	DefaultEffort string   // reasoning.defaultEffort（新模型键）或 reasoning.effort（老模型键）；空=未返回
 
 	// 模型目录全字段（models-full-fields）：
-	Description        string   // descriptionZh 中文描述
-	Credits            string   // credits 积分倍率原文（如 "x0.05"），仅展示不参与选号
-	Tags               []string // tags 模型标签（含 badge:限时免费 等）
-	Vendor             string   // vendor 厂商标识
-	IsDefault          bool     // isDefault 是否默认模型
-	SupportsReasoning  bool     // supportsReasoning 是否支持推理
-	SupportsToolCall   bool     // supportsToolCall 是否支持工具调用
-	OnlyReasoning      bool     // onlyReasoning 是否纯推理模型
-	SupportsImages     bool     // 顶层 supportsImages（多模态能力，透出到 /v1/models）
-	MaxAllowedSize     int64    // maxAllowedSize 最大允许上下文（与 maxInputTokens 口径并列，上游各自下发）
-	CanDisableThinking bool     // reasoning.canDisableThinking：思考可关（off 档可用）
-	ReasoningEffort    string   // reasoning.effort 推理模式（与 supportedEfforts 数组不同源）
-	ReasoningSummary   string   // reasoning.summary 推理摘要模式（如 "auto"）
+	Description       string   // descriptionZh 中文描述
+	Credits           string   // credits 积分倍率原文（如 "x0.05"），仅展示不参与选号
+	Tags              []string // tags 模型标签（含 badge:限时免费 等）
+	Vendor            string   // vendor 厂商标识
+	IsDefault         bool     // isDefault 是否默认模型
+	SupportsReasoning bool     // supportsReasoning 是否支持推理
+	SupportsToolCall  bool     // supportsToolCall 是否支持工具调用
+	OnlyReasoning     bool     // onlyReasoning 是否纯推理模型
+	SupportsImages    bool     // 顶层 supportsImages（多模态能力，透出到 /v1/models）
+	MaxAllowedSize    int64    // maxAllowedSize 最大允许上下文（与 maxInputTokens 口径并列，上游各自下发）
+
+	// Type 模型类型：chat / image / video，由 tags 判定。媒体模型不参与 chat 选号，
+	// 但会进入 /v1/models 的媒体区并供图像前门识别。
+	Type               string
+	CanDisableThinking bool   // reasoning.canDisableThinking：思考可关（off 档可用）
+	ReasoningEffort    string // reasoning.effort 推理模式（与 supportedEfforts 数组不同源）
+	ReasoningSummary   string // reasoning.summary 推理摘要模式（如 "auto"）
 
 	// 优惠（modelPromotions，/v3/config data.modelPromotions）：Credits 是**牌价**
 	//（转正后基准倍率），Promo* 是当前生效的限时优惠——面板据此显示「生效价 +
@@ -1417,10 +1445,25 @@ func (m dynModelEntry) modelInfo() ModelInfo {
 		SupportsToolCall:   m.SupportsTool,
 		OnlyReasoning:      m.OnlyReasoning,
 		MaxAllowedSize:     m.MaxAllowedSize,
+		Type:               modelTypeFromTags(m.Tags),
 		CanDisableThinking: m.Reasoning.CanDisableThinking,
 		ReasoningEffort:    m.Reasoning.Effort,
 		ReasoningSummary:   m.Reasoning.Summary,
 	}
+}
+
+// modelTypeFromTags 按 tags 判定媒体类型；非媒体返回 chat。
+// 判据与 nonChatModel 同源（官方目录 tag），避免两处口径漂移。
+func modelTypeFromTags(tags []string) string {
+	for _, t := range tags {
+		switch strings.ToLower(strings.TrimSpace(t)) {
+		case "text-to-video", "image-to-video":
+			return "video"
+		case "text-to-image", "image-to-image":
+			return "image"
+		}
+	}
+	return "chat"
 }
 
 // nonChatModel 判定是否非对话模型（应从模型列表过滤掉）。
@@ -1472,6 +1515,13 @@ const codeBuddyIDEUA = "CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0"
 //  2. 该常量仅用于 global 侧第二路探测；CN 侧仍走 codeBuddyIDEUA 单路。
 const codeBuddyCLIUA = "CLI/2.63.2 CodeBuddy/2.63.2"
 
+// modelProbe 一次目录探测的结果：chat 用于对话选号/模型列表，media 只进
+// /v1/models 的媒体区（图像 / 视频），两者都来自同一份 upstream 目录。
+type modelProbe struct {
+	chat  []ModelInfo
+	media []ModelInfo
+}
+
 // FetchModels 调上游动态模型接口（CN 侧；global 账号见 global_models.go 家族）。
 //
 // v3-config-merge：动态目录 = /v3/config（主，IDE UA 完整能力版）+ 企业端点
@@ -1481,21 +1531,40 @@ const codeBuddyCLIUA = "CLI/2.63.2 CodeBuddy/2.63.2"
 // 反之亦然（两路独立容错）。
 func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	type probeResult struct {
-		infos []ModelInfo
+		probe modelProbe
 		err   error
 	}
 	enterpriseCh := make(chan probeResult, 1)
 	v3Ch := make(chan probeResult, 1)
+	wbCh := make(chan probeResult, 1)
 	go func() {
-		infos, err := c.fetchEnterpriseModels(a)
-		enterpriseCh <- probeResult{infos, err}
+		probe, err := c.fetchEnterpriseModels(a)
+		enterpriseCh <- probeResult{probe, err}
 	}()
 	go func() {
-		infos, err := c.fetchV3Models(a)
-		v3Ch <- probeResult{infos, err}
+		probe, err := c.fetchV3Models(a)
+		v3Ch <- probeResult{probe, err}
+	}()
+	go func() {
+		// 媒体目录单独用 WorkBuddy 桌面 UA 探一次：实测同一账号同一 /v3/config，
+		// IDE UA 只下发 24 个模型（媒体仅 alpha），WorkBuddy UA 下发 62 个并带齐
+		// alpha-edit / kling-video-v3 / minimax-video-h3。chat 目录仍用 IDE UA
+		//（单模型字段更全），互不影响。
+		probe, err := c.fetchV3MediaModels(a)
+		wbCh <- probeResult{probe, err}
 	}()
 	enterprise := <-enterpriseCh
 	v3 := <-v3Ch
+	wb := <-wbCh
+	// 合并顺序有讲究：IDE 目录的 alpha 条目带 credits（x5.00），WorkBuddy 目录
+	// 的 alpha 没有；先 IDE 后 WorkBuddy，才能既有牌价又补齐 alpha-edit/视频。
+	media := mergeModelInfos(v3.probe.media, wb.probe.media)
+	media = mergeModelInfos(media, enterprise.probe.media)
+	// 媒体目录与 chat 目录同一次探测刷新：两路 chat 都成功时即使 media 为空也写入
+	//（表示上游确实下掉了媒体模型，清掉旧缓存）；只有部分成功时不贸然清空。
+	if len(media) > 0 || (v3.err == nil && enterprise.err == nil) {
+		c.storeMediaModels(a.Realm(), media)
+	}
 	if enterprise.err != nil && v3.err != nil {
 		return nil, enterprise.err // 两路全失败：返回企业端点错误（既有调用方语义零漂移）
 	}
@@ -1506,7 +1575,12 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	if enterprise.err != nil {
 		log.Printf("WARN: [upstream] fetch models: enterprise endpoint failed (v3/config only): %v", enterprise.err)
 	}
-	out := mergeModelInfos(v3.infos, enterprise.infos)
+	if wb.err != nil && len(media) == 0 && !strings.Contains(wb.err.Error(), "no media models") {
+		// 账号本来就没有媒体模型时 fetchV3MediaModels 会返回 no media models，
+		// 属于正常态，不刷 WARN；其他失败（网络/解析）才值得记。
+		log.Printf("WARN: [upstream] fetch models: media probe failed: %v", wb.err)
+	}
+	out := mergeModelInfos(v3.probe.chat, enterprise.probe.chat)
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")
 	}
@@ -1560,28 +1634,28 @@ func mergeModelInfos(primary, secondary []ModelInfo) []ModelInfo {
 
 // fetchEnterpriseModels 单路探测企业模型端点（/console/enterprises/personal/models）。
 // 解析口径：agents[cli].models 过滤 + nonChatModel 剔除 + disabled 剔除。
-func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
+func (c *Client) fetchEnterpriseModels(a *auth.Auth) (modelProbe, error) {
 	// 局部变量名避开 url（本包已 import net/url，同名会造成阅读混淆）。
 	endpoint := c.chatBase(a) + "/console/enterprises/personal/models"
 	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil, err
+		return modelProbe{}, err
 	}
 	c.CommonHeaders(req, a) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
 	// AccessToken 加锁快照（见 auth.AccessTokenValue：keepalive 刷新在 a.mu 内改写）。
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	resp, err := c.httpFor(a).Do(req)
 	if err != nil {
-		return nil, err
+		return modelProbe{}, err
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		// 读失败 → 传输层错误（handler 侧该路径不 NoteError）。
-		return nil, fmt.Errorf("read body: %w", err)
+		return modelProbe{}, fmt.Errorf("read body: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("models api status %d: %s", resp.StatusCode, truncate(string(raw), 120))
+		return modelProbe{}, fmt.Errorf("models api status %d: %s", resp.StatusCode, truncate(string(raw), 120))
 	}
 	var env struct {
 		Code int `json:"code"`
@@ -1594,10 +1668,10 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, fmt.Errorf("models parse: %w", err)
+		return modelProbe{}, fmt.Errorf("models parse: %w", err)
 	}
 	if env.Code != 0 {
-		return nil, fmt.Errorf("models api code=%d", env.Code)
+		return modelProbe{}, fmt.Errorf("models api code=%d", env.Code)
 	}
 	var cliIDs []string
 	for _, ag := range env.Data.Agents {
@@ -1607,50 +1681,80 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 		}
 	}
 	if len(cliIDs) == 0 {
-		return nil, fmt.Errorf("no cli agent models found")
+		return modelProbe{}, fmt.Errorf("no cli agent models found")
 	}
-	// dynMap 收集模型字段；nonChatModel 过滤在写入 dynMap 前执行，
-	// 确保非对话条目（nes-/completion-/codewise- 前缀、maxOutputTokens≤256、
-	// tags 含 text-to-image）根本不进返回列表（来源：harness buddy.ts:547-555）。
+	// 媒体模型（图像/视频）不参与 cli chat 名单，但必须收集进 media：官方目录里
+	// 它们的 tag 是 text-to-video/image-to-video，nonChatModel 会把它们直接丢掉。
+	probe := modelProbe{}
 	dynMap := make(map[string]dynModelEntry, len(env.Data.Models))
 	for _, m := range env.Data.Models {
+		mi := m.modelInfo()
+		if mi.Type == "image" || mi.Type == "video" {
+			if !m.Disabled {
+				probe.media = append(probe.media, mi)
+			}
+			continue
+		}
 		if nonChatModel(m.ID, m.MaxOutputTokens, m.Tags) {
 			continue
 		}
 		dynMap[m.ID] = m
 	}
-	out := make([]ModelInfo, 0, len(cliIDs))
 	for _, id := range cliIDs {
 		if m, ok := dynMap[id]; ok && !m.Disabled {
-			out = append(out, m.modelInfo())
+			probe.chat = append(probe.chat, m.modelInfo())
 		}
 	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("models api returned empty list")
+	if len(probe.chat) == 0 && len(probe.media) == 0 {
+		return modelProbe{}, fmt.Errorf("models api returned empty list")
 	}
-	return out, nil
+	return probe, nil
 }
 
 // fetchV3Models 单路探测 /v3/config（IDE UA 完整能力版，见 codeBuddyIDEUA）。
 // v3 面取全量 models（不按 agents[cli] 过滤，与 global 探测口径一致），按同一
 // nonChatModel 规则剔除非对话条目（selected 会选模型报 code=11102）。
 // 失败返回错误（调用方降级为仅企业端点）。
-func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
+// fetchV3MediaModels 用当前客户端 UA（默认 WorkBuddy 桌面端）探 /v3/config，
+// 只取 image/video 条目。媒体目录对 UA 敏感：IDE UA 会漏掉 alpha-edit 与视频模型。
+// 失败不影响 chat 目录（调用方只把它当媒体补充来源）。
+func (c *Client) fetchV3MediaModels(a *auth.Auth) (modelProbe, error) {
+	byID, err := c.fetchV3ConfigModelMap(a, c.userAgent(a))
+	if err != nil {
+		return modelProbe{}, err
+	}
+	probe := modelProbe{}
+	for _, mi := range byID {
+		if mi.Type == "image" || mi.Type == "video" {
+			probe.media = append(probe.media, mi)
+		}
+	}
+	if len(probe.media) == 0 {
+		return modelProbe{}, fmt.Errorf("v3/config returned no media models")
+	}
+	return probe, nil
+}
+
+func (c *Client) fetchV3Models(a *auth.Auth) (modelProbe, error) {
 	byID, err := c.fetchV3ConfigModelMap(a, codeBuddyIDEUA)
 	if err != nil {
-		return nil, err
+		return modelProbe{}, err
 	}
-	out := make([]ModelInfo, 0, len(byID))
+	probe := modelProbe{}
 	for _, mi := range byID {
+		if mi.Type == "image" || mi.Type == "video" {
+			probe.media = append(probe.media, mi)
+			continue
+		}
 		if nonChatModel(mi.ID, mi.MaxTokens, mi.Tags) {
 			continue
 		}
-		out = append(out, mi)
+		probe.chat = append(probe.chat, mi)
 	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("v3/config returned empty models")
+	if len(probe.chat) == 0 && len(probe.media) == 0 {
+		return modelProbe{}, fmt.Errorf("v3/config returned empty models")
 	}
-	return out, nil
+	return probe, nil
 }
 
 // v3ModelPromotion /v3/config data.modelPromotions 单条优惠定义（2026-09-23 实测
@@ -1866,6 +1970,42 @@ func (c *Client) storeModelRates(realm string, infos []ModelInfo) {
 		c.modelRates = make(map[string]map[string]string)
 	}
 	c.modelRates[realmKey(realm)] = rates
+}
+
+// storeMediaModels 按 realm 整体替换媒体模型目录快照。
+// 传入空切片表示上游确认下掉全部媒体模型（调用方负责只在探测成功时调用）。
+func (c *Client) storeMediaModels(realm string, infos []ModelInfo) {
+	cp := make([]ModelInfo, len(infos))
+	copy(cp, infos)
+	c.mediaMu.Lock()
+	if c.mediaModels == nil {
+		c.mediaModels = make(map[string][]ModelInfo)
+	}
+	c.mediaModels[realmKey(realm)] = cp
+	c.mediaMu.Unlock()
+}
+
+// StoreMediaModels 显式写入媒体模型目录（global 探测与测试用）。
+// 正常 CN 路径由 FetchModels 自动写入，不需要调用方手工维护。
+func (c *Client) StoreMediaModels(realm string, infos []ModelInfo) {
+	c.storeMediaModels(realm, infos)
+}
+
+// MediaModels 返回最近一次探测到的指定域媒体模型（image/video）快照。
+// 返回副本，调用方可安全遍历；未探测过返回 nil。
+func (c *Client) MediaModels(realm string) []ModelInfo {
+	if c == nil {
+		return nil
+	}
+	c.mediaMu.RLock()
+	defer c.mediaMu.RUnlock()
+	list := c.mediaModels[realmKey(realm)]
+	if len(list) == 0 {
+		return nil
+	}
+	cp := make([]ModelInfo, len(list))
+	copy(cp, list)
+	return cp
 }
 
 // ModelRate 返回最近成功刷新的指定域模型生效倍率；未知返回空串。

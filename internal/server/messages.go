@@ -16,13 +16,17 @@
 package server
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -41,6 +45,21 @@ type messagesRequest struct {
 	Model    string             `json:"model"`
 	Tools    []messagesTool     `json:"tools"`
 	Messages []messagesTurnItem `json:"messages"`
+
+	// 以下为网关扩展字段（Anthropic 协议本身没有，客户端可不传）：
+	//
+	// MaxResults 期望条数 1–10，缺省 5（上游默认）。上游最多给 10 条。
+	MaxResults int `json:"max_results"`
+	// AllowedDomains 严格域名白名单（后缀匹配：example.com 含 a.example.com）。
+	// 上游的 site: 只是软加权，过滤在网关侧做，才能真正只留目标站。
+	AllowedDomains []string `json:"allowed_domains"`
+	// ExcludedDomains 严格域名黑名单，优先级高于白名单。
+	ExcludedDomains []string `json:"excluded_domains"`
+	// FetchContent 为 true 时对前 FetchMax 条结果抓正文（/agenttool/v1/webfetch），
+	// 正文写进结果的 content 扩展字段。搜索给链接、抓取给全文。
+	FetchContent bool `json:"fetch_content"`
+	// FetchMax 抓正文的条数上限，缺省 3、封顶 5（每条都是一次真实上游抓取）。
+	FetchMax int `json:"fetch_max"`
 }
 
 // messagesTool 工具声明。搜索工具两种形态都认：`{type:"web_search_20250305"}`
@@ -127,6 +146,15 @@ type messagesSearchResultItem struct {
 	Type  string `json:"type"`
 	URL   string `json:"url"`
 	Title string `json:"title,omitempty"`
+
+	// 以下为网关扩展字段（fetch_content=true 时才有）：Anthropic 原生 result 只
+	// 有 url/title，多出的字段不影响既有客户端解析。
+	Content       string `json:"content,omitempty"`
+	ContentLength int    `json:"content_length,omitempty"`
+	// ContentTruncated 正文超过单条上限被截断；或上游标记 truncated。
+	ContentTruncated bool `json:"content_truncated,omitempty"`
+	// ContentError 该条抓取失败的原因（不影响其它条）。
+	ContentError string `json:"content_error,omitempty"`
 }
 
 // messagesToolResultBlock 搜索结果块。
@@ -145,8 +173,8 @@ type messagesCitation struct {
 
 // messagesTextBlock 承载 citations 的文本块。
 type messagesTextBlock struct {
-	Type      string            `json:"type"`
-	Text      string            `json:"text"`
+	Type      string             `json:"type"`
+	Text      string             `json:"text"`
 	Citations []messagesCitation `json:"citations,omitempty"`
 }
 
@@ -158,13 +186,13 @@ type messagesUsage struct {
 
 // messagesResponse Anthropic Messages 响应。
 type messagesResponse struct {
-	ID           string `json:"id"`
-	Type         string `json:"type"`
-	Role         string `json:"role"`
-	Model        string `json:"model"`
-	Content      []any  `json:"content"`
-	StopReason   string `json:"stop_reason"`
-	StopSequence any    `json:"stop_sequence"`
+	ID           string        `json:"id"`
+	Type         string        `json:"type"`
+	Role         string        `json:"role"`
+	Model        string        `json:"model"`
+	Content      []any         `json:"content"`
+	StopReason   string        `json:"stop_reason"`
+	StopSequence any           `json:"stop_sequence"`
 	Usage        messagesUsage `json:"usage"`
 }
 
@@ -176,7 +204,13 @@ type messagesResponse struct {
 //   - 该 block 的 content[] 每项 type="web_search_result"，url 非空；
 //   - snippet 只能从 text block 的 citations[].cited_text 取（web_search_result
 //     本身不带摘要），故有摘要时追加一个 text block 承载引用。
-func buildMessagesSearchResponse(query, model string, out *upstream.SearchOutcome) messagesResponse {
+func buildMessagesSearchResponse(query, model string, out *upstream.SearchOutcome, extras ...map[string]messagesFetchExtra) messagesResponse {
+	// extras 可选：fetch_content=true 时传入的「url → 正文」映射。
+	// 用可变参数是为了让不关心正文的调用方（以及既有测试）零改动。
+	var fetched map[string]messagesFetchExtra
+	if len(extras) > 0 {
+		fetched = extras[0]
+	}
 	items := make([]messagesSearchResultItem, 0, len(out.Results))
 	citations := make([]messagesCitation, 0, len(out.Results))
 	for _, r := range out.Results {
@@ -184,11 +218,18 @@ func buildMessagesSearchResponse(query, model string, out *upstream.SearchOutcom
 		if title == "" {
 			title = r.URL // 无标题时用 URL 兜底，客户端渲染 title ?? hostname 才不会空
 		}
-		items = append(items, messagesSearchResultItem{
+		item := messagesSearchResultItem{
 			Type:  "web_search_result",
 			URL:   r.URL,
 			Title: title,
-		})
+		}
+		if ex, ok := fetched[r.URL]; ok {
+			item.Content = ex.Content
+			item.ContentLength = ex.ContentLength
+			item.ContentTruncated = ex.Truncated
+			item.ContentError = ex.Err
+		}
+		items = append(items, item)
 		if r.Snippet != "" {
 			citations = append(citations, messagesCitation{
 				Type:      "web_search_result_location",
@@ -275,7 +316,34 @@ func (h *Handler) messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	out, fail := h.runSearch(r.Context(), query, 0, searchMetaFromRequest(r))
+	// 条数：缺省 5（上游默认），封顶 10（上游服务端上限，超了也不会多给）。
+	maxResults := req.MaxResults
+	if maxResults <= 0 {
+		maxResults = upstream.SearchDefaultMaxResults
+	}
+	if maxResults > upstream.SearchMaxResultsCap {
+		maxResults = upstream.SearchMaxResultsCap
+	}
+
+	allowed := normalizeDomainList(req.AllowedDomains)
+	excluded := normalizeDomainList(req.ExcludedDomains)
+	searchQuery := query
+	upstreamN := maxResults
+	if len(allowed) == 1 && !strings.Contains(strings.ToLower(searchQuery), "site:") {
+		// site: 必须放在**查询开头**才生效：实测同一句 `智能体 落地`，
+		// 后缀 `… site:mp.weixin.qq.com` 只回 1/5 公众号，前缀 `site:mp.weixin.qq.com …`
+		// 回 5/5。上游把它当限定词而非布尔过滤，位置决定召回。
+		// 仍是软加权（会混入 developers.weixin.qq.com 等同公司子域），
+		// 故网关侧还要做严格后缀过滤。
+		searchQuery = "site:" + allowed[0] + " " + searchQuery
+	}
+	if len(allowed) > 0 || len(excluded) > 0 || req.FetchContent {
+		// 过滤/抓正文都要更多候选：只要 5 条时，过滤后可能只剩 0–2 条。
+		upstreamN = upstream.SearchMaxResultsCap
+	}
+
+	meta := searchMetaFromRequest(r)
+	out, fail := h.runSearch(r.Context(), searchQuery, upstreamN, meta)
 	if fail != nil {
 		// Anthropic 错误类型映射：限流用 rate_limit_error，其余用 api_error，
 		// 与真实 Anthropic 的错误词表保持可识别。
@@ -292,5 +360,198 @@ func (h *Handler) messages(w http.ResponseWriter, r *http.Request) {
 		writeMessagesError(w, fail.status, errType, msg)
 		return
 	}
-	writeJSON(w, http.StatusOK, buildMessagesSearchResponse(query, req.Model, out))
+	// 严格域名过滤在网关侧做：上游 site: 不保证「只返回该站」。
+	if len(allowed) > 0 || len(excluded) > 0 {
+		before := len(out.Results)
+		out.Results = filterSearchResults(out.Results, allowed, excluded)
+		if removed := before - len(out.Results); removed > 0 {
+			w.Header().Set("X-WB2A-Search-Filtered", strconv.Itoa(removed))
+		}
+		if len(out.Results) == 0 && len(allowed) > 0 {
+			// 明确告知「搜到了但都被域名过滤掉了」，避免客户端以为上游没结果。
+			w.Header().Set("X-WB2A-Search-Warn", "no-results-after-domain-filter")
+		}
+	}
+	// 过滤后可能超过调用方期望条数（上游取的是 10 条候选）。
+	if len(out.Results) > maxResults {
+		out.Results = out.Results[:maxResults]
+	}
+	w.Header().Set("X-WB2A-Search-Max", strconv.Itoa(maxResults))
+
+	var extras map[string]messagesFetchExtra
+	if req.FetchContent {
+		fetchMax := req.FetchMax
+		if fetchMax <= 0 {
+			fetchMax = searchFetchDefault
+		}
+		if fetchMax > searchFetchMax {
+			fetchMax = searchFetchMax
+		}
+		extras = h.fetchResultContents(r.Context(), meta, out.Results, fetchMax)
+		if len(extras) > 0 {
+			w.Header().Set("X-WB2A-Search-Fetched", strconv.Itoa(len(extras)))
+		}
+	}
+
+	writeJSON(w, http.StatusOK, buildMessagesSearchResponse(query, req.Model, out, extras))
+}
+
+// ---------- 域名过滤与正文补全 ----------
+
+const (
+	// searchFetchDefault 默认抓几条正文。每条都是一次真实抓取，3 条是「够用且不慢」的折中。
+	searchFetchDefault = 3
+	// searchFetchMax 单次搜索最多抓 5 条正文（并发度也是 5）。
+	searchFetchMax = 5
+	// searchContentMaxChars 单条正文写回响应的字符上限。公众号长文 1–2 万字很常见，
+	// 全量塞进搜索响应会让单次响应膨胀到几百 KB；需要全文请直接调 /v1/fetch。
+	searchContentMaxChars = 20000
+)
+
+// normalizeDomainList 归一域名：小写、去 scheme/端口/路径、去空白与空项。
+// 支持传 "mp.weixin.qq.com" 或 "https://mp.weixin.qq.com/s/xxx" 两种写法。
+func normalizeDomainList(in []string) []string {
+	out := make([]string, 0, len(in))
+	seen := make(map[string]bool, len(in))
+	for _, raw := range in {
+		d := strings.TrimSpace(strings.ToLower(raw))
+		if d == "" {
+			continue
+		}
+		if strings.HasPrefix(d, "http://") || strings.HasPrefix(d, "https://") {
+			if u, err := url.Parse(d); err == nil && u.Hostname() != "" {
+				d = u.Hostname()
+			}
+		}
+		if i := strings.IndexAny(d, "/?#"); i >= 0 {
+			d = d[:i]
+		}
+		if h, _, err := strings.Cut(d, ":"); err && h != "" {
+			d = h
+		}
+		d = strings.Trim(d, ".")
+		if d == "" || seen[d] {
+			continue
+		}
+		seen[d] = true
+		out = append(out, d)
+	}
+	return out
+}
+
+// hostMatchesDomain 后缀匹配：example.com 命中 example.com 与 a.example.com，
+// 但不会命中 notexample.com（避免 "site:example.com" 被仿冒域绕过）。
+func hostMatchesDomain(host, domain string) bool {
+	host = strings.ToLower(strings.Trim(host, "."))
+	if host == "" || domain == "" {
+		return false
+	}
+	return host == domain || strings.HasSuffix(host, "."+domain)
+}
+
+// urlHost 取 URL 的主机名；解析失败返回空串。
+func urlHost(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(u.Hostname())
+}
+
+// filterSearchResults 按白/黑名单过滤结果。排除优先于允许。
+// 无法解析出 host 的结果：有白名单时丢弃（无法证明它在白名单内），
+// 只配黑名单时保留（没有证据表明它在黑名单内）。
+func filterSearchResults(results []upstream.SearchResult, allowed, excluded []string) []upstream.SearchResult {
+	if len(allowed) == 0 && len(excluded) == 0 {
+		return results
+	}
+	out := make([]upstream.SearchResult, 0, len(results))
+	for _, r := range results {
+		host := urlHost(r.URL)
+		if host == "" {
+			if len(allowed) > 0 {
+				continue
+			}
+			out = append(out, r)
+			continue
+		}
+		if matchesAny(host, excluded) {
+			continue
+		}
+		if len(allowed) > 0 && !matchesAny(host, allowed) {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+func matchesAny(host string, domains []string) bool {
+	for _, d := range domains {
+		if hostMatchesDomain(host, d) {
+			return true
+		}
+	}
+	return false
+}
+
+// messagesFetchExtra 单条结果的正文补全产物。
+type messagesFetchExtra struct {
+	Content       string
+	ContentLength int
+	Truncated     bool
+	Err           string
+}
+
+// fetchResultContents 并发抓取前 limit 条结果的正文，返回 url → 正文映射。
+//
+// 抓取失败不失败整个搜索：错误写进该条的 content_error，其余结果照常返回。
+// 并发度固定 5（等于 searchFetchMax），每条内部仍走账号轮转与在途租约。
+func (h *Handler) fetchResultContents(ctx context.Context, meta upstream.ChatMeta, results []upstream.SearchResult, limit int) map[string]messagesFetchExtra {
+	if limit <= 0 || len(results) == 0 {
+		return nil
+	}
+	if limit > len(results) {
+		limit = len(results)
+	}
+	out := make(map[string]messagesFetchExtra, limit)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, searchFetchMax)
+	for _, r := range results[:limit] {
+		u := strings.TrimSpace(r.URL)
+		if u == "" {
+			continue
+		}
+		wg.Add(1)
+		go func(target string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			// 语义：抓正文只要内容，不需要额外的提取指令。
+			fetched, fail := h.runFetch(ctx, meta, target, "")
+			mu.Lock()
+			defer mu.Unlock()
+			if fail != nil {
+				out[target] = messagesFetchExtra{Err: fail.msg}
+				return
+			}
+			content := fetched.Content
+			truncated := fetched.Truncated
+			if len(content) > searchContentMaxChars {
+				content = content[:searchContentMaxChars]
+				truncated = true
+			}
+			out[target] = messagesFetchExtra{
+				Content:       content,
+				ContentLength: fetched.ContentLength,
+				Truncated:     truncated,
+			}
+		}(u)
+	}
+	wg.Wait()
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }

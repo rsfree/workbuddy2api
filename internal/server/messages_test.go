@@ -339,3 +339,165 @@ func TestMessagesResponseIDsAreUnique(t *testing.T) {
 		t.Errorf("msg id=%q want msg_wb2api_ 前缀", a.ID)
 	}
 }
+
+// searchItems 从 Messages 响应里取 web_search_tool_result 的结果项。
+func searchItems(t *testing.T, body []byte) []map[string]any {
+	t.Helper()
+	var resp struct {
+		Content []map[string]any `json:"content"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode: %v body=%s", err, body)
+	}
+	for _, blk := range resp.Content {
+		if blk["type"] != "web_search_tool_result" {
+			continue
+		}
+		raw, _ := blk["content"].([]any)
+		out := make([]map[string]any, 0, len(raw))
+		for _, it := range raw {
+			if m, ok := it.(map[string]any); ok {
+				out = append(out, m)
+			}
+		}
+		return out
+	}
+	t.Fatalf("响应里没有 web_search_tool_result: %s", body)
+	return nil
+}
+
+// TestMessagesMaxResultsAndDomainFilter 网关扩展字段：
+// max_results 收敛到上游上限、allowed_domains 在本地严格过滤、单一域名自动加 site:。
+func TestMessagesMaxResultsAndDomainFilter(t *testing.T) {
+	var gotQuery string
+	var gotMax float64
+	up := newSearchUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		gotQuery, _ = body["query"].(string)
+		gotMax, _ = body["max_results"].(float64)
+		_, _ = w.Write([]byte(`{"query":"q","type":"text2text","provider":"1","results":[
+			{"title":"wx1","url":"https://mp.weixin.qq.com/s/1","snippet":"a"},
+			{"title":"other1","url":"https://developers.weixin.qq.com/x","snippet":"b"},
+			{"title":"wx2","url":"http://mp.weixin.qq.com/s/2","snippet":"c"},
+			{"title":"other2","url":"https://hub.baai.ac.cn/view/1","snippet":"d"},
+			{"title":"wx3","url":"https://mp.weixin.qq.com/s/3","snippet":"e"},
+			{"title":"other3","url":"https://openai.weixin.qq.com/","snippet":"f"},
+			{"title":"wx4","url":"https://mp.weixin.qq.com/s/4","snippet":"g"}
+		],"total_results":7}`))
+	})
+	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up})
+
+	body := `{"model":"m","max_tokens":1024,"max_results":3,"allowed_domains":["https://mp.weixin.qq.com/s/anything"],
+		"tools":[{"type":"web_search_20250305","name":"web_search"}],
+		"messages":[{"role":"user","content":"Perform a web search for the query: 智能体 落地"}]}`
+	rec := doMessages(t, h, "", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	items := searchItems(t, rec.Body.Bytes())
+	if len(items) != 3 {
+		t.Fatalf("items=%d want 3: %v", len(items), items)
+	}
+	for _, it := range items {
+		if u, _ := it["url"].(string); !strings.Contains(u, "mp.weixin.qq.com") {
+			t.Errorf("过滤后仍出现非公众号: %v", it)
+		}
+	}
+	if gotMax != 10 {
+		t.Errorf("upstream max_results=%v want 10（过滤需要更多候选）", gotMax)
+	}
+	if !strings.Contains(gotQuery, "site:mp.weixin.qq.com") {
+		t.Errorf("query=%q want site: 注入", gotQuery)
+	}
+	if got := rec.Header().Get("X-WB2A-Search-Max"); got != "3" {
+		t.Errorf("X-WB2A-Search-Max=%q", got)
+	}
+	if got := rec.Header().Get("X-WB2A-Search-Filtered"); got != "3" {
+		t.Errorf("X-WB2A-Search-Filtered=%q want 3", got)
+	}
+}
+
+// TestMessagesExcludedDomains 黑名单优先于白名单。
+func TestMessagesExcludedDomains(t *testing.T) {
+	up := newSearchUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"query":"q","type":"text2text","results":[
+			{"title":"keep","url":"https://good.example/a","snippet":"a"},
+			{"title":"drop","url":"https://spam.good.example/b","snippet":"b"},
+			{"title":"keep2","url":"https://other.example/c","snippet":"c"}
+		],"total_results":3}`))
+	})
+	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up})
+
+	body := `{"model":"m","max_tokens":1024,"excluded_domains":["spam.good.example"],
+		"tools":[{"type":"web_search_20250305","name":"web_search"}],
+		"messages":[{"role":"user","content":"Perform a web search for the query: qq"}]}`
+	rec := doMessages(t, h, "", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	items := searchItems(t, rec.Body.Bytes())
+	if len(items) != 2 {
+		t.Fatalf("items=%d want 2: %v", len(items), items)
+	}
+	for _, it := range items {
+		if u, _ := it["url"].(string); strings.Contains(u, "spam.good.example") {
+			t.Errorf("黑名单域名未被过滤: %v", it)
+		}
+	}
+}
+
+// TestMessagesFetchContent fetch_content 给前 N 条结果补正文，失败只影响该条。
+func TestMessagesFetchContent(t *testing.T) {
+	up := newSearchUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/agenttool/v1/search":
+			_, _ = w.Write([]byte(`{"query":"q","type":"text2text","results":[
+				{"title":"ok","url":"https://mp.weixin.qq.com/s/ok","snippet":"a"},
+				{"title":"bad","url":"https://mp.weixin.qq.com/s/bad","snippet":"b"}
+			],"total_results":2}`))
+		case "/agenttool/v1/webfetch":
+			var body map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body["url"] == "https://mp.weixin.qq.com/s/bad" {
+				_, _ = w.Write([]byte(`{"code":15003,"msg":"blocked"}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"url":"https://mp.weixin.qq.com/s/ok","title":"ok",
+				"content":"完整正文","content_length":4,"status_code":200}`))
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	})
+	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up})
+
+	body := `{"model":"m","max_tokens":1024,"fetch_content":true,"fetch_max":2,
+		"tools":[{"type":"web_search_20250305","name":"web_search"}],
+		"messages":[{"role":"user","content":"Perform a web search for the query: qq"}]}`
+	rec := doMessages(t, h, "", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	items := searchItems(t, rec.Body.Bytes())
+	if len(items) != 2 {
+		t.Fatalf("items=%d", len(items))
+	}
+	byURL := map[string]map[string]any{}
+	for _, it := range items {
+		byURL[it["url"].(string)] = it
+	}
+	ok := byURL["https://mp.weixin.qq.com/s/ok"]
+	if ok["content"] != "完整正文" {
+		t.Errorf("ok item=%v", ok)
+	}
+	bad := byURL["https://mp.weixin.qq.com/s/bad"]
+	if bad["content_error"] == nil || bad["content_error"] == "" {
+		t.Errorf("bad item 应带 content_error: %v", bad)
+	}
+	if got := rec.Header().Get("X-WB2A-Search-Fetched"); got != "2" {
+		t.Errorf("X-WB2A-Search-Fetched=%q", got)
+	}
+}

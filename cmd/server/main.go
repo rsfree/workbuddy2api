@@ -365,6 +365,17 @@ func main() {
 		// 模型黑名单原始条目；运行期以 livecfg 快照为准（热生效），此处供
 		// Live 为 nil 的裸用/测试路径。
 		ModelsHidden: cfg.Models.Hidden,
+		// 图像接口（/v1/images/*）：默认模型、总时限、参考图上限与 /v1/models 可见性。
+		Images: &server.ImagesConfig{
+			Enabled:       cfg.Images.Enabled,
+			DefaultModel:  cfg.Images.DefaultModel,
+			EditModel:     cfg.Images.EditModel,
+			FallbackModel: cfg.Images.FallbackModel,
+			Deadline:      time.Duration(cfg.Images.DeadlineSeconds) * time.Second,
+			MaxRefImages:  cfg.Images.MaxRefImages,
+			FetchSourceIP: cfg.Images.FetchSourceIP,
+			ListInModels:  cfg.Images.ListInModels,
+		},
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

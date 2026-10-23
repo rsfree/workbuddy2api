@@ -66,6 +66,9 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | ⚡ **流式 + 非流式** | 出站强制 `stream:true`；SSE 帧按规范白名单重建；非流式由本地聚合为单响应 |
 | 🧠 **推理模型兼容** | DeepSeek 思维链注入（`thinking.type=enabled` + 默认档）、`reasoning_content` 多轮回填、effort 档位自动降级 |
 | 🔍 **联网搜索** | `POST /v1/search/messages` 把上游 `/agenttool/v1/search` 包成 Anthropic Messages 兼容形态（DSH 等客户端的搜索 provider 零改动接入）；复用账号池选号 / 在途租约 / token 刷新 / 错误冷却，出站请求头对齐官方客户端 |
+| 🎨 **图像生成** | `POST /v1/images/generations`（文生图）与 `POST /v1/images/edits`（图生图，multipart / JSON）把上游 `/v2/images/*` 包成 OpenAI images 形态；另提供 **chat 前门**：`/v1/chat/completions` 选图像模型即可直接生图（`stream` 回 SSE）。复用账号池 / 租约 / 冷却 / 用量积分记账。默认 `hunyuan-image-alpha` 与 `hunyuan-image-alpha-edit` |
+| 📄 **网页抓取** | `POST /v1/fetch` 把上游 `/agenttool/v1/webfetch` 包成 JSON 端点：给 URL 返回 `title` + markdown 正文。公众号文章实测 0.2s 拿到全文，补上搜索只能给 snippet 的缺口；复用账号轮转 / 租约 / 错误冷却 |
+| 🎬 **视频生成** | `POST /v1/videos/generations` 提交异步任务 + `GET /v1/videos/{id}` 轮询成片，对接上游 `/v2/videos/*`。支持首帧/尾帧、参考图 ≤9 / 视频 ≤3 / 音频 ≤3、分辨率与比例；任务→账号映射在内存保留 2h。默认 `minimax-video-h3`，另有 `kling-video-v3`（最高 4K） |
 | 💬 **系统提示词体系** | 网关自有提示词替换客户端 system（默认 `custom`），从源头消灭 system 来源的内容误报；`passthrough` 遇拦截自动降级重试 |
 | 🗑️ **指纹脱敏** | 出站请求体黑名单指纹字段清洗（可关闭），与提示词体系两层叠加 |
 | 📊 **可观测** | 每请求一行表格日志（TTFB / token 速率 / uid）；`/healthz` 带 `service` 身份标识可接负载均衡 / 宿主探活 |
@@ -352,7 +355,42 @@ curl -s http://localhost:7863/v1/search/messages \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4-flash","tools":[{"type":"web_search_20250305","name":"web_search"}],
        "messages":[{"role":"user","content":"Perform a web search for the query: OpenAI 最新模型"}]}'
+
+# 文生图（OpenAI images 形态）
+curl -s http://localhost:7863/v1/images/generations \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"hunyuan-image-alpha","prompt":"一只在雨里的橘猫","size":"1024x1024","n":1}'
+
+# 图生图（multipart，OpenAI 客户端同形态；也接受 JSON + data URI）
+curl -s http://localhost:7863/v1/images/edits \
+  -H "Authorization: Bearer your-api-key" \
+  -F model=hunyuan-image-alpha-edit \
+  -F prompt="把背景换成海边" \
+  -F image=@./cat.png
 ```
+
+### 图像生成
+
+两条端点共用一条「归一 → 选号 → 上游调用 → 记账」管道：
+
+| 端点 | 上游 | 说明 |
+|---|---|---|
+| `POST /v1/images/generations` | `/v2/images/generations` | 文生图。请求体带 `image` / `images` 时自动改走 edits（不会静默丢掉参考图） |
+| `POST /v1/images/edits` | `/v2/images/edits` | 图生图。支持 multipart（`image` 可重复）与 JSON（`image` 字符串或数组） |
+
+**Chat 前门**：同一个 `POST /v1/chat/completions` 选图像模型（如 `hunyuan-image-alpha`）时，网关把 user 消息折成 prompt、把 `image_url` / `input_image` 内容块折成参考图，走同一条生图管道，返回 `chat.completion`（`stream=true` 回 `chat.completion.chunk` + `[DONE]`）。system 消息不会混进生图 prompt；编辑模型没垫图会自动切到文本模型并回 `X-WB2A-Image-Warn`。`images.list_in_models=true` 时图像模型会出现在 `/v1/models`，纯聊天客户端可直接选用。
+
+- **模型列表**：`/v1/models` 末尾的媒体区来自上游目录动态探测（与 chat 同一次 `FetchModels`，缓存 10min），`type:"image"` 条目带 `endpoint`/`edits_endpoint`，`type:"video"` 条目带 `endpoint`/`poll_endpoint`。媒体目录单独用 WorkBuddy 桌面 UA 探一次 `/v3/config`——实测同一账号 IDE UA 只下发 1 个图像模型，桌面 UA 才带齐 `hunyuan-image-alpha-edit` / `kling-video-v3` / `minimax-video-h3`。`GET /v1/models?refresh=1` 强制立即重新探测。
+- **模型**：`hunyuan-image-alpha`（文生图，默认）、`hunyuan-image-v3.0`（新版文生图，账号已开通时可用）、`hunyuan-image-alpha-edit`（图生图）。可通过 `images.default_model` / `images.edit_model` 改默认值；`images.list_in_models=true` 时它们会带 `type:"image"` + `endpoint` 出现在 `/v1/models` 末尾。
+- **响应**：`{"created":…,"data":[{"url":…} 或 {"b64_json":…}],"usage":{"credit":7}}`——上游信封已展平；积分同时写进面板用量。
+- **入参收敛**：只保留白名单字段。`mask` 上游不支持，静默丢弃；`hunyuan-*` 不收 `response_format` / `quality` / `style` / `background`，非 hunyuan 模型默认 `response_format=b64_json`。
+- **参考图形态**：`data:image/...;base64,...`、裸 base64、`http(s)` URL 都接受。URL 由网关代下载并转 data URI（官方客户端同逻辑），下载器带 SSRF 防护（只连公网 IP、禁环境代理、最多 3 跳重定向、24MB 上限），错误信息会去掉预签名 query。本地文件路径网关读不到——请用 multipart 上传。
+  - 运维注意：多公网 IP 主机上，默认路由 IP 可能被图片 CDN 单独拉黑（实测 sched-1 的 `154.40.45.34` 连腾讯云 COS 连 SYN 都收不到，同机 `154.40.45.65` 0.2s 下载成功）。此时把 `images.fetch_source_ip` 配成可达的源 IP 即可，无需改路由；未配置且默认 IP 被拉黑时，URL 参考图会返回 400 `download failed`，客户端可改用 multipart / data URI。
+- **实测口径（2026-10-24）**：hunyuan 忽略 `n`，`n=2` 仍只返回 1 张、按 1 张扣费，网关回 `X-WB2A-Image-Warn: requested-n-2-got-1`；`response_format` 对 hunyuan 无效，始终返回 URL（上游图片带「AI生成 WORKBUDDY」水印）。
+- **分辨率与积分（同账号实测，按张计费，不随像素涨）**：`hunyuan-image-alpha` 支持 `512x512` / `1024x1024` / `2048x2048` / `1024x1536`，均为 **5.71 credits/张**；`4096x4096` 返回 `14402 unsupported_image_size`（不扣费）。`hunyuan-image-v3.0` 实测仅支持 `1024x1024`（**10.57 credits/张**），`2048x2048` / `4096x4096` 均被拒（不扣费）。价格随上游牌价变动，以响应里的 `usage.credit` 为准。
+- **诊断头**：`X-WB2A-Image-Model`（实际模型）、`X-WB2A-Model-Fallback`（未知模型兜底替换）、`X-WB2A-Image-Route`（generations 自动转 edits）、`X-WB2A-Upstream-Request-Id`。
+- **超时**：`images.deadline_seconds` 是总预算（默认 420s，跨账号轮转）；上游排队慢时不会再被 chat 的 60s 首字节超时误杀（图像走独立 HTTP client，首字节上限 15 分钟）。
 
 ## 配置说明
 
@@ -388,6 +426,14 @@ curl -s http://localhost:7863/v1/search/messages \
 | `upstream.timeout_seconds` | `120` | 短 RPC（刷新 / 签到 / 余额 / 模型列表）总时长上限 |
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
+| `images.enabled` | `true` | 是否挂载 `/v1/images/generations` 与 `/v1/images/edits` |
+| `images.default_model` | `hunyuan-image-alpha` | 文生图默认模型（请求未写 `model` 时使用；不会回落到 chat 的默认模型） |
+| `images.edit_model` | `hunyuan-image-alpha-edit` | 图生图默认模型 |
+| `images.fallback_model` | 空 | 请求写了未知图像模型时的兜底；空 = 交给上游判定（上游新增模型无需先升级网关） |
+| `images.deadline_seconds` | `420` | 单次生图总时限（跨账号轮转 + 重试）；只决定「还换不换号」，不打断在途调用 |
+| `images.max_ref_images` | `4` | 单次请求参考图上限，超出按顺序截尾 |
+| `images.fetch_source_ip` | 空 | 下载 URL 参考图时绑定的本机源 IP；空 = 默认路由。多公网 IP 主机上默认路由 IP 可能被图片 CDN 单独拉黑（实测 sched-1 的 `154.40.45.34` 连腾讯云 COS 恒定超时，同机 `154.40.45.65` 0.2s 可达），此时配一个可达源 IP 即可；只影响参考图下载，不改生图出口 |
+| `images.list_in_models` | `true` | 是否把动态探测到的图像/视频模型附到 `/v1/models` 末尾（带 `type`；图像带 `endpoint`/`edits_endpoint`，视频带 `endpoint`/`poll_endpoint`）。媒体目录与 chat 目录同一次上游探测刷新；`/v1/models?refresh=1` 可强制立即重探 |
 | `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`）。官网「使用端」列按出站 UA 服务端归因；官方 WorkBuddy 桌面 UA 为 `WorkBuddy/<version>`，需要时可配 |
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
 | `models.hidden` | `[]` | 模型黑名单：不对外暴露的模型。裸名=两域都藏；`"cn:xxx"`/`"global:xxx"`=只藏该域。`GET /v1/models` 列表过滤 + `POST /v1/chat/completions` 点名拒绝（400 `model_unavailable`）。面板保存后热生效 |
@@ -707,7 +753,12 @@ baseURL 指向 `<网关>/v1/search`，即可零代码接入本网关的搜索能
 - `tools` 必须声明 web_search（`type` 以 `web_search` 开头或 `name` 为 `web_search`），
   否则返回 400——本端点只服务搜索，不处理模型对话
 - 搜索词取自 user 消息文本，固定前缀 `Perform a web search for the query:` 会被剥离
-- 结果条数固定为官方默认值 5（服务端实际上限约 10）
+- 条数与过滤（网关扩展字段，都是可选的）：
+  - `max_results`：1–10，缺省 5；上游服务端上限 10
+  - `allowed_domains`：严格域名白名单（后缀匹配）；单域名时会自动在 query **开头**加 `site:<域名>`（实测后缀无效、前缀 5/5 命中），再在网关侧严格过滤
+  - `excluded_domains`：严格域名黑名单，优先级高于白名单
+  - `fetch_content` / `fetch_max`：给前 N 条（缺省 3、封顶 5）结果补正文，正文写进结果的 `content` 扩展字段
+- 诊断头：`X-WB2A-Search-Max`、`X-WB2A-Search-Filtered`（过滤掉几条）、`X-WB2A-Search-Fetched`（补了几条正文）、`X-WB2A-Search-Warn`
 
 响应为 Anthropic Messages 形态，搜索结果在 `web_search_tool_result` block 里：
 
@@ -741,9 +792,64 @@ baseURL 指向 `<网关>/v1/search`，即可零代码接入本网关的搜索能
 > **摘要只走 citations**：Anthropic 的 `web_search_result` 本身不带摘要，摘要由 `text`
 > block 的 `citations[].cited_text` 承载（与官方行为一致）。
 >
-> **上游未实现的参数不要暴露给用户**：实测 `allowed_domains`、`freshness`、
-> `blocked_domains`（折成 `(-site:)` 拼进 query）在服务端均**静默失效**——传了不报错也
-> 不生效。本端点因此不接受这三个字段，避免调用方产生「已过滤」的错误预期。
+> **域名过滤在网关侧做，不依赖上游**：实测上游对 `allowed_domains`、`freshness`、
+> `blocked_domains` 都是静默失效（传了不报错也不生效），只有 `site:` 能起到「软加权」作用。
+> 因此本端点的 `allowed_domains` / `excluded_domains` 是**网关自己过滤**：先让上游多给
+> 候选（最多 10 条），再按域名后缀严格筛选，最后截到 `max_results`。代价是过滤后
+> 条数可能少于期望值（上游只给 10 条候选），这属于上游能力上限，不是过滤 bug。
+
+### 网页正文抓取 `POST /v1/fetch`
+
+给一个 URL，返回标题与 markdown 正文。与搜索互补：搜索给「有哪些链接」，抓取给「链接里写了什么」。
+
+```bash
+curl -s http://localhost:7863/v1/fetch \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://mp.weixin.qq.com/s/xxxx","prompt":"提取正文"}'
+```
+
+```json
+{
+  "object": "web_fetch",
+  "url": "https://mp.weixin.qq.com/s/xxxx",
+  "title": "微信公众平台",
+  "content": "**标题**: ...\n\n# 正文标题\n...",
+  "content_type": "text/html",
+  "content_length": 3527,
+  "truncated": false,
+  "status_code": 200,
+  "usage": { "input_tokens": 0, "output_tokens": 0 }
+}
+```
+
+- `prompt` 是给上游内容提取器的指令，可省略（网关补默认值）；实测不会裁剪返回的 `content`，要摘要请自行处理
+- 只接受 `http` / `https`；`file://`、`javascript:` 等直接 400
+- 抓取失败（目标页要求登录、被风控、超时）按请求级错误返回，不会把账号判死
+- 公众号文章无需 Cookie / 微信 UA，上游已处理；实测 0.2s / 3.5k 字全文
+
+### 视频生成 `POST /v1/videos/generations` + `GET /v1/videos/{id}`
+
+上游是**异步任务**：提交只拿 task id，成片要靠轮询。网关保持同一语义，不做「一次请求等到成片」——那样会长时间占住在途租约，客户端超时重试还会重复扣费。
+
+```bash
+# 1) 提交
+curl -s http://localhost:7863/v1/videos/generations \
+  -H "Authorization: Bearer your-api-key" -H "Content-Type: application/json" \
+  -d '{"model":"minimax-video-h3","prompt":"一只猫在雪地里奔跑","seconds":5,
+       "resolution":"768P","aspect_ratio":"16:9"}'
+# → {"id":"task-xxx","object":"video","model":"minimax-video-h3","status":"queued","poll_url":"/v1/videos/task-xxx"}
+
+# 2) 轮询
+curl -s http://localhost:7863/v1/videos/task-xxx -H "Authorization: Bearer your-api-key"
+# → {"id":"task-xxx","status":"completed","url":"https://...","videos":[{"url":"https://..."}],"usage":{"credit":12.5}}
+```
+
+- 模型：`minimax-video-h3`（默认；768P/2K，7 种比例，参考图 ≤9 / 视频 ≤3 / 音频 ≤3，音频常开）、`kling-video-v3`（720P/1080P/4K，16:9/9:16/1:1，音频可开关）
+- 入参：`prompt`（有首帧时可空）、`seconds`、`image_url`（首帧）、`last_image_url`（尾帧，必须同时给首帧）、`reference_images` / `reference_videos` / `reference_audios`（字符串或 `[{"image_url":...}]`）、`resolution`、`aspect_ratio`、`enable_audio`、`watermark`
+- **任务归属账号**：上游按账号隔离任务，查询必须用提交时的同一个号。网关在内存里维护 task → 账号映射（保留 2h），**进程重启后旧 task id 查不到**（任务仍在上游跑）
+- 成片积分在第一次看到 `completed` 时记一次账，重复轮询不会重复计数
+- 提交阶段的账号故障按既有错误策略冷却/熔断；查询阶段失败同样会按 Kind 处置
 
 **余额后台刷新**（`schedule.balance_refresh_enabled`，缺省开启）：每 `balance_refresh_minutes`（缺省 5）分钟并发查询全部账号余额并更新池内积分——两次签到时点之间 credits 保持新鲜，余额恢复的冷却账号也会自动解冻（语义同签到，但不做签到不刷 token）。面板「立即刷新」按钮也是全量刷余额；5 秒自动轮询只读内存，不打上游。
 

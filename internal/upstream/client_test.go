@@ -632,10 +632,13 @@ func TestFetchModelsOverlaysV3ConfigCapabilities(t *testing.T) {
 				{"id":"deepseek-v4.1-flash","name":"Deepseek-V4.1-Flash","maxInputTokens":1000000,"maxOutputTokens":128000,"credits":"x0.03 credits","supportsReasoning":true,"onlyReasoning":true,"reasoning":{"effort":"high","summary":"auto"}}
 			],"agents":[{"name":"cli","models":["deepseek-v4.1-flash"]}]}}`), nil
 		case strings.HasSuffix(r.URL.Path, "/v3/config"):
-			sawIDE = true
-			if r.Header.Get("User-Agent") != codeBuddyIDEUA {
-				t.Errorf("v3/config UA=%q want %s", r.Header.Get("User-Agent"), codeBuddyIDEUA)
+			ua := r.Header.Get("User-Agent")
+			if ua != codeBuddyIDEUA {
+				// 第二路 /v3/config 是媒体目录探测（WorkBuddy/当前配置 UA），
+				// 返回空模型让 FetchModels 走 chat 两路即可。
+				return jsonResp(200, `{"code":0,"data":{"models":[]}}`), nil
 			}
+			sawIDE = true
 			if r.Header.Get("X-Product") != "SaaS" {
 				t.Errorf("X-Product=%q want SaaS", r.Header.Get("X-Product"))
 			}
@@ -643,7 +646,7 @@ func TestFetchModelsOverlaysV3ConfigCapabilities(t *testing.T) {
 				t.Errorf("X-User-Id=%q want u1", r.Header.Get("X-User-Id"))
 			}
 			return jsonResp(200, `{"code":0,"data":{"models":[
-				{"id":"deepseek-v4.1-flash","name":"Deepseek-V4.1-Flash","maxInputTokens":1000000,"maxOutputTokens":393216,"credits":"x0.03","supportsReasoning":true,"onlyReasoning":true,"reasoning":{"canDisableThinking":true,"defaultEffort":"high","summary":"auto","supportedEfforts":["low","high","max"]}}
+				{"id":"deepseek-v4.1-flash","name":"Deepseek-v4.1-Flash","maxInputTokens":1000000,"maxOutputTokens":393216,"credits":"x0.03","supportsReasoning":true,"onlyReasoning":true,"reasoning":{"canDisableThinking":true,"defaultEffort":"high","summary":"auto","supportedEfforts":["low","high","max"]}}
 			]}}`), nil
 		default:
 			t.Errorf("unexpected path %s", r.URL.Path)

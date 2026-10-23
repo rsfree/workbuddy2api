@@ -78,6 +78,59 @@ type Config struct {
 	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
 	// 保持为空，归档与面板都不出现来源信息。
 	RecordClientInfo bool
+
+	// Images 图像接口配置。nil = 用内置默认（启用；alpha / alpha-edit；420s；4 张）。
+	// 为什么用指针而不是零值：false/0 是合法配置（关闭、不限），需要区分
+	// 「没配置」与「显式关掉」。
+	Images *ImagesConfig
+}
+
+// ImagesConfig /v1/images/* 的运行参数（来自 config images 段）。
+type ImagesConfig struct {
+	// Enabled 是否挂载 /v1/images/generations 与 /v1/images/edits。
+	Enabled bool
+	// DefaultModel 文生图默认模型（请求未写 model 时使用）。
+	DefaultModel string
+	// EditModel 图生图默认模型。
+	EditModel string
+	// FallbackModel 请求写了未知模型时的兜底（空 = 不兜底，交给上游判定）。
+	FallbackModel string
+	// Deadline 单次生图请求的总时限（跨账号轮转 + 重试）。
+	Deadline time.Duration
+	// MaxRefImages 单次请求的参考图上限（超出截尾）。
+	MaxRefImages int
+	// FetchSourceIP 下载 URL 参考图时绑定的本机源 IP（空 = 走默认路由）。
+	// 多公网 IP 主机上，默认路由 IP 可能被图片 CDN（如腾讯云 COS）单独拉黑：
+	// 此时指定一个可达的源 IP 即可，不影响生图请求本身的账号出口绑定。
+	FetchSourceIP string
+	// ListInModels 是否把图像模型附到 /v1/models 末尾（带 type/endpoint 字段）。
+	ListInModels bool
+}
+
+// imagesCfg 返回归一化后的图像配置。
+func (h *Handler) imagesCfg() ImagesConfig {
+	var c ImagesConfig
+	if h.cfg.Images != nil {
+		c = *h.cfg.Images
+	} else {
+		// 未注入配置（测试/裸用）时的默认：启用图像接口，并把媒体模型列进
+		// /v1/models（动态目录由 upstream.FetchModels 填充）。
+		c.Enabled = true
+		c.ListInModels = true
+	}
+	if c.DefaultModel == "" {
+		c.DefaultModel = defaultImageModel
+	}
+	if c.EditModel == "" {
+		c.EditModel = defaultImageEditModel
+	}
+	if c.Deadline <= 0 {
+		c.Deadline = 420 * time.Second
+	}
+	if c.MaxRefImages <= 0 {
+		c.MaxRefImages = 4
+	}
+	return c
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -123,6 +176,11 @@ type Handler struct {
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
+
+	// videoMu/videoTasks 视频任务 → 出票账号的映射。上游按账号隔离任务，
+	// 查询必须用提交时的同一个号；进程内状态，重启即失效（不落盘凭据）。
+	videoMu    sync.Mutex
+	videoTasks map[string]*videoTaskEntry
 }
 
 // NewHandler 构建 handler。
@@ -141,9 +199,20 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	// 图像生成（OpenAI images 兼容形态，见 images.go）。两条路由共用同一条
+	// 选号/租约/冷却/记账管道；edits 额外接受 multipart 上传。
+	if h.imagesCfg().Enabled {
+		h.mux.HandleFunc("POST /v1/images/generations", h.withAuth(h.imageGenerations))
+		h.mux.HandleFunc("POST /v1/images/edits", h.withAuth(h.imageEdits))
+	}
 	// 联网搜索（Anthropic Messages 兼容形态，见 messages.go）。路径刻意不占用
 	// /v1/messages——那是 Anthropic 模型对话的标准路径，留给未来的 chat 转发。
 	h.mux.HandleFunc("POST /v1/search/messages", h.withAuth(h.messages))
+	// 网页正文抓取（JSON，见 fetch.go）：搜索给链接、抓取给全文，两者互补。
+	h.mux.HandleFunc("POST /v1/fetch", h.withAuth(h.webFetch))
+	// 视频生成（异步任务，见 videos.go）：提交拿 task_id，再用 GET 轮询成片。
+	h.mux.HandleFunc("POST /v1/videos/generations", h.withAuth(h.videoGenerations))
+	h.mux.HandleFunc("GET /v1/videos/{id}", h.withAuth(h.videoTask))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
@@ -160,6 +229,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// 搜索不是模型调用，但面板「模型」列空着无法区分这类流量；
 			// 用产品名标注（与 chat 的 model 字段并列展示）。
 			trace.model = searchToolLabel
+		}
+		if isFetchPath(r.URL.Path) {
+			trace.model = fetchToolLabel
+		}
+		if isVideoPath(r.URL.Path) {
+			trace.model = videoToolLabel // 提交成功后会被真实模型名覆盖
 		}
 		if h.loadLive().RecordClientInfo {
 			trace.captureClientInfo(r)
@@ -190,12 +265,37 @@ func (h *Handler) tracedRequest(r *http.Request) bool {
 	if r.Method != http.MethodPost {
 		return false
 	}
-	return r.URL.Path == "/v1/chat/completions" || isSearchPath(r.URL.Path)
+	if r.Method == http.MethodGet && isVideoPollPath(r.URL.Path) {
+		return true // 轮询也是真实上游调用，面板要能看见任务查询
+	}
+	return r.URL.Path == "/v1/chat/completions" || isSearchPath(r.URL.Path) ||
+		isFetchPath(r.URL.Path) || isImagePath(r.URL.Path)
 }
 
 // isSearchPath 判断是否为搜索端点。
 func isSearchPath(path string) bool {
 	return path == "/v1/search/messages"
+}
+
+// isFetchPath 判断是否为网页抓取端点。
+func isFetchPath(path string) bool {
+	return path == "/v1/fetch"
+}
+
+// isVideoPath 判断是否为视频端点（提交或轮询）。
+func isVideoPath(path string) bool {
+	return path == "/v1/videos/generations" || isVideoPollPath(path)
+}
+
+// isVideoPollPath 判断是否为视频任务轮询（/v1/videos/{id}）。
+func isVideoPollPath(path string) bool {
+	return strings.HasPrefix(path, "/v1/videos/") && path != "/v1/videos/generations"
+}
+
+// isImagePath 判断是否为图像端点。与 chat 一样进请求日志/指标账本：
+// 生图同样消耗账号额度、同样会因上游/账号问题失败，不记账面板就完全看不见。
+func isImagePath(path string) bool {
+	return path == "/v1/images/generations" || path == "/v1/images/edits"
 }
 
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -307,10 +407,34 @@ const (
 // models 返回模型列表：纯动态（缓存 10min），失败/无号返回空列表（无静态兜底——
 // 拉不出目录即意味着上游不可用，假名单只会让客户端选到 11102 的模型）。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
+	// 手动强制刷新：默认 10min TTL 内走缓存，?refresh=1 立即打上游重新探测
+	//（chat + 媒体目录同一次刷新）。上游上新模型后不必等 TTL。
+	if modelsRefreshRequested(r) {
+		invalidateDynamicModelsCache()
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
 		"data":   h.modelList(),
 	})
+}
+
+// modelsRefreshRequested 解析 /v1/models?refresh=1|true|yes。
+func modelsRefreshRequested(r *http.Request) bool {
+	switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("refresh"))) {
+	case "1", "true", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
+// invalidateDynamicModelsCache 让下一次 fetchDynamicModels 重新探测上游。
+// 只清 fetched/lastFail，不清 ids：探测失败时旧列表仍可继续服务。
+func invalidateDynamicModelsCache() {
+	dynamicModelsCache.Lock()
+	dynamicModelsCache.fetched = time.Time{}
+	dynamicModelsCache.lastFail = time.Time{}
+	dynamicModelsCache.Unlock()
 }
 
 // fmtCreditsPrefix 从上游 credits 原文提取倍率并格式化为 "[x0.05 credit]"。
@@ -466,6 +590,47 @@ func (h *Handler) modelList() []map[string]any {
 			out = append(out, entry)
 		}
 	}
+	// 媒体模型（图像 / 视频）：与 chat 目录同一次上游探测刷新（FetchModels
+	// 内部收集 media），这里只负责组装 OpenAI 模型条目。两类模型都有专用端点：
+	// 图像同步返回图片，视频是异步任务（提交后轮询）。
+	if ic := h.imagesCfg(); ic.Enabled && ic.ListInModels && h.cfg.Upstream != nil {
+		seen := make(map[string]bool, len(out))
+		for _, m := range out {
+			if id, ok := m["id"].(string); ok {
+				seen[id] = true
+			}
+		}
+		for _, mi := range h.cfg.Upstream.MediaModels("cn") {
+			if mi.ID == "" || (mi.Type != "image" && mi.Type != "video") {
+				continue
+			}
+			id := "cn:" + mi.ID
+			if seen[id] {
+				continue
+			}
+			if _, hide := hidden[id]; hide {
+				continue
+			}
+			seen[id] = true
+			entry := map[string]any{
+				"id":       id,
+				"object":   "model",
+				"created":  1753600000,
+				"owned_by": "workbuddy",
+				"type":     mi.Type,
+			}
+			entry = applyModelInfoFields(entry, mi)
+			switch mi.Type {
+			case "image":
+				entry["endpoint"] = "/v1/images/generations"
+				entry["edits_endpoint"] = "/v1/images/edits"
+			case "video":
+				entry["endpoint"] = "/v1/videos/generations"
+				entry["poll_endpoint"] = "/v1/videos/{id}"
+			}
+			out = append(out, entry)
+		}
+	}
 	return out
 }
 
@@ -587,6 +752,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if canon := upstream.CanonicalModel(bareModel); canon != bareModel {
 		log.Printf("WARN: [server] model alias: %s → %s（客户端写法，全链路按规范名处理）", bareModel, canon)
 		bareModel = canon
+	}
+	// 图像模型的 chat 前门：只支持 /v1/chat/completions 的客户端也能直接生图。
+	// 把 messages 折成 prompt + 参考图，复用 /v1/images/* 的选号/冷却/记账管道，
+	// 结果封成 chat.completion（stream=true 时回 SSE chunk）。
+	if h.isImageModelName(bareModel) {
+		// 黑名单优先级不变：隐藏模型不能借图像前门绕过。
+		if _, hide := h.loadLive().HiddenModels[realm+":"+bareModel]; hide {
+			writeOpenAIErrorHint(w, http.StatusBadRequest, "model_unavailable",
+				"model is hidden by gateway configuration, try another model", "")
+			return
+		}
+		h.imageChat(w, r, body, bareModel)
+		return
 	}
 	modelRate := ""
 	if h.cfg.Upstream != nil {

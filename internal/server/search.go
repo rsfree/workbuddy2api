@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
@@ -55,6 +56,18 @@ func searchMetaFromRequest(r *http.Request) upstream.ChatMeta {
 // 轮转语义与 chat 完全一致：PickExcluding → 在途租约 → token 预刷新 →
 // 上游调用 → 按 ErrKind 走 applyErrorPolicy → 抖动退避换号。
 func (h *Handler) runSearch(ctx context.Context, query string, maxResults int, meta upstream.ChatMeta) (*upstream.SearchOutcome, *searchFailure) {
+	return rotateAgentTool(h, ctx, "search", func(acct *auth.Auth) (*upstream.SearchOutcome, error) {
+		return h.cfg.Upstream.Search(ctx, acct, query, maxResults, meta)
+	})
+}
+
+// rotateAgentTool 是 agenttool 家族（搜索 / 网页抓取）共用的轮转内核。
+//
+// 语义与 chat 完全一致：PickExcluding → 在途租约 → token 预刷新 → 上游调用 →
+// 按 ErrKind 走 applyErrorPolicy → 抖动退避换号。两个调用方的差异只有「调谁」，
+// 因此把循环抽出来，避免搜索与抓取各维护一份（改一处漏一处的经典来源）。
+func rotateAgentTool[T any](h *Handler, ctx context.Context, op string, call func(*auth.Auth) (T, error)) (T, *searchFailure) {
+	var zero T
 	tried := map[string]bool{}
 	var lastErr error
 	var lastStatus int
@@ -66,16 +79,17 @@ func (h *Handler) runSearch(ctx context.Context, query string, maxResults int, m
 			break
 		}
 		tried[acct.UID] = true
-		// 在途租约：与 chat 共用同一名额池。搜索也是真实上游调用，不占名额会让
-		// 搜索流量绕过 MaxInFlight 限流。
+		// 在途租约：与 chat 共用同一名额池。搜索/抓取也是真实上游调用，不占名额
+		// 会让这类流量绕过 MaxInFlight 限流。
 		if !h.cfg.Pool.Acquire(acct.UID) {
 			if !rotateBackoff(i, ctx) {
 				break
 			}
 			continue
 		}
-		// token 临近过期先刷新：搜索与 chat 共用同一 accessToken，把过期 token
-		// 打到搜索端点会换回 401，被 applyErrorPolicy 当账号故障处置、误伤健康号。
+		// token 临近过期先刷新：与 chat 共用同一 accessToken，把过期 token
+		// 打到 agenttool 端点会换回 401，被 applyErrorPolicy 当账号故障处置、
+		// 误伤健康号。
 		if acct.NeedsRefresh(h.cfg.RefreshSkew) {
 			if rerr := h.cfg.Upstream.RefreshToken(acct); rerr != nil {
 				h.cfg.Pool.Release(acct.UID)
@@ -95,14 +109,14 @@ func (h *Handler) runSearch(ctx context.Context, query string, maxResults int, m
 			}
 			if serr := acct.SaveAtomic(); serr != nil {
 				// 刷新成功但落盘失败：下次启动会拿旧 token，必须暴露。
-				log.Printf("ERR: [server] search refresh acct=%s: save auth failed: %v",
-					logfmt.Label(acct.UID, acct.Nickname), serr)
+				log.Printf("ERR: [server] %s refresh acct=%s: save auth failed: %v",
+					op, logfmt.Label(acct.UID, acct.Nickname), serr)
 			}
 		}
 
-		// 记账：搜索没有 chatStat，账号信息直接写进 trace，面板才能看出「这次搜索用了哪个号」。
-		// 出口一并记下：搜索同样走该账号的出口绑定，「配了代理但没生效」在搜索路径上
-		// 也得能从日志看出来。
+		// 记账：搜索/抓取没有 chatStat，账号信息直接写进 trace，面板才能看出
+		// 「这次请求用了哪个号」。出口一并记下：同样走该账号的出口绑定，
+		// 「配了代理但没生效」在这条路径上也得能从日志看出来。
 		if tr := requestTraceFromContext(ctx); tr != nil {
 			tr.account = logfmt.Label(acct.UID, acct.Nickname)
 			if h.cfg.Upstream != nil {
@@ -110,8 +124,8 @@ func (h *Handler) runSearch(ctx context.Context, query string, maxResults int, m
 			}
 		}
 		// meta 在循环外构造（会话头透传 + 轮级聚合键），此处直接复用：
-		// 同一次搜索的换号重试属于同一请求，必须复用同一组会话 ID。
-		out, serr := h.cfg.Upstream.Search(ctx, acct, query, maxResults, meta)
+		// 同一次请求的换号重试属于同一请求，必须复用同一组会话 ID。
+		out, serr := call(acct)
 		h.cfg.Pool.Release(acct.UID)
 		if serr == nil {
 			return out, nil
@@ -121,7 +135,7 @@ func (h *Handler) runSearch(ctx context.Context, query string, maxResults int, m
 		if errors.As(serr, &ue) {
 			lastStatus, lastKind = ue.Status, ue.Kind
 			// 与 chat 复用同一错误策略：余额不足/限流/WAF/账号故障各自冷却或熔断，
-			// model 传空——搜索没有模型维度，不写模型级冷却。
+			// model 传空——这类调用没有模型维度，不写模型级冷却。
 			h.applyErrorPolicy(acct.UID, ue.Kind, ue.Msg, "", ue)
 		} else {
 			// 传输层故障（非上游业务返回）：只喂连败计数，不按业务错误罚。
@@ -140,7 +154,7 @@ func (h *Handler) runSearch(ctx context.Context, query string, maxResults int, m
 	// 让运维在一个字段里就能分清「池子没号」和「上游报错」。
 	hint := upstream.NoHealthyAccountHint()
 	if lastErr == nil {
-		return nil, &searchFailure{
+		return zero, &searchFailure{
 			status: http.StatusServiceUnavailable,
 			msg:    "all accounts are temporarily unavailable, please retry later",
 			hint:   hint,
@@ -155,14 +169,14 @@ func (h *Handler) runSearch(ctx context.Context, query string, maxResults int, m
 	}
 	var ue *upstream.Error
 	if errors.As(lastErr, &ue) {
-		// 搜索无模型维度（bareModel 传空、无图片判定），其余判定口径与 chat 一致。
-		return nil, &searchFailure{
+		// 无模型维度（bareModel 传空、无图片判定），其余判定口径与 chat 一致。
+		return zero, &searchFailure{
 			status: status,
 			msg:    ue.Msg,
 			hint:   h.hintOf(ue.Kind, ue.Msg, "", false, ue),
 		}
 	}
-	return nil, &searchFailure{
+	return zero, &searchFailure{
 		status: status,
 		msg:    lastErr.Error(),
 		hint:   hint,

@@ -45,6 +45,17 @@
   "cn": {
     "chat_base": ""
   },
+  "images": {
+    "_comment": "OpenAI 兼容图像接口 /v1/images/generations 与 /v1/images/edits。模型名对齐服务端目录：文生图 hunyuan-image-alpha（已开通新版可改 hunyuan-image-v3.0），图生图 hunyuan-image-alpha-edit。fallback_model 留空 = 未知模型交给上游判定；list_in_models=true（默认）会把上游动态探测到的图像/视频模型附到 /v1/models 末尾（带 type/endpoint），?refresh=1 可强制立即刷新。",
+    "enabled": true,
+    "default_model": "hunyuan-image-alpha",
+    "edit_model": "hunyuan-image-alpha-edit",
+    "fallback_model": "",
+    "deadline_seconds": 420,
+    "max_ref_images": 4,
+    "fetch_source_ip": "",
+    "list_in_models": true
+  },
   "egress": {
     "_comment": "出口隔离（风控）。mode=direct 关闭；local=本机多 IP（ips 留空自动发现，按账号 hash 分配）；static=共用代理；pool-keyed/pool-pin=自建 SOCKS5 池。敏感项（host/password/salt）建议只走环境变量 WB2A_EGRESS_HOST / WB2A_EGRESS_PASSWORD / WB2A_EGRESS_SALT，不要写进本文件。",
     "mode": "local",

@@ -1137,7 +1137,7 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 	dynamicModelsCache.lastFail = time.Time{}
 	dynamicModelsCache.Unlock()
 
-	var calls atomic.Int32 // FetchModels 企业/v3 两路并发探测回调，计数须原子
+	var calls atomic.Int32 // FetchModels 企业/v3/媒体 三路并发探测回调，计数须原子
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		calls.Add(1)
 		return 500, `boom`, false
@@ -1154,9 +1154,10 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 			t.Fatalf("req %d: code=%d body=%s", i, rec.Code, rec.Body)
 		}
 	}
-	// 一轮探测 = 2 次上游调用（企业端点 + /v3/config 并发，两路全失败才进负缓存）。
-	if got := calls.Load(); got != 2 {
-		t.Errorf("want 2 probes (console + v3), got %d", got)
+	// 一轮探测 = 3 次上游调用（企业端点 + IDE UA /v3/config + WorkBuddy UA
+	// /v3/config 并发；chat 两路全失败才进负缓存，媒体探测独立）。
+	if got := calls.Load(); got != 3 {
+		t.Errorf("want 3 probes (console + v3 + media), got %d", got)
 	}
 
 	// 冷却期结束（把失败时间戳拨回 10 分钟前）→ 应重新 fetch。
@@ -1168,8 +1169,8 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("after cooldown: code=%d", rec.Code)
 	}
-	if got := calls.Load(); got != 4 {
-		t.Errorf("want 4 probes after cooldown (2 rounds x 2), got %d", got)
+	if got := calls.Load(); got != 6 {
+		t.Errorf("want 6 probes after cooldown (2 rounds x 3), got %d", got)
 	}
 }
 

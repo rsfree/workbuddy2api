@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -141,6 +142,31 @@ type Config struct {
 		// 该域海外出口可达，/v2/chat/completions、/v3/config 与模型目录路径同构。
 		ChatBase string `json:"chat_base"`
 	} `json:"cn"`
+
+	Images struct {
+		// Enabled 是否挂载 /v1/images/generations 与 /v1/images/edits（缺省 true）。
+		Enabled bool `json:"enabled"`
+		// DefaultModel 文生图默认模型；空 = 回落内置 hunyuan-image-alpha。
+		// 请求体不写 model 时用它——不能复用 chat 的默认模型（那是对话模型）。
+		DefaultModel string `json:"default_model"`
+		// EditModel 图生图默认模型；空 = 回落内置 hunyuan-image-alpha-edit。
+		EditModel string `json:"edit_model"`
+		// FallbackModel 请求里的模型不在网关已知图像模型内时改用它；空 = 不兜底，
+		// 交给上游判定（未知名字可能是上游新增的图像模型）。
+		FallbackModel string `json:"fallback_model"`
+		// DeadlineSeconds 单次生图请求的总时限（跨账号轮转 + 重试），缺省 420。
+		// 只决定「还换不换号」，不打断已经在途的那一次。
+		DeadlineSeconds int `json:"deadline_seconds"`
+		// MaxRefImages 单次请求参考图上限（超出截尾），缺省 4。
+		MaxRefImages int `json:"max_ref_images"`
+		// FetchSourceIP 下载 URL 参考图时绑定的本机源 IP（空 = 默认路由）。
+		// 多公网 IP 主机上默认路由 IP 可能被图片 CDN 单独拉黑（sched-1 的
+		// 154.40.45.34 连腾讯云 COS 恒超时、同机 .65 正常），此时指定可达源 IP。
+		FetchSourceIP string `json:"fetch_source_ip"`
+		// ListInModels 是否把图像模型附到 /v1/models 末尾（带 type/endpoint 字段）。
+		// 缺省 false：引入图像接口前 /v1/models 的输出逐字节不变。
+		ListInModels bool `json:"list_in_models"`
+	} `json:"images"`
 
 	Egress struct {
 		// Mode 出口策略：direct（默认，直连）| local（本机多 IP，按身份 hash 分配）
@@ -387,6 +413,17 @@ func Default() *Config {
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
+	// 图像接口：缺省开启，模型名取服务端 product config 里实际存在的 hunyuan 系
+	//（2026-10 账号目录为 alpha / alpha-edit；已开通 v3.0 的账号可显式改配置）。
+	// 总时限 420s：官方客户端实测生图 p99 在分钟级，太短会把成功请求误判超时。
+	c.Images.Enabled = true
+	c.Images.DefaultModel = "hunyuan-image-alpha"
+	c.Images.EditModel = "hunyuan-image-alpha-edit"
+	c.Images.DeadlineSeconds = 420
+	c.Images.MaxRefImages = 4
+	// 媒体模型（图像/视频）默认进 /v1/models：列表本身是动态探测的，开箱即可
+	// 在聊天客户端里选到图像模型；不需要时显式 false。
+	c.Images.ListInModels = true
 	// 出口隔离默认 local：按账号 hash 分配**本机出口 IP**（多网卡/多 EIP 部署时
 	// 才真正分散；单 IP 机器上等价于直连，无副作用）。自动发现不到可用地址时
 	// Enabled() 为 false，运行期回落直连——不构成可用性单点。
@@ -645,8 +682,8 @@ func (c *Config) EgressConfig() (egress.Config, error) {
 	}
 
 	return egress.Config{
-		Mode:           mode,
-		StaticURL:      c.Egress.StaticURL,
+		Mode:      mode,
+		StaticURL: c.Egress.StaticURL,
 		Local: egress.Local{
 			IPs:             c.Egress.Local.IPs,
 			Interfaces:      c.Egress.Local.Interfaces,
@@ -821,6 +858,24 @@ func (c *Config) normalize() error {
 			c.Schedule.TaskSweepMinutes = 15
 		}
 		c.TaskSweepInterval = time.Duration(c.Schedule.TaskSweepMinutes) * time.Minute
+	}
+	// 图像接口：空模型名回落官方当前默认；时限/参考图数 <=0 视为未设置。
+	// 模型名不做白名单校验——上游新增模型时不应要求先升级网关。
+	c.Images.FetchSourceIP = strings.TrimSpace(c.Images.FetchSourceIP)
+	if c.Images.FetchSourceIP != "" && net.ParseIP(c.Images.FetchSourceIP) == nil {
+		return fmt.Errorf("images.fetch_source_ip 不是合法 IP: %q", c.Images.FetchSourceIP)
+	}
+	if c.Images.DefaultModel == "" {
+		c.Images.DefaultModel = "hunyuan-image-alpha"
+	}
+	if c.Images.EditModel == "" {
+		c.Images.EditModel = "hunyuan-image-alpha-edit"
+	}
+	if c.Images.DeadlineSeconds <= 0 {
+		c.Images.DeadlineSeconds = 420
+	}
+	if c.Images.MaxRefImages <= 0 {
+		c.Images.MaxRefImages = 4
 	}
 	if err := c.validateScheduleHours(); err != nil {
 		return err

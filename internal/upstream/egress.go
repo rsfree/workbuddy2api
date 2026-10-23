@@ -22,12 +22,14 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 )
 
-// egressClient 一个出口对应的 client 对（短 RPC + 聊天流各一个 Timeout）。
-// 两者共享同一个 Transport，连接池按出口只建一份。
+// egressClient 一个出口对应的 client 组（短 RPC / 聊天流 / 图像生成各一个 Timeout）。
+// 短 RPC 与聊天流共享同一个 Transport；图像生成必须独立 Transport（首字节超时
+// 需要更长，而 ResponseHeaderTimeout 是 Transport 级字段），连接池按出口建两份。
 type egressClient struct {
 	key  string
 	http *http.Client
 	chat *http.Client
+	img  *http.Client
 	// lastUsed UnixNano，LRU 淘汰用。atomic：命中路径要刷新它，不能为此加锁。
 	lastUsed atomic.Int64
 }
@@ -84,28 +86,40 @@ func (c *Client) httpFor(a *auth.Auth) *http.Client {
 
 // chatHTTPFor 返回该账号的聊天流 client。
 func (c *Client) chatHTTPFor(a *auth.Auth) *http.Client {
-	_, hc := c.clientPairFor(a)
+	_, hc, _ := c.clientTripleFor(a)
 	return hc
 }
 
-// clientPairFor 取（或创建）该账号出口对应的 client 对。
+// clientPairFor 取（或创建）该账号出口对应的短 RPC + 聊天 client。
 func (c *Client) clientPairFor(a *auth.Auth) (*http.Client, *http.Client) {
-	return c.clientPairForBinding(c.bindFor(a))
+	h, chat, _ := c.clientTripleFor(a)
+	return h, chat
 }
 
-// clientPairForBinding 按已解析的绑定取 client 对。调用方若需要按出口记账
-// （NoteResult），应先用 bindFor 拿绑定再调本函数，避免解析两次。
+// clientTripleFor 取该账号出口对应的三个 client（短 RPC / 聊天 / 图像）。
+func (c *Client) clientTripleFor(a *auth.Auth) (*http.Client, *http.Client, *http.Client) {
+	return c.clientTripleForBinding(c.bindFor(a))
+}
+
+// clientPairForBinding 按已解析的绑定取短 RPC + 聊天 client。
+// 调用方若需要按出口记账（NoteResult），应先用 bindFor 拿绑定再调本函数，避免解析两次。
 func (c *Client) clientPairForBinding(b egress.Binding) (*http.Client, *http.Client) {
+	h, chat, _ := c.clientTripleForBinding(b)
+	return h, chat
+}
+
+// clientTripleForBinding 按已解析的绑定取三个 client。
+func (c *Client) clientTripleForBinding(b egress.Binding) (*http.Client, *http.Client, *http.Client) {
 	key := b.Key()
 	if key == "direct" {
-		return c.HTTP, c.chatHTTP()
+		return c.HTTP, c.chatHTTP(), c.imageHTTP()
 	}
 
 	now := time.Now().UnixNano()
 	if v, ok := c.egressClients.Load(key); ok {
 		ec := v.(*egressClient)
 		ec.lastUsed.Store(now)
-		return ec.http, ec.chat
+		return ec.http, ec.chat, ec.img
 	}
 
 	ec := &egressClient{key: key}
@@ -119,17 +133,26 @@ func (c *Client) clientPairForBinding(b egress.Binding) (*http.Client, *http.Cli
 	}
 	ec.http = &http.Client{Timeout: timeout, Transport: tr}
 	ec.chat = &http.Client{Timeout: 0, Transport: tr}
+	// 图像专用 Transport：首字节上限按 imageHeaderTimeout（生图排队是分钟级），
+	// 不能沿用 newEgressTransport 里写入的 chat HeaderTimeout。
+	imgTr := c.newEgressTransport(b)
+	imgTr.ResponseHeaderTimeout = imageHeaderTimeout
+	if c.HeaderTimeout > imgTr.ResponseHeaderTimeout {
+		imgTr.ResponseHeaderTimeout = c.HeaderTimeout
+	}
+	ec.img = &http.Client{Timeout: 0, Transport: imgTr}
 
 	// 并发首次见面：只保留先落地的那一份。落败者的 Transport 没有发出过请求，
 	// 但仍显式清一次空闲连接（防御：万一有并发请求已借它建连）。
 	actual, loaded := c.egressClients.LoadOrStore(key, ec)
 	if loaded {
 		roundTripCloseIdle(tr)
+		roundTripCloseIdle(imgTr)
 		ae := actual.(*egressClient)
-		return ae.http, ae.chat
+		return ae.http, ae.chat, ae.img
 	}
 	c.evictEgress(c.egress.Load())
-	return ec.http, ec.chat
+	return ec.http, ec.chat, ec.img
 }
 
 // evictEgress 超出上限时淘汰最久未用的出口（关闭其空闲连接）。
@@ -160,6 +183,10 @@ func (c *Client) evictEgress(r *egress.Resolver) {
 		if v, ok := c.egressClients.LoadAndDelete(oldestKey); ok {
 			if ec, ok := v.(*egressClient); ok {
 				roundTripCloseIdle(ec.http.Transport)
+				// img 与 chat 是两个独立 Transport，必须各自清空闲连接。
+				if ec.img != nil {
+					roundTripCloseIdle(ec.img.Transport)
+				}
 			}
 		}
 	}

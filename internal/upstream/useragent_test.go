@@ -131,6 +131,7 @@ func TestUserAgentOverrideBilling(t *testing.T) {
 // TestFetchModelsUsesConfiguredUA FetchModels 手工 Set UA 也走覆盖。
 func TestFetchModelsUsesConfiguredUA(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+	var sawIDE, sawMedia bool
 	c := &Client{
 		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
 			switch {
@@ -139,8 +140,15 @@ func TestFetchModelsUsesConfiguredUA(t *testing.T) {
 					t.Errorf("personal/models UA = %q want FetchAgent/2", got)
 				}
 			case strings.HasSuffix(r.URL.Path, "/v3/config"):
-				if got := r.Header.Get("User-Agent"); got != codeBuddyIDEUA {
-					t.Errorf("v3/config UA = %q want %s", got, codeBuddyIDEUA)
+				// chat 探测固定 IDE UA；媒体探测用配置 UA（FetchAgent/2）。
+				// 两路都允许，但两路都必须出现（媒体目录也走覆盖后的身份）。
+				switch got := r.Header.Get("User-Agent"); got {
+				case codeBuddyIDEUA:
+					sawIDE = true
+				case "FetchAgent/2":
+					sawMedia = true
+				default:
+					t.Errorf("v3/config UA = %q", got)
 				}
 				return jsonResp(200, `{"code":0,"data":{"models":[]}}`), nil
 			default:
@@ -154,6 +162,9 @@ func TestFetchModelsUsesConfiguredUA(t *testing.T) {
 	}
 	if _, err := c.FetchModels(a); err != nil {
 		t.Errorf("fetchModels: %v", err)
+	}
+	if !sawIDE || !sawMedia {
+		t.Errorf("v3 probes: ide=%v media=%v want both", sawIDE, sawMedia)
 	}
 }
 
