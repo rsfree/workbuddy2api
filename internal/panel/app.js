@@ -16,6 +16,10 @@ let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'defaul
 // 2026-10-23 实测：50 个号里 22 个带这个标记、全是个人号，差别只在登录入口。
 // 因此前端不再为它渲染徽标 —— 一枚对「能否得分 / 会不会被拦」零判断力的标签，
 // 只会让人误以为账号有问题（早前那版把它写成「不计分」就是这么来的）。
+// entSession 仍是「真企业会话」清单，renderAccounts / loadOverview 都要用；
+// 6ff601b 撤徽标时连带删掉了这一行的声明，导致 loadOverview 首行赋值即
+// ReferenceError（严格模式）→ 被 quiet 的 catch 静默吞掉 → 账号池/统计全空白。
+let entSession = new Set();
 let mdAll = [], mdProbes = {}, mdProbeOf = () => undefined;
 let mdLocks = [], mdRecent = [];
 let reqFilter = { q: '', outcome: '' };
