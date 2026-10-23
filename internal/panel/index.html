@@ -711,6 +711,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <h3>账号池</h3>
           <span class="grow"></span>
           <span class="note" id="accNote"></span>
+          <!-- 一键剔除被封号（上游 11140 request illegal 等硬禁用）：两段式——先预演
+               出清单+确认框，再按确认过的 uid 真删；凭证不删、归档到 auths-pruned/。
+               人工禁用 / 14017 试用未激活 / 冷却中的号不在命中范围。 -->
+          <button class="xs danger" id="btnPruneBanned" title="剔除因上游封禁（11140 request illegal 等）废掉的账号：出池 + 凭证归档到 auths-pruned/，不影响人工禁用与冷却中的号">剔除封禁号</button>
           <button class="xs" id="btnRemarks">备注</button>
           <button class="xs" id="btnCheckinAll">全部签到</button>
           <button class="xs" id="btnTravelAll">旅行巡检</button>

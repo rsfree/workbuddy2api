@@ -509,6 +509,12 @@ async function loadOverview(quiet) {
     $('sHealthy').textContent = d.healthy;
     $('sCooling').textContent = d.cooling;
     $('sDisabled').textContent = d.disabled;
+    // 「剔除封禁号」按钮的计数：banned 是 disabled 中「被上游判死」的子集，口径由
+    // 后端 IsUpstreamBannedReason 统一算（前端不重复判定，避免两套正则漂移）。
+    if ($('btnPruneBanned')) {
+      const bn = d.banned || 0;
+      $('btnPruneBanned').textContent = bn ? '剔除封禁号(' + bn + ')' : '剔除封禁号';
+    }
     // 暂停选号单列（issue #125）：它只关选号、照常签到保活，与禁用是两种状态。
     if ($('sPaused')) $('sPaused').textContent = d.paused == null ? '-' : d.paused;
     const remSum = (d.accounts || []).reduce((a, s) => a + (s.credits || 0), 0);
@@ -585,6 +591,36 @@ $('btnTravelAll').onclick = async () => {
 $('btnActivityAll').onclick = async () => {
   try { await api('activity_all', { method: 'POST' }); toast('活跃上报已开始，结果见日志', 'ok'); }
   catch (e) { toast(e.message, 'err'); }
+};
+/* 剔除封禁号：两段式（预演 → 确认 → 按确认清单执行）。
+   单段式「点一下就删」在这个接口上不可接受：一次可能删掉上百个账号的凭证，
+   而运维看不出到底删的是哪些。预演回的是逐号 uid/昵称/原因/积分，确认框把它们
+   摊开，真删时再把这份 uid 清单回传，后端只动这批（期间新封的号留到下次）。 */
+$('btnPruneBanned').onclick = async ev => {
+  const b = ev.currentTarget;
+  b.disabled = true;
+  try {
+    const pre = await api('accounts/prune_banned', { method: 'POST', body: JSON.stringify({ dry_run: true }) });
+    if (!pre.count) { toast('当前没有因上游封禁而废掉的账号', 'ok'); return; }
+    const lines = (pre.accounts || []).slice(0, 6).map(s => '· ' + (s.nickname || String(s.uid).slice(0, 12)));
+    if (pre.count > lines.length) lines.push('… 等共 ' + pre.count + ' 个');
+    const msg = '将剔除 ' + pre.count + ' 个被上游封禁的账号：\n\n' + lines.join('\n')
+      + '\n\n冻结积分合计 ' + (pre.frozen_credits || 0) + '（剔除后不再计入池内余额）'
+      + '\n凭证文件不删除，归档到：\n' + (pre.archive_dir || '(auths-pruned/)')
+      + '\n\n只处理上游封禁号（11140 request illegal 等）；人工禁用、14017 试用未激活、'
+      + '冷却中的账号不受影响。\n\n确认剔除？';
+    if (!confirm(msg)) return;
+    const r = await api('accounts/prune_banned', {
+      method: 'POST',
+      body: JSON.stringify({ dry_run: false, uids: (pre.accounts || []).map(s => s.uid) }),
+    });
+    const bad = (r.failed || []).length;
+    toast('已剔除 ' + r.removed + ' 个封禁号'
+      + (r.archived ? '，凭证已归档 ' + r.archived + ' 份' : '')
+      + (bad ? '；' + bad + ' 个凭证归档失败（见日志，重启会把它们载回池子）' : ''),
+      bad ? 'err' : 'ok');
+  } catch (e) { toast(e.message, 'err'); }
+  finally { b.disabled = false; loadOverview(true); }
 };
 
 /* ── 模型 ─────────────────────────────────────────────────────────── */

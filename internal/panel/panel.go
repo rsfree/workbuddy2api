@@ -15,6 +15,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -172,6 +173,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.accountBalance))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.withAuth(p.accountRemove))
+	p.mux.HandleFunc("POST /panel/api/accounts/prune_banned", p.withAuth(p.accountPruneBanned))
 	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/tasks", p.withAuth(p.accountTasks))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept", p.withAuth(p.accountTaskAccept))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept_all", p.withAuth(p.taskAcceptAll))
@@ -260,6 +262,16 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.StickyCount != nil {
 		sticky = p.cfg.StickyCount()
 	}
+	// accounts 只取一次快照：概览与「可剔除的封禁号」计数必须来自同一时刻。
+	// 各自 List() 一次会在两次读锁之间被新到的 11140 插队，出现「已禁用 5 / 可剔除 6」
+	// 这种自相矛盾的展示。计数口径与 Pool.Banned 一致（同用 IsUpstreamBannedReason）。
+	accounts := p.cfg.Pool.List()
+	banned := 0
+	for _, st := range accounts {
+		if st.Disabled && pool.IsUpstreamBannedReason(st.DisabledReason) {
+			banned++
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":         p.cfg.Version,
 		"uptime_sec":      int(time.Since(p.started).Seconds()),
@@ -270,16 +282,20 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"healthy":         healthy,
 		"cooling":         cooling,
 		"disabled":        disabled,
-		"paused":          paused,
-		"in_flight_full":  inFlightFull,
-		"accounts":        p.cfg.Pool.List(),
+		// banned 是 disabled 的子集：其中因上游 11140 等硬处置封停、面板可一键剔除的。
+		// 前端据此禁用/标注「剔除封禁号」按钮；两类分开是因为人工禁用与 14017
+		// 试用未激活都还能救，混在一起剔会误伤。
+		"banned":         banned,
+		"paused":         paused,
+		"in_flight_full": inFlightFull,
+		"accounts":       accounts,
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
 		// 与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
 		"model_locks": p.cfg.Pool.ModelLockView(),
 		// 到期提醒快照的节奏与年龄：界面轮询是 5 秒级，但卡片数据只随余额后台刷新
 		// 更新（默认每 5 分钟）——把这两个数透出，前端才能如实标注「x 分钟前更新」。
-		"balance_refresh_sec":    p.balanceRefreshSec(),
-		"balance_refreshed_at":   p.balanceRefreshedAt(),
+		"balance_refresh_sec":  p.balanceRefreshSec(),
+		"balance_refreshed_at": p.balanceRefreshedAt(),
 	})
 }
 
@@ -710,6 +726,161 @@ func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("panel: remove uid=%s（已出池并删除凭证文件）", uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// ---------------------------------------------------------------------------
+// 批量剔除封禁号
+// ---------------------------------------------------------------------------
+
+// pruneBannedRequest 一键剔除「上游封禁」账号的请求体。
+//
+// dry_run 用指针而不是 bool：接口会删凭证，默认必须是安全的那一侧。空 body、
+// 非法 JSON、字段缺省一律落到「只读预演」，只有显式 "dry_run": false 才真删。
+//
+// uids 是前端确认框里展示给运维的那批账号（预演结果原样回传）。带上它能把
+// 「看到 3 个 → 点下去删了 99 个」这类 TOCTOU 差异压到零：真删时只动这批 uid，
+// 期间新被封的号留到下一次剔除。为空时退化为「处理当前全部命中账号」，供
+// curl / 脚本使用。
+type pruneBannedRequest struct {
+	DryRun *bool    `json:"dry_run"`
+	UIDs   []string `json:"uids"`
+}
+
+// pruneBannedRow 预演/执行结果的单行（前端确认框直接渲染）。
+type pruneBannedRow struct {
+	UID      string `json:"uid"`
+	Nickname string `json:"nickname,omitempty"`
+	Reason   string `json:"reason"`
+	Credits  int64  `json:"credits"`
+}
+
+// accountPruneBanned 一键剔除被封号（上游 11140 request illegal 等硬禁用）。
+//
+// 语义：
+//   - 命中口径只有 pool.IsUpstreamBannedReason：人工禁用（manual disable）、
+//     14017 试用未激活、积分/软冷却一律不动——那些都还能救；
+//   - 出池走 Pool.Remove（与单号「移除」同一条路径：立即落盘 state，在途请求的
+//     Release 对已删条目是 no-op）；
+//   - 凭证文件**不删**，移到 <auth_dir 父目录>/auths-pruned/<YYYY-MM-DD>/。
+//     被封号仍有申诉价值（上游解除后原凭证可再用），删了就真没了；该目录与
+//     auth_dir 并列而非其子目录，确保 auth.LoadDir 的 auth_dir/workbuddy*.json
+//     glob 永远扫不到归档，重启不会把刚剔掉的号又载回池子。
+func (p *Panel) accountPruneBanned(w http.ResponseWriter, r *http.Request) {
+	var req pruneBannedRequest
+	// 解析失败按零值处理（= 预演）：这个接口的默认动作必须是不可逆操作的反面。
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	dryRun := req.DryRun == nil || *req.DryRun
+
+	banned := p.cfg.Pool.Banned()
+	if len(req.UIDs) > 0 {
+		want := make(map[string]bool, len(req.UIDs))
+		for _, u := range req.UIDs {
+			if u = strings.TrimSpace(u); u != "" {
+				want[u] = true
+			}
+		}
+		// 只认「既在确认清单里、此刻仍被封」的交集：确认后已被人手工解冻/移除的
+		// 账号自动出列，不会因为清单过期而误删。
+		sel := make([]pool.Status, 0, len(want))
+		for _, st := range banned {
+			if want[st.UID] {
+				sel = append(sel, st)
+			}
+		}
+		banned = sel
+	}
+
+	rows := make([]pruneBannedRow, 0, len(banned))
+	var frozen int64
+	for _, st := range banned {
+		rows = append(rows, pruneBannedRow{
+			UID:      st.UID,
+			Nickname: st.Nickname,
+			Reason:   st.DisabledReason,
+			Credits:  st.Credits,
+		})
+		frozen += st.Credits
+	}
+	archiveDir := p.pruneArchiveDir()
+
+	if dryRun {
+		// 预演不写任何状态：只回清单，供前端弹确认框（账号数 / 冻结积分 / 归档位置）。
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":             true,
+			"dry_run":        true,
+			"count":          len(rows),
+			"frozen_credits": frozen,
+			"archive_dir":    archiveDir,
+			"accounts":       rows,
+		})
+		return
+	}
+
+	removed := 0
+	archived := 0
+	failed := make([]map[string]string, 0)
+	for _, st := range banned {
+		a := p.cfg.Pool.Remove(st.UID)
+		if a == nil {
+			continue // 已被并发移除/剔除（另一页签、脚本），跳过而非报错
+		}
+		removed++
+		if a.FilePath == "" {
+			continue // 纯内存态账号：没有凭证文件可归档
+		}
+		if _, err := archiveAuthFile(a.FilePath, archiveDir); err != nil {
+			// 出池已生效，只是归档失败（权限/磁盘）。如实报出来，凭证文件仍在原位，
+			// 重启时会被 LoadDir 重新载回池子——运维需要知道这件事并手工处理。
+			failed = append(failed, map[string]string{"uid": st.UID, "error": err.Error()})
+			continue
+		}
+		archived++
+	}
+	log.Printf("panel: prune_banned 剔除 %d 个上游封禁号（归档凭证 %d，失败 %d，归档目录 %s）",
+		removed, archived, len(failed), archiveDir)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":          true,
+		"dry_run":     false,
+		"removed":     removed,
+		"archived":    archived,
+		"failed":      failed,
+		"archive_dir": archiveDir,
+	})
+}
+
+// pruneArchiveDir 封禁号凭证的归档目录：<auth_dir 父目录>/auths-pruned/<日期>。
+// auth_dir 为空（未配置）时返回空串，由 archiveAuthFile 就近推导。
+func (p *Panel) pruneArchiveDir() string {
+	dir := p.cfg.AuthDir
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(dir), "auths-pruned", time.Now().Format("2006-01-02"))
+}
+
+// archiveAuthFile 把凭证文件移入归档目录（同分区 rename；跨分区退化为一读一写）。
+func archiveAuthFile(src, dir string) (string, error) {
+	if dir == "" {
+		dir = filepath.Join(filepath.Dir(src), "auths-pruned", time.Now().Format("2006-01-02"))
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	dst := filepath.Join(dir, filepath.Base(src))
+	if err := os.Rename(src, dst); err == nil {
+		return dst, nil
+	}
+	raw, err := os.ReadFile(src)
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(dst, raw, 0o600); err != nil {
+		return "", err
+	}
+	if err := os.Remove(src); err != nil {
+		return dst, err // 已复制但旧文件还在：报错让人工清理，不谎报成功
+	}
+	return dst, nil
 }
 
 // ---------------------------------------------------------------------------
