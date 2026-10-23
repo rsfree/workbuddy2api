@@ -225,51 +225,75 @@ func (a *Auth) IsGlobal() bool { return a.Realm() == "global" }
 // 无需加锁——Realm() 加锁是因为 realm/Domain 会被 RefreshToken 在锁内改写。
 func (a *Auth) IsEnterprise() bool { return strings.TrimSpace(a.EnterpriseID) != "" }
 
-// IsEnterpriseSession 报告当前凭证是否处于「企业上下文」：
-// 账号本身是企业版（IsEnterprise），或 AccessToken 签发自**企业切换会话**
-// （JWT payload 带 token_source=enterprise_switch——浏览器在企业空间状态下
-// 完成 OAuth 授权时签发）。
+// IsEnterpriseSession 报告当前凭证是否处于**真正绑定企业租户**的会话。
 //
-// 为什么单独一站：企业切换会话与真企业版的上游表现**不同**（实测 2026-10-12，
-// 同一时刻与个人号 A/B 对照）——成长任务列表 / 额度查询 / 领养 Buddy 等**读端点
-// 与直连 API 照常**，但 /v2/report 行为事件**返回 200 却被静默丢弃**（15 个成长
-// 任务全部 0/x，重跑并 90s 内逐 15s 回读进度从不跳动），连登 / 签到同样无效。
-// 即「读得见、记不上账」：不跳过则队列每轮白跑全部任务（含真实对话配额）且
-// 无任何报错。因此行为类任务（活跃上报 / 连登 / 旅行 / 夜猫子 / 成长任务执行）
-// 的门控应使用本方法；签到与任务列表扫描不在此列（签到失败是显式报错，
-// 列表扫描实测可用）。额度查询 / 选号 / 保活照常（按 IsEnterprise 口径）。
+// 判定口径（2026-10-23 修正，重要）：
+//   - 账号本身是企业版（IsEnterprise）→ true；
+//   - JWT 带 token_source=enterprise_switch **且** 带非空 enterprise_id → true；
+//   - 只有 token_source=enterprise_switch、enterprise_id 为空 → **false**。
 //
-// 每次现解码 JWT 而非 Parse 时缓存：RefreshToken 会整体换发 token，
-// 企业切换状态可能随重新授权翻转，缓存会读到过期形态。解码成本仅一次
-// base64 + 小 JSON（每调度轮每账号数次），可忽略。
+// 为什么收紧：早前把「token_source=enterprise_switch」单独当作「行为事件被丢弃」
+// 的充分条件，结果在一次 23 账号的线上排查里全员命中（22 个都是这个形态），
+// 于是任务动作被 422 拦死。2026-10-23 对其中一个账号（enterprise_id 为空）做
+// 对照实测，两条主判据都正常入账：
+//   - web_element_click（资料库） 0/1 → 1/1
+//   - chat_request_send（对话）   0/5 → 1/5
+//
+// 说明「没绑定租户的切换标记」不影响计分，只是 OAuth 走过企业空间。真正的企业
+// 上下文必须带 enterprise_id——那才可能命中「读得见、记不上账」。
+//
+// 仍需本方法拦截的场景（企业租户绑定 / 真企业版）：/v2/report 返回 200 但事件
+// 被静默丢弃（2026-10-12 实测），成长任务永远 0/x，不跳过则每轮白跑真实对话。
+//
+// 每次现解码 JWT 而非缓存：RefreshToken 会整体换发 token，企业绑定状态可能随
+// 重新授权翻转。解码成本仅一次 base64 + 小 JSON，可忽略。
 func (a *Auth) IsEnterpriseSession() bool {
 	if a.IsEnterprise() {
 		return true
 	}
-	return jwtTokenSource(a.AccessTokenValue()) == "enterprise_switch"
+	src, eid := jwtClaims(a.AccessTokenValue())
+	return src == "enterprise_switch" && strings.TrimSpace(eid) != ""
 }
 
-// jwtTokenSource 解出 JWT payload 中的 token_source 声明；非 JWT / 解码失败
-// 一律返回 ""（老 token 与非标准形态按无此声明处理，零回归）。先按无填充
-// base64url 解（JWT 标准），失败再试带填充形态（兼容非标准签发方）。
-func jwtTokenSource(token string) string {
+// EnterpriseSwitchOnly 凭证带 enterprise_switch 标记但**未绑定企业租户**
+// （enterprise_id 为空）。这类号实测仍能正常计分（见 IsEnterpriseSession 注释里的
+// 2026-10-23 实测），因此**不参与任何拦截**，仅供面板标注凭证来源。
+func (a *Auth) EnterpriseSwitchOnly() bool {
+	if a.IsEnterprise() {
+		return false
+	}
+	src, eid := jwtClaims(a.AccessTokenValue())
+	return src == "enterprise_switch" && strings.TrimSpace(eid) == ""
+}
+
+// jwtClaims 解出 JWT payload 里的企业相关声明。非 JWT / 解码失败一律返回空值
+// （老 token 与非标准形态按无此声明处理，零回归）。先按无填充 base64url 解
+// （JWT 标准），失败再试带填充形态（兼容非标准签发方）。
+func jwtClaims(token string) (tokenSource, enterpriseID string) {
 	parts := strings.Split(token, ".")
 	if len(parts) < 2 {
-		return ""
+		return "", ""
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
 		if raw, err = base64.URLEncoding.DecodeString(parts[1]); err != nil {
-			return ""
+			return "", ""
 		}
 	}
 	var payload struct {
-		TokenSource string `json:"token_source"`
+		TokenSource  string `json:"token_source"`
+		EnterpriseID string `json:"enterprise_id"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return ""
+		return "", ""
 	}
-	return payload.TokenSource
+	return payload.TokenSource, payload.EnterpriseID
+}
+
+// jwtTokenSource 仅取 token_source（保留给日志/装饰用途）。
+func jwtTokenSource(token string) string {
+	src, _ := jwtClaims(token)
+	return src
 }
 
 // isGlobalDomain 判定 domain 是否指向 www.workbuddy.ai 家族。

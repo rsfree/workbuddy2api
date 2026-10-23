@@ -11,9 +11,10 @@ let logPin = true, loginState = null, loginTimer = null;
 let refTimer = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
 let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
-// 企业切换会话账号（token_source=enterprise_switch）：读端点正常但行为事件被上游
-// 静默丢弃，成长任务/签到不计分。概览接口给 uid 清单，表格与任务中心据此打标。
-let entSwitch = new Set();
+// 企业相关凭证两套清单（概览接口下发）：
+//   entSwitch  = token_source=enterprise_switch 但未绑定租户 —— 实测仍计分，灰标；
+//   entSession = 真正绑定企业租户/企业版 —— 行为事件被丢弃，任务动作被拦截，红标。
+let entSwitch = new Set(), entSession = new Set();
 let mdAll = [], mdProbes = {}, mdProbeOf = () => undefined;
 let mdLocks = [], mdRecent = [];
 let reqFilter = { q: '', outcome: '' };
@@ -445,7 +446,7 @@ function renderAccounts(list) {
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') +
-        (entSwitch.has(s.uid) ? ' <span class="realm-tag warn" title="该凭证在企业空间下完成授权（token_source=enterprise_switch）：任务列表读得到，但行为事件被上游静默丢弃——成长任务/签到/连登都不计分。修法：在浏览器退出企业切换，以个人身份重新登录后重新导入。">企业切换·不计分</span>' : '') + '</div><div class="id">' + esc(short) + '</div>' + (s.egress ? '<div class="id egress" title="出口 ' + esc(s.egress) + '">出口 ' + esc(s.egress) + '</div>' : '') + '</td>' +
+        (entSwitch.has(s.uid) ? ' <span class="realm-tag mute" title="凭证带 token_source=enterprise_switch，但未绑定企业租户（enterprise_id 为空）。2026-10-23 实测：web 点击与对话两条判据都正常入账，不影响成长任务；仅作来源标注。">企业切换</span>' : '') + (entSession.has(s.uid) ? ' <span class="realm-tag warn" title="该凭证绑定企业租户/企业版：行为事件被上游静默丢弃（200 不计分），成长任务与签到不会入账，面板会拦截任务动作。修法：在浏览器退出企业空间，以个人身份重新登录后重新导入。">企业会话·不计分</span>' : '') + '</div><div class="id">' + esc(short) + '</div>' + (s.egress ? '<div class="id egress" title="出口 ' + esc(s.egress) + '">出口 ' + esc(s.egress) + '</div>' : '') + '</td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -516,6 +517,7 @@ async function loadOverview(quiet) {
     const d = await api('overview');
     overviewData = d;
     entSwitch = new Set(d.enterprise_switch || []);
+    entSession = new Set(d.enterprise_session || []);
     $('sTotal').textContent = d.total;
     $('sHealthy').textContent = d.healthy;
     $('sCooling').textContent = d.cooling;
@@ -2126,7 +2128,7 @@ function renderQueue(groups, progress, emptyTitle, emptyDesc) {
   list.innerHTML = groups.map(g => {
     total += g.rows.length;
     return '<div class="qgroup"><header><span class="nm">' + esc(g.nick || g.uid.slice(0, 12)) + '</span>' +
-      (g.entSwitch ? '<span class="tag warn" title="企业切换会话（token_source=enterprise_switch）：行为事件被上游静默丢弃，执行也不会入账">企业切换·不计分</span>' : '') +
+      (g.entSwitch ? '<span class="tag mute" title="凭证带 enterprise_switch 标记但未绑定企业租户：实测仍计分，不影响执行">企业切换</span>' : '') +
       '<span class="cnt">' + g.rows.length + ' 项待办</span></header>' +
       g.rows.map(qrowHTML).join('') + '</div>';
   }).join('');

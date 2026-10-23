@@ -16,15 +16,18 @@ func testJWT(payload string) string {
 	return "hdr." + base64.RawURLEncoding.EncodeToString([]byte(payload)) + ".sig"
 }
 
-// TestOverviewMarksEnterpriseSwitchAccounts 概览必须把「企业切换会话」的账号单独列出来：
-// 这类号读端点正常但行为事件被上游静默丢弃（成长任务永远 0/x），前端据此在账号表格
-// 与任务中心打「企业切换·不计分」标——否则会被误判成判据没适配，反复白查。
+// TestOverviewMarksEnterpriseSwitchAccounts 概览要区分两类企业相关凭证：
 //
-// 口径要点：只列 token_source=enterprise_switch，真企业版（EnterpriseID 非空）
-// 已有「企业版」标记，不重复计入。
+//	enterprise_switch  = token_source=enterprise_switch 但未绑定租户（enterprise_id 空）
+//	                     → 仅中性标注，实测仍计分，**不拦截**；
+//	enterprise_session = 真正绑定租户的企业会话 → 行为事件不计分，标红拦截。
+//
+// 2026-10-23 线上误判即源于把前者当成后者：22 个号全被 422 拦死，实测两条主判据
+// （web 点击 / 对话）都正常入账。
 func TestOverviewMarksEnterpriseSwitchAccounts(t *testing.T) {
 	pl := pool.New("")
-	pl.Add(&auth.Auth{UID: "u-switch", Nickname: "切换号", AccessToken: testJWT(`{"token_source":"enterprise_switch"}`)})
+	pl.Add(&auth.Auth{UID: "u-switch", Nickname: "切换未绑定", AccessToken: testJWT(`{"token_source":"enterprise_switch"}`)})
+	pl.Add(&auth.Auth{UID: "u-bound", Nickname: "企业会话", AccessToken: testJWT(`{"token_source":"enterprise_switch","enterprise_id":"e9"}`)})
 	pl.Add(&auth.Auth{UID: "u-personal", Nickname: "个人号", AccessToken: testJWT(`{"token_source":"oneid_login"}`)})
 	pl.Add(&auth.Auth{UID: "u-real-ent", Nickname: "真企业", EnterpriseID: "e1", AccessToken: testJWT(`{"token_source":"oneid_login"}`)})
 
@@ -35,13 +38,19 @@ func TestOverviewMarksEnterpriseSwitchAccounts(t *testing.T) {
 		t.Fatalf("overview status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	var resp struct {
-		EnterpriseSwitch []string `json:"enterprise_switch"`
-		Count            int      `json:"enterprise_switch_count"`
+		EnterpriseSwitch  []string `json:"enterprise_switch"`
+		SwitchCount       int      `json:"enterprise_switch_count"`
+		EnterpriseSession []string `json:"enterprise_session"`
+		SessionCount      int      `json:"enterprise_session_count"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode overview: %v", err)
 	}
-	if resp.Count != 1 || len(resp.EnterpriseSwitch) != 1 || resp.EnterpriseSwitch[0] != "u-switch" {
-		t.Fatalf("enterprise_switch = %v (count %d), want 仅 u-switch", resp.EnterpriseSwitch, resp.Count)
+	if resp.SwitchCount != 1 || len(resp.EnterpriseSwitch) != 1 || resp.EnterpriseSwitch[0] != "u-switch" {
+		t.Fatalf("enterprise_switch = %v (count %d), want 仅 u-switch", resp.EnterpriseSwitch, resp.SwitchCount)
+	}
+	if resp.SessionCount != 1 || len(resp.EnterpriseSession) != 1 || resp.EnterpriseSession[0] != "u-bound" {
+		t.Fatalf("enterprise_session = %v (count %d), want 仅 u-bound（真企业版不计入）",
+			resp.EnterpriseSession, resp.SessionCount)
 	}
 }

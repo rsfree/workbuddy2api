@@ -243,8 +243,9 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .acc.md .who .nm { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .acc.md .who .nm .mid { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .realm-tag { display: inline-block; margin-left: 6px; padding: 1px 5px; border-radius: 4px; font: 500 10px/1 var(--sans); color: var(--accent); background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent); vertical-align: 1px; }
-/* 企业切换会话：读得见、记不上账（行为事件被上游静默丢弃）——用警告色区分于国际版/企业版 */
+/* 企业会话（真绑定租户）：读得见、记不上账，警告色；企业切换标记（未绑定）用中性灰 */
 .realm-tag.warn { color: var(--warn); background: var(--warn-soft); border-color: color-mix(in srgb, var(--warn) 24%, transparent); cursor: help; }
+.realm-tag.mute { color: var(--ink-3); background: var(--surface-2); border-color: var(--line); cursor: help; }
 .realm-row { display: flex; align-items: center; gap: 14px; padding: 4px 0 10px; }
 .realm-opt { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }
 .realm-opt input { accent-color: var(--accent); margin: 0; }

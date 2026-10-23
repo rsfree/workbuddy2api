@@ -286,14 +286,23 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 			banned++
 		}
 	}
-	// 企业切换会话账号（JWT token_source=enterprise_switch）：这类号「读得见、记不上账」
-	// ——任务列表/额度查询照常，但 /v2/report 行为事件被上游 200 静默丢弃，成长任务
-	// 永远 0/x、连登签到同样无效。必须单独标出来，否则会被误判成「判据没适配」而反复
-	// 排查。只列「切换会话」这一种，真企业版本已有 enterprise 标记，不重复。
+	// 两类企业相关凭证，展示口径不同（2026-10-23 实测修正后）：
+	//   - enterprise_switch：JWT 带 token_source=enterprise_switch 但**未绑定租户**
+	//     （enterprise_id 空）。实测仍正常计分，只做中性标注「凭证走过企业空间」；
+	//   - enterprise_session：真正绑定企业租户 / 企业版 → 行为事件被上游静默丢弃，
+	//     任务动作会被拦截，前端标红「不计分」。
 	switchUIDs := make([]string, 0, 4)
+	sessionUIDs := make([]string, 0, 4)
 	for _, st := range accounts {
-		if a := p.cfg.Pool.AuthByUID(st.UID); a != nil && a.IsEnterpriseSession() && !a.IsEnterprise() {
+		a := p.cfg.Pool.AuthByUID(st.UID)
+		if a == nil {
+			continue
+		}
+		switch {
+		case a.EnterpriseSwitchOnly():
 			switchUIDs = append(switchUIDs, st.UID)
+		case a.IsEnterpriseSession() && !a.IsEnterprise():
+			sessionUIDs = append(sessionUIDs, st.UID)
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -313,10 +322,13 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"paused":         paused,
 		"in_flight_full": inFlightFull,
 		"accounts":       accounts,
-		// 企业切换会话账号清单（uid）+ 计数：前端据此在账号表格与任务中心打
-		// 「企业切换·不计分」标。只影响展示，不改变选号/执行口径。
-		"enterprise_switch":       switchUIDs,
-		"enterprise_switch_count": len(switchUIDs),
+		// 企业相关凭证清单（uid）+ 计数：只影响展示，不改变选号/执行口径。
+		//   enterprise_switch  → 仅标记（实测可计分，中性灰标）
+		//   enterprise_session → 真拦截（不参与成长任务，红标）
+		"enterprise_switch":        switchUIDs,
+		"enterprise_switch_count":  len(switchUIDs),
+		"enterprise_session":       sessionUIDs,
+		"enterprise_session_count": len(sessionUIDs),
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
 		// 与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
 		"model_locks": p.cfg.Pool.ModelLockView(),

@@ -32,9 +32,8 @@ type scanAccountItem struct {
 	Nickname  string     `json:"nickname"`
 	Growth    []scanTask `json:"growth,omitempty"`
 	GrowthErr string     `json:"growth_error,omitempty"`
-	// EnterpriseSwitch 该凭证是企业切换会话（token_source=enterprise_switch）：
-	// 任务读得到但行为事件不计分，队列会跳过。前端在分组头标出来，避免误读成
-	// 「任务没跑/判据不对」。
+	// EnterpriseSwitch 该凭证带 token_source=enterprise_switch 但未绑定企业租户：
+	// 实测仍能计分（2026-10-23 两条主判据都点亮），只做中性标注，不影响执行。
 	EnterpriseSwitch bool `json:"enterprise_switch,omitempty"`
 }
 
@@ -150,9 +149,9 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 			if a.IsEnterprise() {
 				return
 			}
-			// 企业切换会话：列表读得到，但行为事件被上游静默丢弃（200 不计分）。
-			// 仍然扫描（让人看见有什么任务），但打标说明「跑了也不计分」。
-			it.EnterpriseSwitch = a.IsEnterpriseSession()
+			// 企业切换标记（未绑定租户）：仅中性标注凭证来源——实测仍计分，
+			// 不能当成「跑了也不入账」的证据（2026-10-23 实测修正）。
+			it.EnterpriseSwitch = a.EnterpriseSwitchOnly()
 			// 默认 + 小程序口径合并（mp 是默认超集，按 code 去重；mp 失败静默）。
 			tasks, _, err := p.listTasksBoth(a)
 			if err != nil {
