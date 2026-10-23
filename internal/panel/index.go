@@ -11,6 +11,7 @@
 package panel
 
 import (
+	"bytes"
 	"crypto/sha256"
 	_ "embed"
 	"encoding/hex"
@@ -78,10 +79,29 @@ func writeStatic(w http.ResponseWriter, r *http.Request, contentType string, bod
 	_, _ = w.Write(body)
 }
 
+// versionedIndexHTML 给内嵌页面的资源引用打上版本号查询串（app.js?v=<版本>）。
+//
+// 为什么光有 ETag 不够：ETag 只在浏览器**愿意发条件请求**时才起作用。旧版本一个
+// 缓存头都不发，已经进过用户缓存的 app.js 可能压根不再回源，于是升级后页面还是旧的
+// （2026-10-23 连踩两次：企业切换徽标撤掉后仍有人看得到）。资源名带版本号是唯一
+// 不依赖浏览器合作的做法 —— URL 变了就是新资源，缓存必然失效。
+// 查询串不影响路由：mux 按路径匹配，appScript 照常命中。
+func versionedIndexHTML(ver string) []byte {
+	if ver == "" {
+		return indexHTML
+	}
+	out := indexHTML
+	// 只改属性值，不碰正文里提到文件名的注释（如「由 app.js 切 .on」）。
+	for _, ref := range []string{`src="app.js"`, `src="mobile.js"`, `href="mobile.css"`} {
+		out = bytes.ReplaceAll(out, []byte(ref), []byte(ref[:len(ref)-1]+"?v="+ver+`"`))
+	}
+	return out
+}
+
 // index 输出面板页面（静态无秘密；数据接口 /panel/api/* 才走鉴权）。
 func (p *Panel) index(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
-	writeStatic(w, r, "text/html; charset=utf-8", indexHTML)
+	writeStatic(w, r, "text/html; charset=utf-8", versionedIndexHTML(p.cfg.Version))
 }
 
 // appScript 输出前端逻辑（同源脚本，供 CSP script-src 'self' 加载）。
