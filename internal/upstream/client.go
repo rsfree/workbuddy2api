@@ -1010,7 +1010,19 @@ func (c *Client) doJSON(a *auth.Auth, req *http.Request) (json.RawMessage, error
 	}
 	if resp.StatusCode >= 400 {
 		kind := Classify(resp.StatusCode, string(raw))
-		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
+		msg := truncate(string(raw), 200)
+		// 401 + `WWW-Authenticate: Bearer ... error="invalid_token"`：APISIX 对**已被
+		// 上游终止的会话**的固定答复（默认 HTML 401 页）。它与普通 4xx 有本质区别：
+		// access token 报 invalid_token、refreshToken 同时报 12153 invalid_grant，
+		// 确定性不可自愈，只能重新登录。归 ErrSessionDead（走「连续 N 次→禁用」链路），
+		// 并把 message 归一化成一句人话——原始 HTML 既污染日志，也会让面板显示成
+		// 一坨标签（实测 2026-10-23：账号 941****5 的补偿查询就栽在这）。
+		if resp.StatusCode == http.StatusUnauthorized &&
+			strings.Contains(strings.ToLower(resp.Header.Get("WWW-Authenticate")), `error="invalid_token"`) {
+			kind = ErrSessionDead
+			msg = "凭证已失效（401 invalid_token）：上游会话已被终止，refresh 也无法恢复，请重新登录该账号"
+		}
+		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: msg}
 	}
 	var env apiEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {

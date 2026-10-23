@@ -133,6 +133,13 @@ func (s *Scheduler) CompensationStatusAll() []CompensationRow {
 			st, err := s.cfg.Upstream.GetCompensationStatus(t.a)
 			if err != nil {
 				row.Error = err.Error()
+				// 顺带记一次「会话已死」：这里只计数不禁用（阈值见 pool.NoteSessionDead），
+				// 与 keepalive 的 12153 共用同一计数——死凭证攒够次数后账号自动禁用，
+				// 不用等人盯着补偿面板发现。
+				var ue *upstream.Error
+				if ps, ok := s.cfg.Pool.Status(t.uid); errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead && ok && !ps.Disabled {
+					s.cfg.Pool.NoteSessionDead(t.uid)
+				}
 			} else {
 				row.Status = st
 			}
