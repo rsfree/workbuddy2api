@@ -10,8 +10,9 @@
 // 加条目前须用真凭证探测上游确认目标名存在（/v3/config 或一次真实对话）。
 //
 // 已知边界：
-//   - kimi-k3.1-pro（官方 API 名）→ kimi-k3-1 暂未收：WorkBuddy 侧 k3-1 是否为
-//     Pro 无法仅凭名字坐实，等官方文档或上游目录显式对应后再加；
+//   - kimi-k3.1-pro-highspeed（官方高速版）故意不收：WorkBuddy 上游还没有对应
+//     模型条目（实测 11102），别过去只会得到"假的高速版"（普通速度），误导性
+//     强于直接 400。等上游真上了 highspeed 条目再映射；
 //   - 响应回显与请求日志用规范名（kimi-k3-1），客户端若以别名计费对账需注意。
 package upstream
 
@@ -22,6 +23,10 @@ var modelAliases = map[string]string{
 	// 官方 API 点号写法 kimi-k3.1 的抄名入口；WorkBuddy 目录里实际存在的是 k3-1
 	//（上游 /v3/config 实测：id=kimi-k3-1、name="Kimi-K3"，即官宣的 K3.1 系列）。
 	"kimi-k3.1": "kimi-k3-1",
+	// 官方 API 完整名（官宣原文"模型选择 kimi-k3.1-pro"）。坐实依据：K3.1 系列
+	// 目前只有 Pro 一个型号（无非 Pro 的 K3.1），WorkBuddy 的 k3-1 即官宣的
+	// K3.1 Pro（2026-10-24 官宣，k3-1 在官宣前已进目录 = 合作伙伴早期接入）。
+	"kimi-k3.1-pro": "kimi-k3-1",
 }
 
 // CanonicalModel 把客户端传来的（已剥 realm 前缀的）模型名归一到网关规范名；
