@@ -581,6 +581,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
 	realm, bareModel, realmExplicit := resolveModelDetail(peek.Model)
+	// 别名归一（upstream.CanonicalModel）：官方平台点号名等外部写法 → 网关规范名。
+	// 必须在一切按名查表之前——牌价、隐藏名单、选号、6004 模型级冷却键、
+	// 成本观测、出站 body 重写全部由 bareModel 承载，别名不穿透到这些键里。
+	if canon := upstream.CanonicalModel(bareModel); canon != bareModel {
+		log.Printf("WARN: [server] model alias: %s → %s（客户端写法，全链路按规范名处理）", bareModel, canon)
+		bareModel = canon
+	}
 	modelRate := ""
 	if h.cfg.Upstream != nil {
 		modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)
@@ -629,7 +636,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if h.cfg.Pool.StrategyForRealm(realm) != pool.WeightedRandom {
 			resolve = h.cfg.Session.LookupForModel
 		}
-		if uid, ok := resolve(sessKey, peek.Model); ok {
+		// 用规范名（realm + 别名归一后的 bareModel）查可用性：6004 模型级冷却
+		// 按规范名记账，若拿别名/原名来查会漏判「绑定号对该模型正限额」。
+		if uid, ok := resolve(sessKey, realm+":"+bareModel); ok {
 			stickyUID = uid
 		}
 	}
