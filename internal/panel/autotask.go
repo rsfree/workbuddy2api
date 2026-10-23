@@ -29,6 +29,8 @@ import (
 	"log"
 	"math/rand/v2"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -43,6 +45,10 @@ type autoAction struct {
 	Desc     string // 展示用说明
 	Attempt  bool   // true = 尝试型（上游未证实可脚本化，跑了可能不点亮）
 	run      func(p *Panel, a *auth.Auth) (string, error)
+	// runTask 需要任务上下文（标题/进度/口径）的动作走这里，nil 时回落到 run。
+	// 族模式动作（如 expert_use_*「体验指定专家」）由任务标题解析专家名，故必须
+	// 拿到 Task 本体；精确表动作只认 code，保持原签名不动。
+	runTask func(p *Panel, a *auth.Auth, t upstream.Task) (string, error)
 }
 
 // autoActions 已实现的任务动作表（顺序即执行顺序：先解锁依赖项）。
@@ -194,6 +200,354 @@ func autoActionIndex(code string) int {
 		}
 	}
 	return 1 << 20
+}
+
+// ---------------------------------------------------------------------------
+// 族模式：新任务不改代码也能自动完成
+// ---------------------------------------------------------------------------
+
+// expertUsePattern 「体验指定专家」任务码形状。上游按运营活动动态加码，实测
+// expert_use_bowangwang / expert_use_douyinyin / expert_use_maidehao /
+// expert_use_shangjia_xuanchuan 一批同形状任务（+50 分 +5 能），标题统一为
+// 「体验「<专家名>」」。这一类**不该逐个登记**：只要形状一致，就从任务标题
+// 解析专家名 → 市场列表反查 id → 召唤+真实对话+actual_use。
+var expertUsePattern = regexp.MustCompile(`(?i)^expert_use_[a-z0-9_]+$`)
+
+// actionForTask 解析任务对应的动作：精确表优先（保留依赖顺序语义），
+// 其次按族模式兜底。nil = 该任务当前无法自动化，只能接受/等待人工。
+//
+// 族模式有两类推定来源（实测）：
+//  1. 码形状 `expert_use_<slug>`（如 expert_use_bowangwang）；
+//  2. 文案判据「专家 + 召唤/专家页 + 能定位到具体专家」——上游换活动时会用
+//     别的码形状（实测 WorkBuddy_Valorant「体验「无畏契约拼豆专家」」），
+//     只认前缀必漏。
+func actionForTask(t upstream.Task) *autoAction {
+	code := strings.TrimSpace(t.TaskCode)
+	if act := autoActionFor(code); act != nil {
+		return act
+	}
+	if expertUsePattern.MatchString(code) || looksLikeExpertExperience(t) {
+		return &autoAction{
+			TaskCode: code,
+			Desc:     "体验指定专家（族模式：jump_url 的 expertId 或标题专家名 → 召唤 + 真实对话 + actual_use）",
+			runTask:  runExpertExperience,
+		}
+	}
+	return nil
+}
+
+// looksLikeExpertExperience 文案判据：任务是否在要求「召唤某个指定专家并对话」。
+//
+// 必须同时满足：文案含「专家」+ 含「召唤」或「专家页」+ **能定位到具体专家**
+// （jump_url 里有 expertId，或标题「X」里有名字）。最后一条是关键——同样用
+// 「体验「X」」模板的 create_canvas（设计创意模式）不含「专家」，而 expert_5
+// （召唤 5 次专家）虽然含专家但没有具体对象，两者都不该落进族模式。
+func looksLikeExpertExperience(t upstream.Task) bool {
+	text := t.Title + " " + t.TaskDesc + " " + t.Description
+	if !strings.Contains(text, "专家") {
+		return false
+	}
+	if !strings.Contains(text, "召唤") && !strings.Contains(text, "专家页") {
+		return false
+	}
+	return expertIDFromJump(t) != "" || taskExpertName(t) != ""
+}
+
+// expertIDRe 从 jump_url（或其 deeplink 参数解码后）抓专家 id。
+var expertIDRe = regexp.MustCompile(`expertId=([A-Za-z0-9_\-]+)`)
+
+// expertIDFromJump 取任务指定的专家 id。上游对「体验指定专家」任务会在
+// jump_url 里直给 deeplink：
+//
+//	https://www.workbuddy.cn/work/launch/?deeplink=workbuddy%3A%2F%2Fexperts%3FexpertId%3Dex_WZY136wV5aMt
+//	→ workbuddy://experts?expertId=ex_WZY136wV5aMt
+//
+// 这比按标题去市场列表里猜可靠得多（定向专家未必在 reco_rank 首屏，甚至不在市场）。
+func expertIDFromJump(t upstream.Task) string {
+	raw := strings.TrimSpace(t.JumpURL)
+	if raw == "" {
+		return ""
+	}
+	if dec, err := url.QueryUnescape(raw); err == nil {
+		raw = dec
+	}
+	if m := expertIDRe.FindStringSubmatch(raw); len(m) == 2 {
+		return m[1]
+	}
+	return ""
+}
+
+// runAction 统一执行入口：族动作带任务上下文，精确动作用原签名。
+func runAction(act *autoAction, p *Panel, a *auth.Auth, t upstream.Task) (string, error) {
+	switch {
+	case act == nil:
+		return "", fmt.Errorf("任务 %s 无自动动作", t.TaskCode)
+	case act.runTask != nil:
+		return act.runTask(p, a, t)
+	case act.run != nil:
+		return act.run(p, a)
+	default:
+		return "", fmt.Errorf("任务 %s 动作未实现", t.TaskCode)
+	}
+}
+
+// taskExpertName 从任务标题/说明里抠出「」内的专家名（族任务的判据载体）。
+// 只认成对的中文引号：上游对这类任务的标题模板固定为「体验「X」」。
+var expertNameRe = regexp.MustCompile(`[「『]([^」』]{2,32})[」』]`)
+
+func taskExpertName(t upstream.Task) string {
+	for _, s := range []string{t.Title, t.TaskDesc, t.Description} {
+		if m := expertNameRe.FindStringSubmatch(s); len(m) == 2 {
+			if name := strings.TrimSpace(m[1]); name != "" {
+				return name
+			}
+		}
+	}
+	return ""
+}
+
+// expertCacheEntry 单账号的专家市场快照（含抓取时刻）。
+type expertCacheEntry struct {
+	experts []upstream.MarketExpert
+	at      time.Time
+}
+
+// expertCacheTTL 快照有效期：同一轮扫描里多个定向专家任务复用一份列表，
+// 跨轮次隔几分钟重拉一次即可（专家市场排序变化不影响按名匹配）。
+var expertCacheTTL = 5 * time.Minute
+
+// marketExpertSnapshot 拉取（带缓存）该账号可见的**全量**专家市场列表。
+// 逐页翻到不足一页为止，最多 expertSnapshotPages 页——定向专家常不在推荐首屏。
+const expertSnapshotPages = 8
+
+func (p *Panel) marketExpertSnapshot(a *auth.Auth) ([]upstream.MarketExpert, error) {
+	key := a.UID
+	if key == "" {
+		key = a.AccessTokenValue()
+	}
+	p.expertMu.Lock()
+	if e, ok := p.expertCache[key]; ok && time.Since(e.at) < expertCacheTTL {
+		p.expertMu.Unlock()
+		return e.experts, nil
+	}
+	p.expertMu.Unlock()
+
+	const pageSize = 20
+	var all []upstream.MarketExpert
+	for page := 1; page <= expertSnapshotPages; page++ {
+		list, err := p.cfg.Upstream.MarketExpertListPaged(a, "", page, pageSize)
+		if err != nil {
+			if page == 1 {
+				return nil, err
+			}
+			break // 中途翻页失败：用已拿到的部分（够匹配就够用）
+		}
+		all = append(all, list...)
+		if len(list) < pageSize {
+			break
+		}
+	}
+	p.expertMu.Lock()
+	if p.expertCache == nil {
+		p.expertCache = map[string]expertCacheEntry{}
+	}
+	p.expertCache[key] = expertCacheEntry{experts: all, at: time.Now()}
+	p.expertMu.Unlock()
+	return all, nil
+}
+
+// resolveMarketExpert 按展示名匹配市场专家：先精确（展示名/职业名），再包含匹配。
+// 未命中返回零值（ExpertID == ""），由调用方决定跳过而不是硬编 id。
+func (p *Panel) resolveMarketExpert(a *auth.Auth, name string) (upstream.MarketExpert, error) {
+	list, err := p.marketExpertSnapshot(a)
+	if err != nil {
+		return upstream.MarketExpert{}, err
+	}
+	name = strings.TrimSpace(name)
+	var fuzzy upstream.MarketExpert
+	for _, e := range list {
+		if e.ExpertID == "" {
+			continue
+		}
+		if e.DisplayNameZH == name || e.ProfessionZH == name {
+			return e, nil
+		}
+		// 包含匹配只对 2 字以上的名字生效，避免「AI」这类短词误命中。
+		if len([]rune(name)) >= 2 &&
+			(strings.Contains(e.DisplayNameZH, name) || strings.Contains(name, e.DisplayNameZH)) {
+			if fuzzy.ExpertID == "" {
+				fuzzy = e
+			}
+		}
+	}
+	return fuzzy, nil
+}
+
+// resolveTaskExpert 解析任务指向的专家，优先级：
+//  1. jump_url 里的 expertId（上游直给，最可靠）；
+//  2. 标题「X」里的展示名 → 市场列表反查。
+//
+// id 命中但市场快照里没有该专家时，用最小结构体兜底：判据只校验 id 真实存在，
+// name/version/title 仅用于事件展示（缺了不影响计分）。
+func (p *Panel) resolveTaskExpert(a *auth.Auth, t upstream.Task) (upstream.MarketExpert, error) {
+	if id := expertIDFromJump(t); id != "" {
+		if snap, err := p.marketExpertSnapshot(a); err == nil {
+			for _, e := range snap {
+				if e.ExpertID == id {
+					return e, nil
+				}
+			}
+		}
+		return upstream.MarketExpert{
+			ExpertID:      id,
+			ExpertType:    "agent",
+			DisplayNameZH: taskExpertName(t),
+			Version:       "1.0.0",
+		}, nil
+	}
+	name := taskExpertName(t)
+	if name == "" {
+		return upstream.MarketExpert{}, nil
+	}
+	return p.resolveMarketExpert(a, name)
+}
+
+// acceptWithVerify 接受任务并回读验证登记生效（默认/mp 双口径）。
+// 上游存在 200+OK 但 accept 未落账的形态，此时后续上报全部不归账，
+// 判定以回读 accept_status 为准，未生效重试一次。
+func (p *Panel) acceptWithVerify(a *auth.Auth, code string, isMP bool) bool {
+	for attempt := 1; attempt <= 2; attempt++ {
+		var err error
+		if isMP {
+			err = p.cfg.Upstream.AcceptTasksMP(a, []string{code})
+		} else {
+			err = p.cfg.Upstream.AcceptTasks(a, []string{code})
+		}
+		if err != nil {
+			log.Printf("autotask %s %s: accept 尝试%d: %v", logfmt.Label(a.UID, a.Nickname), code, attempt, err)
+			continue
+		}
+		time.Sleep(mpActionGap)
+		t, rerr := p.taskByCode(a, code)
+		if rerr == nil && t != nil && t.AcceptStatus != "not_accepted" && t.AcceptStatus != "" {
+			return true
+		}
+		log.Printf("autotask %s %s: accept 尝试%d 未登记生效（回读=%q）",
+			logfmt.Label(a.UID, a.Nickname), code, attempt, acceptStatusOr(t))
+	}
+	return false
+}
+
+// reportExpertUse 对指定专家跑一轮「召唤 + 真实对话 + expert_actual_use」。
+// mode="craft"：常规市场专家口径（expert_5 同族）；mode="local"：轻量云专家同款
+// LOCAL 口径（chat 链带 has_expert，actual_use 的 type 空、cost=0）——后者实测是
+// 「体验某专家」任务的另一种计分形态，作为兜底第二发。
+func (p *Panel) reportExpertUse(a *auth.Auth, e upstream.MarketExpert, mode string) error {
+	conv, req, err := p.cfg.Upstream.DesktopChatWithExpert(a, e.ExpertID)
+	if err != nil {
+		return fmt.Errorf("真实对话: %w", err)
+	}
+	if len(req) < 8 {
+		return fmt.Errorf("服务端 requestId 异常（%q）", req)
+	}
+	events := upstream.DesktopExpertSummonSequence(e)
+	chat := upstream.DesktopChatSequence(conv, req, "msg-"+req[len(req)-8:], "fast-model", "fast-model")
+	if mode == "local" {
+		for _, ev := range chat {
+			if ev["eventCode"] == "agent_task_created" {
+				ev["has_expert"] = true
+				ev["expert_id"] = e.ExpertID
+				ev["expert_name"] = e.DisplayNameZH
+				ev["expert_industry_id"] = ""
+			}
+		}
+	}
+	events = append(events, chat...)
+	var use upstream.DesktopEvent
+	if mode == "local" {
+		use = upstream.DesktopExpertActualUseLocal(e, conv, req)
+		use["type"] = ""
+		use["cost"] = 0
+		events = append(events, use)
+	} else {
+		events = append(events, upstream.DesktopExpertActualUseEvent(e, conv, req))
+	}
+	return p.cfg.Upstream.ReportDesktopEvent(a, events...)
+}
+
+// runExpertExperience 完成 expert_use_<slug>「体验指定专家」类任务（族模式）。
+//
+// 与 Expert_lighthouse 同族：判据 = 该专家 id 上的 expert_actual_use，且 requestId
+// 必须是真实对话的服务端 id。差别只在**专家来源**：这里是按任务标题里的名字在
+// 市场列表里反查，而不是写死 ex_ 前缀 id——上游每加一个专家就是一条新任务，
+// 硬编码永远追不上。
+//
+// 流程：已达标先领 → 解析专家（找不到直接返回，不留半程态）→ accept 验证 →
+// craft 口径上报 → 异步计分回读 → 未点亮补 LOCAL 口径 → 达标领奖。
+func runExpertExperience(p *Panel, a *auth.Auth, t upstream.Task) (string, error) {
+	code := t.TaskCode
+	if t.Claimed {
+		return "已领取", nil
+	}
+	target := t.Target
+	if target <= 0 {
+		target = 1
+	}
+	if t.Current >= target {
+		credit, energy, err := claimTaskReward(p, a, code)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("已达标并领取（+%d 分 +%d 能）", credit, energy), nil
+	}
+	name := taskExpertName(t)
+	if name == "" && expertIDFromJump(t) == "" {
+		return "任务既无专家名也 jump_url 无 expertId，无法定位判据对象（需人工确认）", nil
+	}
+	e, err := p.resolveTaskExpert(a, t)
+	if err != nil {
+		return "", fmt.Errorf("解析专家: %w", err)
+	}
+	if e.ExpertID == "" {
+		return fmt.Sprintf("未能在专家市场定位「%s」（定向/下线专家），跳过以免半程态", name), nil
+	}
+	if e.DisplayNameZH != "" {
+		name = e.DisplayNameZH
+	}
+	if name == "" {
+		name = e.ExpertID
+	}
+	if t.AcceptStatus == "not_accepted" || t.AcceptStatus == "" {
+		if !p.acceptWithVerify(a, code, false) {
+			return "accept 未登记生效（上游 200+OK 但未落账形态），待下次重试", nil
+		}
+	}
+	if err := p.reportExpertUse(a, e, "craft"); err != nil {
+		return fmt.Sprintf("召唤/上报失败: %v", err), nil
+	}
+	after, _ := p.taskByCodeWaiting(a, code)
+	if after != nil && after.Claimable {
+		credit, energy, cerr := claimTaskReward(p, a, code)
+		if cerr != nil {
+			return "已点亮但领奖失败（下次清扫补领）", nil
+		}
+		return fmt.Sprintf("「%s」体验完成并领奖（+%d 分 +%d 能）", name, credit, energy), nil
+	}
+	if after != nil && after.Current < target {
+		// craft 口径未计分：补一发 LOCAL 口径（同一专家、真实 requestId）。
+		if err := p.reportExpertUse(a, e, "local"); err != nil {
+			return fmt.Sprintf("craft 未计分，LOCAL 补发失败: %v", err), nil
+		}
+		after, _ = p.taskByCodeWaiting(a, code)
+		if after != nil && after.Claimable {
+			credit, energy, cerr := claimTaskReward(p, a, code)
+			if cerr != nil {
+				return "已点亮（LOCAL 口径）但领奖失败（下次清扫补领）", nil
+			}
+			return fmt.Sprintf("「%s」体验完成并领奖（LOCAL 口径，+%d 分 +%d 能）", name, credit, energy), nil
+		}
+	}
+	return fmt.Sprintf("已对「%s」上报召唤+使用链，进度未归账（异步计分，下次重试）", name), nil
 }
 
 // mpTaskCodes 小程序口径专属下发的成长任务：默认（无 mp 头）列表不出现，
@@ -647,12 +1001,6 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "task_code required")
 		return
 	}
-	act := autoActionFor(body.TaskCode)
-	if act == nil {
-		writeErr(w, http.StatusNotImplemented,
-			"该任务需要客户端内交互（无对应接口），无法自动完成；请按任务说明在官方客户端操作")
-		return
-	}
 	// per-account 互斥：同账号的任务动作正在跑（单任务或全量）时直接 409，
 	// 不并发重跑（动作幂等但 expert/skill 系含真实对话，重跑浪费配额）。
 	if !p.tryLockAccount(uid) {
@@ -662,7 +1010,7 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 	defer p.unlockAccount(uid)
 	// 前置读取：已完成的任务直接跳过（幂等，不浪费上游调用）。
 	// taskByCode 已双口径（mp 专属码自动回落 mp 列表）。
-	before, err := p.taskByCode(a, act.TaskCode)
+	before, err := p.taskByCode(a, body.TaskCode)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "list tasks: "+err.Error())
 		return
@@ -671,12 +1019,19 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "该账号没有此任务")
 		return
 	}
+	// 动作解析放在取到任务本体之后：族模式（expert_use_* 等）要靠标题解析判据载体。
+	act := actionForTask(*before)
+	if act == nil {
+		writeErr(w, http.StatusNotImplemented,
+			"该任务暂无自动动作（新增任务待适配）；已可自动接受，完成需在官方客户端操作或补充动作登记")
+		return
+	}
 	isMP := isMPTaskCode(act.TaskCode)
 	if before.Claimed {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "skipped": true, "message": "该任务已领取过奖励"})
 		return
 	}
-	msg, err := act.run(p, a)
+	msg, err := runAction(act, p, a, *before)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "执行失败: "+err.Error())
 		return
@@ -1263,6 +1618,60 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 		}
 		out = append(out, item)
 		time.Sleep(reportGap) // 项间节流
+	}
+
+	// 阶段 2：族模式任务（不在精确表内、但形状已适配的新任务，如 expert_use_*）。
+	// 静态表永远追不上上游加任务的速度，这里按当前列表动态补跑，动作与队列同源。
+	if tasks, _, err := p.listTasksBoth(a); err == nil {
+		for _, t := range tasks {
+			if t.Claimed || t.Locked {
+				continue
+			}
+			act := actionForTask(t)
+			if act == nil || act.runTask == nil {
+				continue
+			}
+			item := map[string]any{"task_code": t.TaskCode, "desc": act.Desc}
+			if t.Target > 0 && t.Current >= t.Target {
+				credit, energy, cerr := claimTaskReward(p, a, t.TaskCode)
+				switch {
+				case cerr != nil:
+					item["status"] = "skipped"
+					item["message"] = "已完成；补领失败: " + cerr.Error()
+				case credit > 0 || energy > 0:
+					item["status"] = "skipped"
+					item["claimed"] = true
+					item["message"] = fmt.Sprintf("已完成（%s）；已补领 +%d 分 +%d 能", taskProgressText(&t), credit, energy)
+				default:
+					item["status"] = "skipped"
+					item["message"] = "已完成（" + taskProgressText(&t) + "）"
+				}
+				out = append(out, item)
+				continue
+			}
+			msg, rerr := runAction(act, p, a, t)
+			if rerr != nil {
+				item["status"] = "error"
+				item["message"] = rerr.Error()
+				out = append(out, item)
+				continue
+			}
+			after, _ := p.taskByCode(a, t.TaskCode)
+			item["status"] = "done"
+			item["message"] = msg
+			item["progress_after"] = taskProgressText(after)
+			if after != nil && after.Claimable {
+				if credit, energy, cerr := claimTaskReward(p, a, t.TaskCode); cerr == nil {
+					item["claimed"] = true
+					item["credit"], item["energy"] = credit, energy
+					item["message"] = msg + fmt.Sprintf("；已自动领奖 +%d 分 +%d 能", credit, energy)
+				} else {
+					item["claim_error"] = cerr.Error()
+				}
+			}
+			out = append(out, item)
+			time.Sleep(reportGap)
+		}
 	}
 	return out
 }

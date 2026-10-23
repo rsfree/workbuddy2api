@@ -379,7 +379,20 @@ type MarketExpert struct {
 // MarketExpertList 拉取专家市场真实专家列表（expertType: "agent" 单专家 / "team" 专家团）。
 // expert_actual_use 的判据校验要求 id 是平台上真实存在的专家（编造 id 不计数）。
 func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpert, error) {
-	body := map[string]any{"page": 1, "page_size": 20, "sort_by": "reco_rank", "sort_order": "desc"}
+	return c.MarketExpertListPaged(a, expertType, 1, 20)
+}
+
+// MarketExpertListPaged 分页拉取专家市场列表（page 从 1 开始，pageSize 夹取 [1,50]）。
+// 「体验指定专家」类任务（expert_use_<slug>）只能按**展示名**反查专家 id，而定向
+// 专家不一定落在推荐排序第一页——调用方需要翻页覆盖整个市场。
+func (c *Client) MarketExpertListPaged(a *auth.Auth, expertType string, page, pageSize int) ([]MarketExpert, error) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 50 {
+		pageSize = 20
+	}
+	body := map[string]any{"page": page, "page_size": pageSize, "sort_by": "reco_rank", "sort_order": "desc"}
 	if expertType != "" {
 		body["expert_type"] = expertType
 	}

@@ -11,6 +11,9 @@ let logPin = true, loginState = null, loginTimer = null;
 let refTimer = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
 let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
+// 企业切换会话账号（token_source=enterprise_switch）：读端点正常但行为事件被上游
+// 静默丢弃，成长任务/签到不计分。概览接口给 uid 清单，表格与任务中心据此打标。
+let entSwitch = new Set();
 let mdAll = [], mdProbes = {}, mdProbeOf = () => undefined;
 let mdLocks = [], mdRecent = [];
 let reqFilter = { q: '', outcome: '' };
@@ -441,7 +444,8 @@ function renderAccounts(list) {
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div>' + (s.egress ? '<div class="id egress" title="出口 ' + esc(s.egress) + '">出口 ' + esc(s.egress) + '</div>' : '') + '</td>' +
+      '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') +
+        (entSwitch.has(s.uid) ? ' <span class="realm-tag warn" title="该凭证在企业空间下完成授权（token_source=enterprise_switch）：任务列表读得到，但行为事件被上游静默丢弃——成长任务/签到/连登都不计分。修法：在浏览器退出企业切换，以个人身份重新登录后重新导入。">企业切换·不计分</span>' : '') + '</div><div class="id">' + esc(short) + '</div>' + (s.egress ? '<div class="id egress" title="出口 ' + esc(s.egress) + '">出口 ' + esc(s.egress) + '</div>' : '') + '</td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -511,6 +515,7 @@ async function loadOverview(quiet) {
   try {
     const d = await api('overview');
     overviewData = d;
+    entSwitch = new Set(d.enterprise_switch || []);
     $('sTotal').textContent = d.total;
     $('sHealthy').textContent = d.healthy;
     $('sCooling').textContent = d.cooling;
@@ -2052,6 +2057,12 @@ $('btnScanAll').onclick = async () => {
   try {
     const d = await api('tasks/scan_all', { method: 'POST' });
     renderQueue(groupItems(d), null, '没有待办任务 🎉', '全部账号的成长任务与开学季活动都已完成，明日再来。');
+    // 新任务：清扫 / 扫描会把它记进任务目录并自动接受，这里只做提示。
+    if (d.new_count) toast('发现 ' + d.new_count + ' 个新任务（已自动接受，可自动的会立即执行）', 'ok');
+    else if (d.pending_count) {
+      const manual = d.pending_count - (d.auto_count || 0);
+      if (manual > 0) toast(manual + ' 项任务暂无自动动作（标「未适配」），需在客户端完成或补登记', 'warn');
+    }
   } catch (e) { toast(e.message, 'err'); }
   finally { b.disabled = false; b.textContent = '扫描待办'; }
 };
@@ -2076,9 +2087,10 @@ function groupItems(d) {
     const rows = [];
     for (const t of (a.growth || [])) {
       GROWTH_TITLES[t.task_code] = t.title || t.task_code;
-      rows.push({ kind: 'growth', code: t.task_code, prog: t.target ? t.current + '/' + t.target : '—', status: 'scan' });
+      // auto=false：任务还没有自动动作（新增任务待适配）；new=true：任务目录里首次出现。
+      rows.push({ kind: 'growth', code: t.task_code, prog: t.target ? t.current + '/' + t.target : '—', status: 'scan', auto: t.auto, isNew: !!t.new });
     }
-    if (rows.length) groups.push({ uid: a.uid, nick: a.nickname, rows });
+    if (rows.length) groups.push({ uid: a.uid, nick: a.nickname, rows, entSwitch: !!a.enterprise_switch });
   }
   return groups;
 }
@@ -2088,9 +2100,11 @@ function qrowHTML(it) {
   const title = isSchool ? '开学季闭环' : (GROWTH_TITLES[it.code] || it.code);
   const dotCls = it.status === 'scan' ? 'wait' : it.status === 'running' ? 'run' : it.status === 'error' ? 'err' : it.status === 'skipped' ? 'skip' : it.status === 'done' ? 'done' : 'wait';
   const stWord = it.status === 'scan' ? '待执行' : (ST_WORDS[it.status] || it.status);
+  const tags = (it.isNew ? '<span class="tag warn">新</span>' : '') +
+    (it.auto === false ? '<span class="tag mute">未适配</span>' : '');
   return '<div class="qrow" title="' + esc(it.message || '') + '">' +
     '<span class="code">' + esc(it.code) + '</span>' +
-    '<span class="name"><span class="t">' + esc(title) + '</span>' + (isSchool ? '<span class="tag mute">开学季</span>' : '') + '</span>' +
+    '<span class="name"><span class="t">' + esc(title) + '</span>' + (isSchool ? '<span class="tag mute">开学季</span>' : '') + tags + '</span>' +
     '<span class="prog">' + esc(it.prog || '') + '</span>' +
     '<span class="st"><span class="qdot ' + dotCls + '"></span>' + stWord + '</span>' +
     '<span class="msg">' + esc(it.message || '') + '</span>' +
@@ -2111,7 +2125,9 @@ function renderQueue(groups, progress, emptyTitle, emptyDesc) {
   let total = 0;
   list.innerHTML = groups.map(g => {
     total += g.rows.length;
-    return '<div class="qgroup"><header><span class="nm">' + esc(g.nick || g.uid.slice(0, 12)) + '</span><span class="cnt">' + g.rows.length + ' 项待办</span></header>' +
+    return '<div class="qgroup"><header><span class="nm">' + esc(g.nick || g.uid.slice(0, 12)) + '</span>' +
+      (g.entSwitch ? '<span class="tag warn" title="企业切换会话（token_source=enterprise_switch）：行为事件被上游静默丢弃，执行也不会入账">企业切换·不计分</span>' : '') +
+      '<span class="cnt">' + g.rows.length + ' 项待办</span></header>' +
       g.rows.map(qrowHTML).join('') + '</div>';
   }).join('');
   $('qcSummary').textContent = total + ' 项';

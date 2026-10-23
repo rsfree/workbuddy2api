@@ -28,14 +28,29 @@ import (
 
 // scanAccountItem 单账号扫描结果。
 type scanAccountItem struct {
-	UID       string          `json:"uid"`
-	Nickname  string          `json:"nickname"`
-	Growth    []upstream.Task `json:"growth,omitempty"`
-	GrowthErr string          `json:"growth_error,omitempty"`
+	UID       string     `json:"uid"`
+	Nickname  string     `json:"nickname"`
+	Growth    []scanTask `json:"growth,omitempty"`
+	GrowthErr string     `json:"growth_error,omitempty"`
+	// EnterpriseSwitch 该凭证是企业切换会话（token_source=enterprise_switch）：
+	// 任务读得到但行为事件不计分，队列会跳过。前端在分组头标出来，避免误读成
+	// 「任务没跑/判据不对」。
+	EnterpriseSwitch bool `json:"enterprise_switch,omitempty"`
 }
 
-// growthPending 任务是否"未完成且可自动化"。
-func growthPending(t upstream.Task) bool {
+// scanTask 扫描条目 = 任务本体 + 两个派生标记。
+//   - Auto：当前是否具备自动动作（false = 未适配，需要人工或补登记）；
+//   - New：任务目录里首次出现（新任务），前端打「新」标。
+type scanTask struct {
+	upstream.Task
+	Auto bool `json:"auto"`
+	New  bool `json:"new,omitempty"`
+}
+
+// taskPending 任务是否"未完成且未锁定"（扫描可见口径：含未适配任务）。
+// 未适配任务出现在扫描里是有意的——「发现新任务」本身就是需求：让人看见它、
+// 知道它值多少分、为什么没被自动跑掉，而不是让它静默消失。
+func taskPending(t upstream.Task) bool {
 	if t.Claimed {
 		return false
 	}
@@ -43,15 +58,68 @@ func growthPending(t upstream.Task) bool {
 	// 下一环以下发但 locked 形态出现在列表里——扫进队列只会 accept 不落账报
 	// 失败（每日锁定窗口），零点解锁后自然回到待办。其余 locked（上游未开放）
 	// 同语义：不该被自动化尝试。
-	if t.Locked {
-		return false
+	return !t.Locked
+}
+
+// growthPending 任务是否"未完成且可自动化"（队列执行口径）。
+func growthPending(t upstream.Task) bool {
+	return taskPending(t) && actionForTask(t) != nil
+}
+
+// listTasksBoth 合并默认与小程序口径任务列表：mp 列表是默认口径的超集（含
+// school_season / Sequential_Tasks_* 等 mp 专属码），按 task_code 去重；mp 列表
+// 失败静默（活动结束 / 无 mp 任务）。mpOnly 标记只在 mp 口径出现的码，供 accept/
+// claim 选端（缺 mp 头上游返回 task not found）。
+func (p *Panel) listTasksBoth(a *auth.Auth) (tasks []upstream.Task, mpOnly map[string]bool, err error) {
+	tasks, err = p.cfg.Upstream.ListTasks(a)
+	if err != nil {
+		return nil, nil, err
 	}
-	if t.Target > 0 && t.Current >= t.Target {
-		// 达标未领：也入队（队列执行后会自动领）——但仅限有自动化动作的任务，
-		// 否则队列执行时会因 autoActionFor 为 nil 直接报错。
-		return autoActionFor(t.TaskCode) != nil
+	mpOnly = map[string]bool{}
+	mpTasks, mErr := p.cfg.Upstream.ListTasksMP(a)
+	if mErr != nil {
+		return tasks, mpOnly, nil
 	}
-	return autoActionFor(t.TaskCode) != nil
+	seen := make(map[string]bool, len(tasks))
+	for _, t := range tasks {
+		seen[t.TaskCode] = true
+	}
+	for _, t := range mpTasks {
+		if seen[t.TaskCode] {
+			continue
+		}
+		mpOnly[t.TaskCode] = true
+		tasks = append(tasks, t)
+	}
+	return tasks, mpOnly, nil
+}
+
+// acceptCodesWithFallback 批量接受任务；整批失败时逐条重试。
+// 上游对单个不认识的码会整批打回（新任务刚下发/活动换码时最常见），逐条重试
+// 把「一个坏码拖死一票好码」的损失隔离掉。返回 (成功数, 失败数)。
+func (p *Panel) acceptCodesWithFallback(a *auth.Auth, codes []string, isMP bool) (ok, failed int) {
+	if len(codes) == 0 {
+		return 0, 0
+	}
+	acc := func(cs []string) error {
+		if isMP {
+			return p.cfg.Upstream.AcceptTasksMP(a, cs)
+		}
+		return p.cfg.Upstream.AcceptTasks(a, cs)
+	}
+	err := acc(codes)
+	if err == nil {
+		return len(codes), 0
+	}
+	log.Printf("panel: accept 整批失败 uid=%s（%d 项）: %v → 逐条重试", a.UID, len(codes), err)
+	for _, c := range codes {
+		if err := acc([]string{c}); err != nil {
+			failed++
+			continue
+		}
+		ok++
+	}
+	return ok, failed
 }
 
 // tasksScanAll 扫描全部账号：成长任务（未完成+可自动化，含 mp 口径合并）。
@@ -82,38 +150,55 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 			if a.IsEnterprise() {
 				return
 			}
-			if tasks, err := p.cfg.Upstream.ListTasks(a); err != nil {
+			// 企业切换会话：列表读得到，但行为事件被上游静默丢弃（200 不计分）。
+			// 仍然扫描（让人看见有什么任务），但打标说明「跑了也不计分」。
+			it.EnterpriseSwitch = a.IsEnterpriseSession()
+			// 默认 + 小程序口径合并（mp 是默认超集，按 code 去重；mp 失败静默）。
+			tasks, _, err := p.listTasksBoth(a)
+			if err != nil {
 				it.GrowthErr = err.Error()
-			} else {
-				for _, t := range tasks {
-					if growthPending(t) {
-						it.Growth = append(it.Growth, t)
-					}
-				}
+				return
 			}
-			// 小程序口径任务（school_season 校园日 / Sequential_Tasks_1 小程序首对话）
-			// 仅在 mp 头列表下发，与默认口径不重叠——合并进待办列表；mp 列表失败
-			// 静默（无 mp 任务的部署/活动结束时零影响）。
-			if mpTasks, err := p.cfg.Upstream.ListTasksMP(a); err == nil {
-				seen := map[string]bool{}
-				for _, t := range it.Growth {
-					seen[t.TaskCode] = true
+			// 目录观察：首次出现的码即新任务（持久化 + 日志 + 前端「新」标）。
+			fresh := p.observeTasks(tasks)
+			if len(fresh) > 0 {
+				logNewTasks(uid, fresh)
+				_ = p.catalog().flush()
+			}
+			isNew := map[string]bool{}
+			for _, t := range fresh {
+				isNew[t.TaskCode] = true
+			}
+			for _, t := range tasks {
+				if !taskPending(t) {
+					continue
 				}
-				for _, t := range mpTasks {
-					if growthPending(t) && !seen[t.TaskCode] {
-						it.Growth = append(it.Growth, t)
-					}
-				}
+				it.Growth = append(it.Growth, scanTask{
+					Task: t,
+					Auto: actionForTask(t) != nil,
+					New:  isNew[t.TaskCode],
+				})
 			}
 		}(i, st.UID)
 	}
 	wg.Wait()
-	pending := 0
+	pending, automatable, newCount := 0, 0, 0
 	for _, it := range items {
 		pending += len(it.Growth)
+		for _, t := range it.Growth {
+			if t.Auto {
+				automatable++
+			}
+			if t.New {
+				newCount++
+			}
+		}
 	}
-	log.Printf("panel: 队列扫描完成：全部账号待办 %d 项", pending)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": items, "pending_count": pending})
+	log.Printf("panel: 队列扫描完成：全部账号待办 %d 项（可自动 %d，新任务 %d）", pending, automatable, newCount)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "accounts": items,
+		"pending_count": pending, "auto_count": automatable, "new_count": newCount,
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -235,24 +320,15 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 				return
 			}
 			if growth {
-				if tasks, err := p.cfg.Upstream.ListTasks(a); err == nil {
+				// 默认 + 小程序口径合并（与 tasksScanAll 同源，含新任务的族动作）。
+				if tasks, _, err := p.listTasksBoth(a); err == nil {
+					// 目录观察：队列这轮也算「看见」，避免只跑队列时新任务不入目录。
+					if fresh := p.observeTasks(tasks); len(fresh) > 0 {
+						logNewTasks(a.UID, fresh)
+					}
 					for _, t := range tasks {
 						if growthPending(t) {
 							one.grow = append(one.grow, t)
-						}
-					}
-					// 合并小程序口径待办（与 tasksScanAll 同口径：mp 列表是默认口径
-					// 超集，按 code 去重；失败静默）。此前此处漏合并——扫描显示
-					// mp 待办而队列报"无可执行待办"。
-					if mpTasks, mpErr := p.cfg.Upstream.ListTasksMP(a); mpErr == nil {
-						seen := map[string]bool{}
-						for _, t := range one.grow {
-							seen[t.TaskCode] = true
-						}
-						for _, t := range mpTasks {
-							if growthPending(t) && !seen[t.TaskCode] {
-								one.grow = append(one.grow, t)
-							}
 						}
 					}
 					sort.Slice(one.grow, func(i, j int) bool { // 按 autoActions 顺序（依赖前置）
@@ -306,6 +382,67 @@ func (p *Panel) RunGrowthQueueOnce() {
 	if started {
 		log.Printf("panel: 定时成长任务队列已启动（%d 项）", total)
 	}
+}
+
+// runDiscoveredTasks 只对「本轮新发现的码」执行动作。
+//
+// 为什么不直接复用 startGrowthQueue：那是「全量待办」语义，一次发现会把所有账号
+// 所有历史待办一起重跑（含真实对话配额）。新任务出现时常伴随一波活动，按全量跑
+// 等于把成本乘以账号数。这里把影响面锁在这几个码上。
+//
+// 并发与队列同口径：账号间并发（上限 4），账号内串行，共用 per-account 锁。
+func (p *Panel) runDiscoveredTasks(codes []string) {
+	if len(codes) == 0 {
+		return
+	}
+	want := make(map[string]bool, len(codes))
+	for _, c := range codes {
+		want[c] = true
+	}
+	sem := make(chan struct{}, 4)
+	var wg sync.WaitGroup
+	for _, ps := range p.cfg.Pool.List() {
+		if ps.Disabled {
+			continue
+		}
+		a := p.cfg.Pool.AuthByUID(ps.UID)
+		if a == nil || a.IsGlobal() || a.IsEnterprise() || a.IsEnterpriseSession() {
+			continue
+		}
+		wg.Add(1)
+		go func(a *auth.Auth) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if !p.tryLockAccount(a.UID) {
+				return // 正在跑任务动作：下一轮或每日队列接手
+			}
+			defer p.unlockAccount(a.UID)
+			tasks, _, err := p.listTasksBoth(a)
+			if err != nil {
+				log.Printf("panel: 新任务执行 uid=%s: 拉取任务列表失败: %v", a.UID, err)
+				return
+			}
+			ran := 0
+			for _, t := range tasks {
+				if !want[t.TaskCode] || t.Claimed || t.Locked {
+					continue
+				}
+				msg, rerr := p.runGrowthQueued(a, t.TaskCode)
+				if rerr != nil {
+					log.Printf("panel: 新任务执行 uid=%s code=%s: %v", a.UID, t.TaskCode, rerr)
+				} else {
+					log.Printf("panel: 新任务执行 uid=%s code=%s: %s", a.UID, t.TaskCode, msg)
+				}
+				ran++
+				time.Sleep(reportGap)
+			}
+			if ran > 0 {
+				log.Printf("panel: 新任务执行 uid=%s: 命中 %d 项（本轮新码 %d 个）", a.UID, ran, len(codes))
+			}
+		}(a)
+	}
+	wg.Wait()
 }
 
 // runQueueItems 队列执行主体：按账号分组，账号内串行（per-account 锁），
@@ -398,35 +535,37 @@ func (p *Panel) queueSet(q *queueState, uid string, fn func(*queueItem)) {
 }
 
 // acceptPendingTasks 批量接受该账号未接受的任务，返回接受的个数（失败返回 0 不阻塞）。
+// 默认与 mp 口径分开提交（端标记不同，混提交会让 mp 任务报 task not found），
+// 整批失败时逐条隔离（新下发的码上游可能不认，别拖死其余合法任务）。
 func (p *Panel) acceptPendingTasks(a *auth.Auth) int {
-	tasks, err := p.cfg.Upstream.ListTasks(a)
+	tasks, mpOnly, err := p.listTasksBoth(a)
 	if err != nil {
 		return 0
 	}
-	var codes []string
+	var codes, mpCodes []string
 	for _, t := range tasks {
-		if !t.Claimed && !t.Locked && t.AcceptStatus != "accepted" && t.AcceptStatus != "completed" {
+		if t.Claimed || t.Locked || t.AcceptStatus == "accepted" || t.AcceptStatus == "completed" {
+			continue
+		}
+		if isMPTaskCode(t.TaskCode) || mpOnly[t.TaskCode] {
+			mpCodes = append(mpCodes, t.TaskCode)
+		} else {
 			codes = append(codes, t.TaskCode)
 		}
 	}
-	if len(codes) == 0 {
-		return 0
+	ok, failed := p.acceptCodesWithFallback(a, codes, false)
+	mpOK, mpFailed := p.acceptCodesWithFallback(a, mpCodes, true)
+	ok += mpOK
+	failed += mpFailed
+	if ok > 0 {
+		log.Printf("panel: 队列 accept uid=%s: 已接受 %d 个任务（失败 %d）", a.UID, ok, failed)
 	}
-	if err := p.cfg.Upstream.AcceptTasks(a, codes); err != nil {
-		log.Printf("panel: 队列 accept uid=%s: %v（不阻塞）", a.UID, err)
-		return 0
-	}
-	log.Printf("panel: 队列 accept uid=%s: 已接受 %d 个任务", a.UID, len(codes))
-	return len(codes)
+	return ok
 }
 
 // runGrowthQueued 执行单个成长任务（动作 + 回读 + 自动领奖；与
 // accountTaskAuto 同语义，结果以文字返回）。
 func (p *Panel) runGrowthQueued(a *auth.Auth, code string) (string, error) {
-	act := autoActionFor(code)
-	if act == nil {
-		return "", fmt.Errorf("任务 %s 无自动动作", code)
-	}
 	// taskByCode 已双口径（mp 专属码自动回落 mp 列表）。
 	before, err := p.taskByCode(a, code)
 	if err != nil {
@@ -435,11 +574,16 @@ func (p *Panel) runGrowthQueued(a *auth.Auth, code string) (string, error) {
 	if before == nil {
 		return "该账号无此任务", nil
 	}
+	// 动作解析需要任务本体（族模式靠标题解析判据载体）。
+	act := actionForTask(*before)
+	if act == nil {
+		return "该任务暂无自动动作（已跳过）", nil
+	}
 	isMP := isMPTaskCode(code)
 	if before.Claimed {
 		return "已完成（已领取）", nil
 	}
-	msg, err := act.run(p, a)
+	msg, err := runAction(act, p, a, *before)
 	if err != nil {
 		return "", err
 	}

@@ -157,6 +157,15 @@ func (s *Scheduler) SetGrowthHook(fn func()) {
 	s.schedMu.Unlock()
 }
 
+// GrowthEnabled 报告成长任务排程是否启用（schedule.growth_enabled）。
+// 任务补领清扫发现「可自动的新任务」时要据此决定是否立即补跑一轮队列——
+// 用户显式关掉成长排程后，不该被清扫绕过开关跑真实对话。
+func (s *Scheduler) GrowthEnabled() bool {
+	s.schedMu.Lock()
+	defer s.schedMu.Unlock()
+	return !s.cfg.GrowthDisabled
+}
+
 // includeDisabledInTasks 返回保号类任务是否应覆盖禁用账号（配置快照，供循环开头取一次）。
 func (s *Scheduler) includeDisabledInTasks() bool {
 	s.schedMu.Lock()

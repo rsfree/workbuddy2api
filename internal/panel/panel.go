@@ -70,6 +70,10 @@ type Config struct {
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
+
+	// CatalogFile 任务目录文件（taskcatalog.go）：记录上游下发过的任务码，用于
+	// 「发现新任务」。空 = 纯内存（测试场景），不落盘。
+	CatalogFile string
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -95,6 +99,15 @@ type Panel struct {
 	// 任务中心执行队列（taskcenter.go）。
 	queueOnce sync.Once
 	q         *queueState
+
+	// 任务目录（taskcatalog.go）：持久化「见过哪些任务码」，用于发现新任务。
+	catOnce sync.Once
+	cat     *taskCatalog
+
+	// 专家市场快照（autotask.go）：定向专家任务按名字匹配专家，一次快照多任务
+	// 复用，避免逐任务重拉分页列表。uid → 快照，TTL 见 expertCacheTTL。
+	expertMu    sync.Mutex
+	expertCache map[string]expertCacheEntry
 }
 
 // tryLockAccount 尝试锁定账号的任务执行；已在执行返回 false。
@@ -183,6 +196,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/tasks/scan_all", p.withAuth(p.tasksScanAll))
 	p.mux.HandleFunc("POST /panel/api/tasks/run_queue", p.withAuth(p.tasksRunQueue))
 	p.mux.HandleFunc("GET /panel/api/tasks/queue", p.withAuth(p.tasksQueueStatus))
+	p.mux.HandleFunc("GET /panel/api/tasks/catalog", p.withAuth(p.tasksCatalog))
 	p.mux.HandleFunc("GET /panel/api/school/vouchers", p.withAuth(p.schoolVouchers))
 	p.mux.HandleFunc("POST /panel/api/checkin_all", p.withAuth(p.checkinAll))
 	p.mux.HandleFunc("POST /panel/api/travel_all", p.withAuth(p.travelAll))
@@ -272,6 +286,16 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 			banned++
 		}
 	}
+	// 企业切换会话账号（JWT token_source=enterprise_switch）：这类号「读得见、记不上账」
+	// ——任务列表/额度查询照常，但 /v2/report 行为事件被上游 200 静默丢弃，成长任务
+	// 永远 0/x、连登签到同样无效。必须单独标出来，否则会被误判成「判据没适配」而反复
+	// 排查。只列「切换会话」这一种，真企业版本已有 enterprise 标记，不重复。
+	switchUIDs := make([]string, 0, 4)
+	for _, st := range accounts {
+		if a := p.cfg.Pool.AuthByUID(st.UID); a != nil && a.IsEnterpriseSession() && !a.IsEnterprise() {
+			switchUIDs = append(switchUIDs, st.UID)
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":         p.cfg.Version,
 		"uptime_sec":      int(time.Since(p.started).Seconds()),
@@ -289,6 +313,10 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"paused":         paused,
 		"in_flight_full": inFlightFull,
 		"accounts":       accounts,
+		// 企业切换会话账号清单（uid）+ 计数：前端据此在账号表格与任务中心打
+		// 「企业切换·不计分」标。只影响展示，不改变选号/执行口径。
+		"enterprise_switch":       switchUIDs,
+		"enterprise_switch_count": len(switchUIDs),
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
 		// 与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
 		"model_locks": p.cfg.Pool.ModelLockView(),
