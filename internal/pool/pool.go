@@ -440,6 +440,9 @@ func (p *Pool) Remove(uid string) *auth.Auth {
 // upsertLocked 更新或插入单个账号；已存在则只换凭证、保留 credits/cooling 状态。
 // 调用方必须已持有 p.mu；Add 与 SyncToDir 共用此 upsert 逻辑。
 func (p *Pool) upsertLocked(a *auth.Auth) {
+	// 进池时间兜底：LoadDir 已按文件 mtime 填过；运行中导入（面板 import / 热加号）
+	// 没有 mtime 来源，以首次进入池的时刻为准。幂等，已有值不覆盖。
+	a.SetImportedAtIfZero(time.Now())
 	if e, ok := p.byUID[a.UID]; ok {
 		e.a = a // 保留 credits/cooling 状态
 		return

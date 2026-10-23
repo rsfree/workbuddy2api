@@ -95,6 +95,21 @@ function dur(sec) {
   const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
   return h ? h + '时' + String(m).padStart(2, '0') + '分' : m ? m + '分' + String(s).padStart(2, '0') + '秒' : s + '秒';
 }
+// 导入时间：MM-DD HH:mm（跨年补年份）；未记录（旧凭证）显示 —。
+// 只负责展示，排序用 parseAPITime 的原始毫秒值。
+function importedAtText(iso) {
+  const ms = parseAPITime(iso);
+  if (!ms) return '—';
+  const d = new Date(ms);
+  const p = n => String(n).padStart(2, '0');
+  const md = p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+  return d.getFullYear() === new Date().getFullYear() ? md : d.getFullYear() + '-' + md;
+}
+function importedAtTitle(iso) {
+  const ms = parseAPITime(iso);
+  if (!ms) return '未记录导入时间（该凭证导入早于本功能上线）';
+  return '导入于 ' + fmtLocalDateTime(ms) + '（' + ago(iso) + '）';
+}
 function parseAPITime(value) {
   const text = String(value || '');
   if (!text || text.startsWith('0001-')) return 0;
@@ -395,9 +410,12 @@ setTimeout(() => {
 
 /* ── 账号池 ───────────────────────────────────────────────────────── */
 function renderAccounts(list) {
+  // 按导入时间倒排：刚导进来的号排在最上面，便于确认「刚才那批进去了没有」。
+  // 无 imported_at 的旧凭证 parseAPITime=0，自然沉到末尾（顺序稳定）。
+  list = list.slice().sort((a, b) => parseAPITime(b.imported_at) - parseAPITime(a.imported_at));
   const tb = $('accBody');
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="10"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
     return;
   }
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
@@ -463,6 +481,7 @@ function renderAccounts(list) {
         '<span class="usage-item usage-rate"><b>' + rate + '</b></span>' +
       '</span></td>' +
       '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
+      '<td class="num" style="color:var(--ink-3)" title="' + esc(importedAtTitle(s.imported_at)) + '">' + importedAtText(s.imported_at) + '</td>' +
       '<td class="acts">' +
         // 企业版无个人成长体系（签到 400「企业账号不支持该操作」/ 成长任务 403）：
         // 不渲染「签到」「任务」按钮，只留「额度」——点它走 /balance，企业额度由

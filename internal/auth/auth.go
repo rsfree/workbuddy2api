@@ -48,6 +48,13 @@ type Auth struct {
 	// 手写扁平形 auth 文件可直接写 "device_token": "..."；插件 OAuth 嵌套形
 	// 顶层 device_token 也会被解析（与桌面端共用状态文件的部署方式）。
 	DeviceToken string
+
+	// importedAt 首次进池时间（导入时间）。来源：LoadDir 读文件 mtime；运行中经
+	// 面板导入的账号由 pool.upsertLocked 兜底填 now（文件刚写入，mtime 即导入时刻）。
+	// 只写一次（SetImportedAtIfZero），token 刷新 / SaveAtomic 均不改写 —— 语义是
+	// 「这个号什么时候进池」，不是「最后一次写文件」。并发纪律同 group：加载期写、
+	// 运行期只读，故不加锁。
+	importedAt time.Time
 }
 
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
@@ -55,6 +62,25 @@ func (a *Auth) Lock() { a.mu.Lock() }
 
 // Unlock 释放 a.Lock 获取的锁。
 func (a *Auth) Unlock() { a.mu.Unlock() }
+
+// ImportedAtTime 返回首次进池时间（零值 = 未知，前端显示 —）。
+func (a *Auth) ImportedAtTime() time.Time {
+	if a == nil {
+		return time.Time{}
+	}
+	return a.importedAt
+}
+
+// SetImportedAtIfZero 仅在尚未记录时写入进池时间（幂等：启动加载 / 重复 upsert
+// 不覆盖，保证「第一次进池」语义稳定）。
+func (a *Auth) SetImportedAtIfZero(t time.Time) {
+	if a == nil || t.IsZero() {
+		return
+	}
+	if a.importedAt.IsZero() {
+		a.importedAt = t
+	}
+}
 
 // Group 返回该账号的出口分组名（空 = 未分组）。
 //
@@ -472,6 +498,10 @@ func LoadDir(dir string) ([]*Auth, error) {
 			continue
 		}
 		a.FilePath = f
+		// 导入时间取文件 mtime：auths/ 下的文件由导入动作写入，mtime 即导入时刻。
+		if fi, err := os.Stat(f); err == nil {
+			a.SetImportedAtIfZero(fi.ModTime())
+		}
 		if prev, ok := seenUID[a.UID]; ok {
 			log.Printf("WARN: uid %s duplicated across %s and %s — 后者覆盖（不同 realm 同名 UID？）",
 				logfmt.Label(a.UID, a.Nickname), prev, f)
