@@ -149,3 +149,36 @@ cp /root/wb2api-hk-proxy.inc.bak-20261023 /www/server/panel/vhost/nginx/wb2api-h
   连登天数断一天补不回来，且活跃上报是 `first_buddy` 领养的前置心跳；静默期收窄为
   旅行 / 夜猫子 / 成长队列。回归用例 `TestRunActivityNowIgnoresNewAccountGrace`。回滚：
   `docker-compose.yml.bak-1.13.20-grace`。
+
+- `1.13.28`（2026-10-24）：**新增对话协议前门** `POST /v1/messages`（Anthropic Messages）、
+  `POST /v1/responses`（OpenAI Responses）、`POST /v1/messages/count_tokens`。入口翻成 chat
+  请求后复用同一条 `chatCompletions` 链路（选号/粘性/轮转/冷却/记账零改动），出口在写入器层
+  翻回目标协议。`count_tokens` 按真实 `usage.prompt_tokens` 在线自校准，样本采在 chat 链路
+  usage 唯一汇聚点，参数落 `data/token-calib.json`、`GET /status` 的 `token_calib` 可观测。
+  回滚：`cp .pre-v1.13.28 docker-compose.yml && docker compose up -d`。
+
+- `1.13.29`（2026-10-24）：**鉴权接受 `x-api-key`**。1.13.28 上线后实测发现 Claude Code
+  默认只发 `x-api-key` 不认 `Authorization: Bearer`，直接 401 —— 前门的核心用户被挡在门外。
+  现在两个头都认（Bearer 优先，`Authorization` 是别的方案时不回落），常量时间比较性质不变。
+  回滚：`cp .pre-v1.13.29 docker-compose.yml && docker compose up -d`。
+
+## 上线验证清单（1.13.28/1.13.29 实测）
+
+```
+/panel/                            200，overview version=1.13.29-panel，68 账号 / 55 healthy
+/v1/messages 无鉴权                 401 {"type":"error","error":{"type":"authentication_error"}}
+/v1/messages x-api-key             200 type=message stop=end_turn
+/v1/messages 流式                   event: message_start → content_block_delta… → message_stop（69 帧）
+                                   首字节 1.30s / 总时长 1.54s ⇒ nginx 未整包缓冲
+/v1/responses                      200 object=response status=completed
+/v1/messages + tools→强制 tool_choice  stop=tool_use，blocks=[thinking,text,tool_use]，
+                                   input={"city":"北京"}
+/v1/messages/count_tokens          200 {"input_tokens":20}（随 token_calib 学到的系数浮动）
+错误信封                            空 messages→400 invalid_request_error（Anthropic 形状）
+                                   /v1/responses 不存在的模型→error.code=model_unavailable
+启动日志                            local[32 ip]，[tokencalib] 已启用 data/token-calib.json
+```
+
+> 校准实况（上线 10 分钟、真实流量）：`deepseek-v4.1-flash` 49 样本 slope≈1.96、
+> `kimi-k2.5` 12 样本 slope≈0.89 + intercept≈557（说明上游把固定开销算进了 prompt_tokens，
+> intercept 正是为它准备的）、另有 4 个模型在学。文件在 `data/token-calib.json`，重建容器不丢。
