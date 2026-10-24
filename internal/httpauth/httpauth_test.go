@@ -59,3 +59,40 @@ func TestDigestIsFixedLength(t *testing.T) {
 		t.Errorf("sha256 digest length = %d, want 32", len(digest("x")))
 	}
 }
+
+// TestVerifyBearerXAPIKey Anthropic 客户端（Claude Code 等）只发 x-api-key，
+// 不认 Authorization: Bearer。只支持后者会把它们挡在 401 外面——这是线上实测
+// 踩到的硬伤，不是可选的兼容项。
+func TestVerifyBearerXAPIKey(t *testing.T) {
+	withKey := func(apiKey, authz string) *http.Request {
+		r := httptest.NewRequest("POST", "/v1/messages", nil)
+		if apiKey != "" {
+			r.Header.Set("x-api-key", apiKey)
+		}
+		if authz != "" {
+			r.Header.Set("Authorization", authz)
+		}
+		return r
+	}
+	cases := []struct {
+		name   string
+		apiKey string
+		authz  string
+		want   bool
+	}{
+		{"仅 x-api-key 正确", "sk-abc123", "", true},
+		{"仅 x-api-key 错误", "sk-wrong", "", false},
+		{"x-api-key 前后有空格（客户端复制粘贴常见）", "  sk-abc123  ", "", true},
+		{"Authorization 正确 + x-api-key 错误：以 Authorization 为准", "sk-wrong", "Bearer sk-abc123", true},
+		{"Authorization 错误 + x-api-key 正确：仍失败（显式头优先）", "sk-abc123", "Bearer sk-wrong", false},
+		{"Authorization 是别的方案时不回落到 x-api-key", "sk-abc123", "Basic dXNlcjpwYXNz", false},
+		{"两个头都没有", "", "", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := VerifyBearer(withKey(c.apiKey, c.authz), "sk-abc123"); got != c.want {
+				t.Errorf("VerifyBearer(x-api-key=%q, authz=%q) = %v, want %v", c.apiKey, c.authz, got, c.want)
+			}
+		})
+	}
+}

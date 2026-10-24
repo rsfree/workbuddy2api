@@ -792,10 +792,15 @@ export WB2A_EGRESS_PASSWORD=<口令>
   429→`rate_limit_error`、503→`overloaded_error`、400→`invalid_request_error`），
   `message` 保留上游原文，`gateway_hint` 一并带上；鉴权失败的 401 同样是协议原生形状。
 
+> **鉴权头两种都认**：`Authorization: Bearer <key>` 或 `x-api-key: <key>`。
+> Claude Code / Anthropic SDK 默认只发后者，直接 `export ANTHROPIC_API_KEY=<key>` 即可，
+> 不必再包一层转换（2026-10-24 线上实测：只支持 Bearer 时 Claude Code 全部 401）。
+
 ```bash
-# Anthropic Messages（Claude Code 把 ANTHROPIC_BASE_URL 指向网关根路径即可）
+# Anthropic Messages（Claude Code：ANTHROPIC_BASE_URL=<网关根路径> + ANTHROPIC_API_KEY=<key>）
 curl -s http://localhost:7863/v1/messages \
-  -H "Authorization: Bearer your-api-key" \
+  -H "x-api-key: your-api-key" \
+  -H "anthropic-version: 2023-06-01" \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4-flash","max_tokens":128,
        "messages":[{"role":"user","content":"hi"}]}'
