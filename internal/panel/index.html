@@ -1026,7 +1026,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="grid2">
               <label class="fld"><span class="lb">新号任务静默期（天）</span>
                 <input name="new_account_grace_days" type="number" min="0" max="30" placeholder="3"></label>
-              <div class="hint">导入后前 N 天只做保号动作（签到 / 连登兑换 / Token 保活 / 余额刷新 / 任务补领），跳过旅行、活跃上报、夜猫子与成长任务——新号刚换设备或出口就跑去领养、上报、发对话最容易触发上游风控。<br>例外：积分清光（credits=0）时提前放行，让号自己回血。填 <b>0</b> 关闭；上限 30 天。<br>只认「导入动作」写入的进池时间：老号由文件时间推断的日期不参与判定，搬机器不会把整池误判成新号。</div>
+              <div class="hint">导入后前 N 天只做保号动作（签到 / 连登兑换 / 活跃上报 / Token 保活 / 余额刷新 / 任务补领），跳过旅行、夜猫子与成长任务——新号刚换设备或出口就去领养、发真实对话最容易触发上游风控。<br><b>活跃上报不会被停</b>：它是连登天数的唯一来源（断一天补不回来），也是领养的前置心跳，动作仅一条轻量上报。<br>例外：积分清光（credits=0）时提前放行，让号自己回血。填 <b>0</b> 关闭；上限 30 天。<br>只认「导入动作」写入的进池时间：老号由文件时间推断的日期不参与判定，搬机器不会把整池误判成新号。</div>
             </div>
             <div class="hr"></div>
             <div class="switch"><span class="lb">保号任务覆盖已禁用账号</span>

@@ -269,7 +269,7 @@ func main() {
 	case days <= 0:
 		log.Printf("新号任务静默期已关闭（schedule.new_account_grace_days=%d）", days)
 	default:
-		log.Printf("新号任务静默期：导入后 %d 天内只签到/保活/刷新余额，跳过旅行 / 活跃上报 / 夜猫子 / 成长任务（积分清光则提前放行）", days)
+		log.Printf("新号任务静默期：导入后 %d 天内跳过旅行 / 夜猫子 / 成长任务；签到、活跃上报（保连登）、保活、刷新余额照常（积分清光则提前放行）", days)
 	}
 
 	// 管理面板日志镜像：标准 log（stderr）与 chat 表格日志（stdout）双路复制进

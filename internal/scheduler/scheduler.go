@@ -572,10 +572,13 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		if st.Disabled && !includeDisabled {
 			continue
 		}
-		// 新号任务静默期：活跃上报是旅行领养的前置，一起停；签到/保活不受影响。
-		if s.graceSkip(st, "activity") {
-			continue
-		}
+		// 活跃上报**不受新号静默期影响**（2026-10-24 用户口径：活跃上报不要停）：
+		//   - 它是连登天数（streak）的唯一来源，停一天就断签，且断签事后补不回来
+		//     （streak 按自然日连续累计，静默期结束只能从 1 重新数）；
+		//   - 它同时是 first_buddy 领养的前置门槛（当日无上报 → 领养 400），停了
+		//     旅行解禁也要顺延，等于把静默期成本翻倍；
+		//   - 动作量级最轻：一条 chat_request_send 心跳，无对话、无模型调用。
+		// 故此处刻意不调 graceSkip：静默期只停旅行 / 夜猫子 / 成长队列。
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.AccessTokenValue() == "" {
 			continue

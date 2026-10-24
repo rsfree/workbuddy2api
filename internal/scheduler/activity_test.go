@@ -609,3 +609,37 @@ func TestCheckinStillSkipsGlobal(t *testing.T) {
 		t.Errorf("checkin global 上游调用=%d want 0（签到仍应跳过 global）", n)
 	}
 }
+
+// TestRunActivityNowIgnoresNewAccountGrace 回归：新号静默期**不停活跃上报**。
+//
+// 2026-10-24 用户口径「活跃上报不要停」：连登天数按自然日连续累计，静默期内停
+// 一天就断签且事后补不回来；它又是 first_buddy 领养的前置心跳。故 runActivity
+// 刻意不走 graceSkip —— 本用例同时断言「这号确实在静默期」（TaskMuted=true）与
+// 「仍然被上报」，防止后人为了「口径整齐」把门控加回来。
+func TestRunActivityNowIgnoresNewAccountGrace(t *testing.T) {
+	fastActivity(t)
+	stub := &reportStub{}
+	srv := httptest.NewServer(stub.handler())
+	defer srv.Close()
+
+	// p.Add 走 upsert 兜底 → 进池时间 = now 且来源标记为可信 "import"，
+	// 即"刚刚导入的新号"。
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "new1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.Add(&auth.Auth{UID: "new2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up, NewAccountGraceDays: 3})
+
+	// 前提自检：这两个号此刻确实处于静默期（旅行/夜猫子会被跳过）。
+	for _, st := range p.List() {
+		if muted, _ := s.TaskMuted(st); !muted {
+			t.Fatalf("%s 应处于静默期（前提不成立，用例失效）", st.UID)
+		}
+	}
+
+	s.RunActivityNow()
+
+	if n := stub.calls.Load(); n != 2 {
+		t.Errorf("report calls=%d want 2（静默期也必须上报：断签补不回来）", n)
+	}
+}
