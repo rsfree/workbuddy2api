@@ -49,3 +49,7 @@ server.exe
 # Node (scripts/register_sms.mjs)
 node_modules/
 scripts/package-lock.json
+
+# 本地编译产物 / 工具目录
+/server
+/.workbuddy/
