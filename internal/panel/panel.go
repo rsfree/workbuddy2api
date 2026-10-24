@@ -108,6 +108,10 @@ type Panel struct {
 	// 复用，避免逐任务重拉分页列表。uid → 快照，TTL 见 expertCacheTTL。
 	expertMu    sync.Mutex
 	expertCache map[string]expertCacheEntry
+
+	// 容量分析扫描完整请求归档，低频读取并缓存；互斥同时合并相同/不同参数的并发计算。
+	capacityMu    sync.Mutex
+	capacityCache map[string]capacityCacheEntry
 }
 
 // tryLockAccount 尝试锁定账号的任务执行；已在执行返回 false。
@@ -205,6 +209,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.balanceAll))
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
+	p.mux.HandleFunc("GET /panel/api/capacity", p.withAuth(p.capacityReport))
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))

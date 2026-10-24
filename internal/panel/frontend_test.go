@@ -97,7 +97,7 @@ const sandbox = new Proxy({
   // 该文件不在本沙箱内执行，但保留此桩，将来把 mobile.js 纳入冒烟时可直接复用。
   MutationObserver: class { constructor() {} observe() {} disconnect() {} takeRecords() { return []; } },
   setInterval, clearInterval, setTimeout, clearTimeout,
-  console, JSON, Math, Date, Number, String, Boolean, Object, Array, Promise, Map, Set, RegExp, Error, TypeError, isNaN, parseInt, parseFloat, encodeURIComponent, decodeURIComponent, URL, Symbol, Proxy, Reflect,
+  console, JSON, Math, Date, Number, String, Boolean, Object, Array, Promise, Map, Set, RegExp, Error, TypeError, isNaN, parseInt, parseFloat, encodeURIComponent, decodeURIComponent, URL, URLSearchParams, Symbol, Proxy, Reflect,
 }, { get(t, k) { return t[k]; }, has() { return true; } });
 sandbox.window = sandbox; sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
@@ -118,7 +118,7 @@ try {
 		t.Fatal(err)
 	}
 	hf.Close()
-	for _, hash := range []string{"#taskscenter", "#accounts", "#usage", "#models", "#config", "#logs", "#packages"} {
+	for _, hash := range []string{"#taskscenter", "#accounts", "#usage", "#capacity", "#models", "#config", "#logs", "#packages"} {
 		cmd := exec.Command(node, hf.Name(), "app.js")
 		cmd.Dir = "." // 测试工作目录 = internal/panel
 		cmd.Env = append(os.Environ(), "SMOKE_HASH="+hash)
@@ -1521,4 +1521,3 @@ process.stdout.write(JSON.stringify({
 			strings.TrimSpace(string(out)), want)
 	}
 }
-

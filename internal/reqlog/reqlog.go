@@ -238,6 +238,15 @@ func (r *Recorder) ReadArchive(limit int, filter Filter) ([]Event, error) {
 	return r.archive.read(limit, filter)
 }
 
+// ReadAllArchive 为离线式聚合读取全部匹配事件，不受面板逐页 1000 条上限影响。
+// 调用方应是带缓存的低频管理任务，不能放在模型请求热路径。
+func (r *Recorder) ReadAllArchive(filter Filter) ([]Event, error) {
+	if r == nil || r.archive == nil {
+		return nil, nil
+	}
+	return r.archive.read(-1, filter)
+}
+
 // Close 刷盘并停止后台归档。
 func (r *Recorder) Close() {
 	if r == nil || r.archive == nil {
@@ -524,7 +533,7 @@ func (w *archiveWriter) read(limit int, filter Filter) ([]Event, error) {
 	if !w.enabled() {
 		return nil, nil
 	}
-	if limit <= 0 {
+	if limit == 0 {
 		limit = 200
 	}
 	if limit > defaultReadMax {
@@ -552,7 +561,7 @@ func (w *archiveWriter) read(limit int, filter Filter) ([]Event, error) {
 	}
 	// 契约：按事件时间倒序返回最近 limit 条（同一时刻用 Stable 保留落盘先后）。
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Time.After(out[j].Time) })
-	if len(out) > limit {
+	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}
 	return out, nil

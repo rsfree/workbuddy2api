@@ -519,6 +519,19 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     margin-top: 6px; background: var(--surface-2); }
   .pk-card .expirybar i { display: block; height: 100%; min-width: 2px; }
 
+  /* ── 容量规划 ─────────────────────────────────────────────────── */
+  .cap-hero { padding: 18px 20px; border-bottom: 1px solid var(--line-soft);
+    font-size: 20px; font-weight: 600; color: var(--accent); }
+  .cap-rec { padding: 13px 17px; border-bottom: 1px solid var(--line-soft); }
+  .cap-rec:last-child { border-bottom: none; }
+  .cap-rec .cap-title { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+  .cap-rec p { margin: 6px 0 3px; color: var(--ink-2); }
+  .cap-rec small { color: var(--ink-3); }
+  .cap-rec.p0 { box-shadow: inset 3px 0 var(--bad); }
+  .cap-rec.p1 { box-shadow: inset 3px 0 var(--warn); }
+  .cap-rec.p2 { box-shadow: inset 3px 0 var(--ok); }
+  .cap-method { white-space: pre-wrap; color: var(--ink-3); line-height: 1.7; }
+
   /* ── 筛选栏（模型档位 / 运行日志 / 用量共用）─────────────────────────
      面板控件默认 input/select 是 width:100%（配置表单要整行），筛选栏里必须显式
      收回宽度，否则第一个控件会把整行撑满、后面的控件被挤到下一行。 */
@@ -628,6 +641,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#usage" data-view="usage">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 13.5h12"/><path d="M4.5 13.5V8.2M8 13.5V3.5M11.5 13.5v-3"/></svg>
         用量</a></li>
+      <li><a href="#capacity" data-view="capacity">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 13.5h12M3 11l3-3 2.5 2L13 4.5"/><path d="M10 4.5h3v3"/></svg>
+        容量规划</a></li>
       <li><a href="#packages" data-view="packages">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.2 5.4 8 2.5l5.8 2.9v5.2L8 13.5l-5.8-2.9z"/><path d="M2.2 5.4 8 8.3l5.8-2.9M8 8.3v5.2"/></svg>
         积分构成</a></li>
@@ -942,6 +958,37 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           </table>
         </div>
       </div>
+    </section>
+
+    <!-- 容量规划：纯只读统计，不触发上游模型调用或配置修改 -->
+    <section class="view" id="view-capacity" hidden>
+      <div class="box">
+        <header>
+          <h3>容量预测 <span class="hint">近期用量 + 账号余额 + 补给 + 请求质量</span></h3>
+          <span class="grow"></span>
+          <label class="sel-note">预测
+            <select id="capDays"><option value="1">1 天</option><option value="3">3 天</option><option value="7" selected>7 天</option><option value="14">14 天</option><option value="30">30 天</option></select></label>
+          <label class="sel-note">质量窗口
+            <select id="capHours"><option value="6">6 小时</option><option value="24" selected>24 小时</option><option value="72">3 天</option><option value="168">7 天</option></select></label>
+          <button class="xs" id="btnCapacity">重新分析</button>
+        </header>
+        <div class="fbar"><span class="flab" id="capNote">等待分析</span></div>
+        <div class="cap-hero" id="capHero">—</div>
+        <div class="kpis" id="capStats"></div>
+      </div>
+      <div class="box">
+        <header><h3>行动建议 <span class="hint">按优先级排序 · 建议不会自动执行</span></h3></header>
+        <div id="capRecommendations"><div class="empty">暂无数据</div></div>
+      </div>
+      <div class="box">
+        <header><h3>补号情景测算 <span class="hint">含 20% 安全余量</span></h3></header>
+        <div class="tbl-wrap"><table class="acc zebra"><thead><tr><th>窗口</th><th>情景</th><th>积分缺口</th><th>需补账号</th><th>可用余额</th><th>假设补给</th></tr></thead><tbody id="capForecastBody"></tbody></table></div>
+      </div>
+      <div class="box">
+        <header><h3>模型健康 <span class="hint">逻辑请求口径 · 近 6 小时用于识别恢复</span></h3></header>
+        <div class="tbl-wrap"><table class="acc zebra"><thead><tr><th>模型</th><th>请求</th><th>成功率</th><th>近 6h 成功率</th><th>Credits</th><th>400 / 429 / 503</th></tr></thead><tbody id="capModelsBody"></tbody></table></div>
+      </div>
+      <div class="box"><header><h3>口径与限制</h3></header><div class="pad cap-method" id="capMethod"></div></div>
     </section>
 
     <!-- 配置 -->

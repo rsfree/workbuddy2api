@@ -292,6 +292,14 @@ func (p *Pool) SetModelRateOf(fn func(realm, model string) string) {
 	p.modelRateOf = fn
 }
 
+// InFlightLimits 返回国内/global 域当前生效的单账号并发配置快照。
+// 仅用于只读观测和容量估算，不改变选号语义。
+func (p *Pool) InFlightLimits() (cn, global int) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.maxInFlight, p.maxInFlightGlobal
+}
+
 // SetMaxInFlight 注入单账号最大在途请求数；0 = 不限。负值保留原值。
 func (p *Pool) SetMaxInFlight(n int) {
 	p.mu.Lock()

@@ -26,6 +26,7 @@ let reqFilter = { q: '', outcome: '' };
 let reqEntries = [];
 let usDim = 'account', usCreditDim = 'account', usSort = 'total';
 let usageData = null;
+let capacityData = null;
 let reqRangeState = null; // 请求记录的时间范围（用量页的见 trangeState）
 
 const $ = id => document.getElementById(id);
@@ -380,7 +381,7 @@ let lastPackagesAt = 0;
 let expFetching = false;                       // 到期卡片在途标记（防重复打上游）
 const EXP_FRESH_MS = 2 * 60 * 1000;            // 缓存新鲜窗口：2 分钟内复用
 
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', usage: '用量', capacity: '容量规划', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
@@ -390,6 +391,7 @@ function go(v) {
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
+  if (v === 'capacity') loadCapacity();
   if (v === 'packages') loadPackages();
   // 到期提醒卡片：默认可见，进页面即用 overview 快照渲染（零上游请求，随首页统计
   // 每轮刷新）。不再「打开账号池就打上游」——逐账号实时查在账号多时会卡死面板。
@@ -3524,3 +3526,79 @@ if ($('btnExpFold')) {
   };
 }
 applyExpFold();
+
+
+/* ── 容量规划 ───────────────────────────────────────────────────────
+   后端读取现有内存快照和脱敏请求归档；本页不触发模型调用，也不会自动调参。 */
+function capNumber(v, digits = 0) {
+  if (v === null || v === undefined || !Number.isFinite(Number(v))) return '—';
+  return Number(v).toLocaleString('zh-CN', { minimumFractionDigits: digits, maximumFractionDigits: digits });
+}
+function capKpi(label, value, sub, cls = '') {
+  return '<div class="kpi"><div class="lb">' + esc(label) + '</div><div class="v ' + esc(cls) + '">' +
+    esc(value) + '</div><div class="sub">' + esc(sub) + '</div></div>';
+}
+async function loadCapacity(force = false) {
+  const btn = $('btnCapacity');
+  btn.disabled = true;
+  $('capNote').textContent = '正在读取服务数据并分析…';
+  try {
+    const q = new URLSearchParams({ days: $('capDays').value, hours: $('capHours').value });
+    if (force) q.set('refresh', '1');
+    const d = await api('capacity?' + q.toString());
+    capacityData = d;
+    renderCapacity(d);
+  } catch (e) {
+    $('capNote').textContent = '分析失败：' + e.message;
+    toast('容量分析失败：' + e.message, 'err');
+  } finally { btn.disabled = false; }
+}
+function renderCapacity(d) {
+  const days = d.parameters && d.parameters.forecast_days || 7;
+  const hours = d.parameters && d.parameters.recent_hours || 24;
+  const h = d.forecast.horizons[String(days)];
+  const main = h.planned_50pct_replenishment;
+  const stable = h.stable_replenishment;
+  const none = h.no_replenishment;
+  const n = main.additional_accounts;
+  $('capHero').textContent = n === null ? '缺少单号额度基线，暂时无法换算补号数' :
+    (n > 0 ? '未来 ' + days + ' 天建议补 ' + n + ' 个号' : '未来 ' + days + ' 天无需为积分补号');
+  $('capStats').innerHTML =
+    capKpi('预计日耗', capNumber(d.usage.daily_credits_forecast), 'credits / day', 'c-accent') +
+    capKpi('当前可用余额', capNumber(d.pool.credits_remaining), '预计续航 ' + capNumber(d.forecast.runway_days_without_headroom, 1) + ' 天') +
+    capKpi('近期成功率', capNumber(d.traffic.success_rate, 2) + '%', capNumber(d.traffic.requests) + ' 个逻辑请求 / 近 ' + hours + 'h') +
+    capKpi('可服务账号', capNumber(d.pool.accounts_available_estimate), '总账号 ' + d.pool.accounts_total + ' · 有余额 ' + d.pool.accounts_credit_positive) +
+    capKpi('单号容量基线', capNumber(d.pool.new_account_credit_unit_p25), '启用账号总额度 P25') +
+    capKpi('并发峰值估算', capNumber(d.traffic.peak_5m_in_flight_estimate), '池上限估算 ' + capNumber(d.pool.in_flight_pool_limit_estimate));
+  $('capRecommendations').innerHTML = (d.recommendations || []).map(r =>
+    '<article class="cap-rec ' + esc(String(r.priority).toLowerCase()) + '"><div class="cap-title"><span class="tag">' +
+    esc(r.priority) + '</span>' + esc(r.title) + '</div><p>' + esc(r.action) + '</p><small>' + esc(r.evidence) + '</small></article>'
+  ).join('') || '<div class="empty">当前没有建议</div>';
+  const scenarioRows = [];
+  Object.keys(d.forecast.horizons).sort((a, b) => Number(a) - Number(b)).forEach(k => {
+    const horizon = d.forecast.horizons[k];
+    [['planned_50pct_replenishment', '计划（50% 补给）'], ['stable_replenishment', '补给稳定'], ['no_replenishment', '不计补给']].forEach(([key, label]) => {
+      const s = horizon[key];
+      scenarioRows.push('<tr><td>' + esc(k) + ' 天</td><td>' + esc(label) + '</td><td class="num">' +
+        capNumber(s.credits_shortfall) + '</td><td class="num"><b>' + capNumber(s.additional_accounts) + '</b></td><td class="num">' +
+        capNumber(s.credits_usable_after_expiry) + '</td><td class="num">' + capNumber(s.credits_replenishment_assumed) + '</td></tr>');
+    });
+  });
+  $('capForecastBody').innerHTML = scenarioRows.join('');
+  $('capModelsBody').innerHTML = (d.traffic.models || []).slice(0, 30).map(m =>
+    '<tr><td>' + esc(m.model) + '</td><td class="num">' + capNumber(m.requests) + '</td><td class="num">' +
+    capNumber(m.success_rate, 1) + '%</td><td class="num">' + (m.recent_6h_success_rate === null ? '—' : capNumber(m.recent_6h_success_rate, 1) + '%') +
+    '</td><td class="num">' + capNumber(m.credits) + '</td><td class="num">' + m.http_400 + ' / ' + m.http_429 + ' / ' + m.http_503 + '</td></tr>'
+  ).join('') || '<tr><td colspan="6"><div class="empty">所选窗口没有请求归档</div></td></tr>';
+  const generated = String(d.generated_at || '').replace('T', ' ').slice(0, 19);
+  $('capNote').textContent = '数据截止 ' + generated + ' · 可信度 ' + d.confidence +
+    (d.parameters.cached ? ' · 5 分钟缓存' : ' · 实时重算') + ' · 只读分析，无上游调用';
+  $('capMethod').textContent = '日耗：' + d.method.daily_burn + '\n' +
+    '计划补给：最近 24h 正向积分变动的 50%；单号额度：有效账号 credits_total 的 P25；所有情景含 20% 安全余量。\n' +
+    '用量 q/e 是账号尝试口径；请求归档才是客户端逻辑请求与严格成功率。并发为基于已完成请求时长的 5 分钟估算，不等于实时租约峰值。\n' +
+    '本次预测窗口：稳定补给 ' + capNumber(stable.additional_accounts) + ' 个；不计补给 ' + capNumber(none.additional_accounts) +
+    ' 个。归档覆盖 ' + capNumber(d.coverage.request_hours / 24, 1) + ' 天；历史较短时请每日复核，不把点估计当承诺。';
+}
+$('btnCapacity').onclick = () => loadCapacity(true);
+$('capDays').onchange = () => loadCapacity();
+$('capHours').onchange = () => loadCapacity();
