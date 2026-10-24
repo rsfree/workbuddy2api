@@ -384,10 +384,11 @@ curl -s http://localhost:7863/v1/images/edits \
 - **模型列表**：`/v1/models` 末尾的媒体区来自上游目录动态探测（与 chat 同一次 `FetchModels`，缓存 10min），`type:"image"` 条目带 `endpoint`/`edits_endpoint`，`type:"video"` 条目带 `endpoint`/`poll_endpoint`。媒体目录单独用 WorkBuddy 桌面 UA 探一次 `/v3/config`——实测同一账号 IDE UA 只下发 1 个图像模型，桌面 UA 才带齐 `hunyuan-image-alpha-edit` / `kling-video-v3` / `minimax-video-h3`。`GET /v1/models?refresh=1` 强制立即重新探测。
 - **模型**：`hunyuan-image-alpha`（文生图，默认）、`hunyuan-image-v3.0`（新版文生图，账号已开通时可用）、`hunyuan-image-alpha-edit`（图生图）。可通过 `images.default_model` / `images.edit_model` 改默认值；`images.list_in_models=true` 时它们会带 `type:"image"` + `endpoint` 出现在 `/v1/models` 末尾。
 - **响应**：`{"created":…,"data":[{"url":…} 或 {"b64_json":…}],"usage":{"credit":7}}`——上游信封已展平；积分同时写进面板用量。
+- **水印**：默认 `watermark: false`（网关默认不带水印）；需要「AI生成」角标时传 `watermark: true`。实测 `hunyuan-image-alpha` 传 false 后整图无角标。
 - **入参收敛**：只保留白名单字段。`mask` 上游不支持，静默丢弃；`hunyuan-*` 不收 `response_format` / `quality` / `style` / `background`，非 hunyuan 模型默认 `response_format=b64_json`。
 - **参考图形态**：`data:image/...;base64,...`、裸 base64、`http(s)` URL 都接受。URL 由网关代下载并转 data URI（官方客户端同逻辑），下载器带 SSRF 防护（只连公网 IP、禁环境代理、最多 3 跳重定向、24MB 上限），错误信息会去掉预签名 query。本地文件路径网关读不到——请用 multipart 上传。
   - 运维注意：多公网 IP 主机上，默认路由 IP 可能被图片 CDN 单独拉黑（实测 sched-1 的 `154.40.45.34` 连腾讯云 COS 连 SYN 都收不到，同机 `154.40.45.65` 0.2s 下载成功）。此时把 `images.fetch_source_ip` 配成可达的源 IP 即可，无需改路由；未配置且默认 IP 被拉黑时，URL 参考图会返回 400 `download failed`，客户端可改用 multipart / data URI。
-- **实测口径（2026-10-24）**：hunyuan 忽略 `n`，`n=2` 仍只返回 1 张、按 1 张扣费，网关回 `X-WB2A-Image-Warn: requested-n-2-got-1`；`response_format` 对 hunyuan 无效，始终返回 URL（上游图片带「AI生成 WORKBUDDY」水印）。
+- **实测口径（2026-10-24）**：hunyuan 忽略 `n`，`n=2` 仍只返回 1 张、按 1 张扣费，网关回 `X-WB2A-Image-Warn: requested-n-2-got-1`；`response_format` 对 hunyuan 无效，始终返回 URL。默认 `watermark:false` 时图片不带「AI生成 WORKBUDDY」角标（2026-10-24 实测），传 `watermark:true` 可恢复。
 - **分辨率与积分（同账号实测，按张计费，不随像素涨）**：`hunyuan-image-alpha` 支持 `512x512` / `1024x1024` / `2048x2048` / `1024x1536`，均为 **5.71 credits/张**；`4096x4096` 返回 `14402 unsupported_image_size`（不扣费）。`hunyuan-image-v3.0` 实测仅支持 `1024x1024`（**10.57 credits/张**），`2048x2048` / `4096x4096` 均被拒（不扣费）。价格随上游牌价变动，以响应里的 `usage.credit` 为准。
 - **诊断头**：`X-WB2A-Image-Model`（实际模型）、`X-WB2A-Model-Fallback`（未知模型兜底替换）、`X-WB2A-Image-Route`（generations 自动转 edits）、`X-WB2A-Upstream-Request-Id`。
 - **超时**：`images.deadline_seconds` 是总预算（默认 420s，跨账号轮转）；上游排队慢时不会再被 chat 的 60s 首字节超时误杀（图像走独立 HTTP client，首字节上限 15 分钟）。
@@ -846,7 +847,7 @@ curl -s http://localhost:7863/v1/videos/task-xxx -H "Authorization: Bearer your-
 ```
 
 - 模型：`minimax-video-h3`（默认；768P/2K，7 种比例，参考图 ≤9 / 视频 ≤3 / 音频 ≤3，音频常开）、`kling-video-v3`（720P/1080P/4K，16:9/9:16/1:1，音频可开关）
-- 入参：`prompt`（有首帧时可空）、`seconds`、`image_url`（首帧）、`last_image_url`（尾帧，必须同时给首帧）、`reference_images` / `reference_videos` / `reference_audios`（字符串或 `[{"image_url":...}]`）、`resolution`、`aspect_ratio`、`enable_audio`、`watermark`
+- 入参：`prompt`（有首帧时可空）、`seconds`、`image_url`（首帧）、`last_image_url`（尾帧，必须同时给首帧）、`reference_images` / `reference_videos` / `reference_audios`（字符串或 `[{"image_url":...}]`）、`resolution`、`aspect_ratio`、`enable_audio`、`watermark`（**默认 false**，传 true 保留「AI生成」标识）
 - **任务归属账号**：上游按账号隔离任务，查询必须用提交时的同一个号。网关在内存里维护 task → 账号映射（保留 2h），**进程重启后旧 task id 查不到**（任务仍在上游跑）
 - 成片积分在第一次看到 `completed` 时记一次账，重复轮询不会重复计数
 - 提交阶段的账号故障按既有错误策略冷却/熔断；查询阶段失败同样会按 Kind 处置

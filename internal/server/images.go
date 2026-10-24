@@ -922,6 +922,13 @@ func buildImagePayload(kind upstream.ImageKind, model string, raw map[string]any
 	hunyuan := strings.HasPrefix(strings.ToLower(model), "hunyuan-")
 
 	p := map[string]any{"model": model, "prompt": prompt}
+	// 默认无水印。官方客户端生图路径从不发这个字段（各 provider 模型自带
+	// 「AI生成」角标），但上游接口接受 watermark 开关；调用方传 true 可保留。
+	wm := false
+	if b, ok := boolField(raw["watermark"]); ok {
+		wm = b
+	}
+	p["watermark"] = wm
 	size := strings.TrimSpace(stringField(raw["size"]))
 	if size == "" {
 		size = defaultImageSize

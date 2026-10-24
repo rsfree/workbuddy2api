@@ -50,8 +50,8 @@ func TestSubmitVideoBody(t *testing.T) {
 	if body["image_url"] != "https://cdn.example/first.png" {
 		t.Errorf("image_url=%v", body["image_url"])
 	}
-	if body["watermark"] != true {
-		t.Errorf("watermark=%v want true（官方默认带水印）", body["watermark"])
+	if body["watermark"] != false {
+		t.Errorf("watermark=%v want false（网关默认无水印）", body["watermark"])
 	}
 	refs, _ := body["reference_images"].([]any)
 	if len(refs) != 2 {

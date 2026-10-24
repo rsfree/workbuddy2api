@@ -548,3 +548,34 @@ func clearDynamicModelsCacheForTest() {
 	dynamicModelsCache.lastFail = time.Time{}
 	dynamicModelsCache.Unlock()
 }
+
+// TestImageWatermarkDefaultOff 网关默认不带水印；显式 watermark=true 时透传。
+func TestImageWatermarkDefaultOff(t *testing.T) {
+	var bodies []string
+	up, _ := newImageUpstream(t, func(r *http.Request) (int, string) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		return 200, `{"code":0,"data":{"data":[{"url":"https://cdn.example/1.png"}],"usage":{"credit":1}}}`
+	})
+	h := NewHandler(Config{Pool: testPoolWith(imageTestAccount("u1")), Upstream: up})
+
+	for _, body := range []string{
+		`{"model":"hunyuan-image-alpha","prompt":"a cat"}`,
+		`{"model":"hunyuan-image-alpha","prompt":"a cat","watermark":true}`,
+	} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/images/generations", strings.NewReader(body)))
+		if rec.Code != 200 {
+			t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+		}
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("bodies=%d", len(bodies))
+	}
+	if !strings.Contains(bodies[0], `"watermark":false`) {
+		t.Errorf("默认未关闭水印: %s", bodies[0])
+	}
+	if !strings.Contains(bodies[1], `"watermark":true`) {
+		t.Errorf("显式开启未透传: %s", bodies[1])
+	}
+}

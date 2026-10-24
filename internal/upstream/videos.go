@@ -156,9 +156,11 @@ func (c *Client) SubmitVideo(ctx context.Context, a *auth.Auth, in VideoSubmitIn
 		return nil, &Error{Kind: ErrClient, Msg: err.Error()}
 	}
 	body := videoRequestBody{
-		Prompt:    in.Prompt,
-		Model:     in.Model,
-		Watermark: true,
+		Prompt: in.Prompt,
+		Model:  in.Model,
+		// 默认无水印：官方客户端硬编码 watermark=true，但上游接口支持显式关闭。
+		// 需要水印的调用方传 watermark=true 即可（合规标识请自行按需保留）。
+		Watermark: false,
 		Seconds:   in.Seconds,
 		ImageURL:  in.ImageURL,
 	}
