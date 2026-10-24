@@ -1037,6 +1037,12 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 			"该账号为企业版/已绑定企业租户的会话，无个人成长体系，成长任务行为事件会被上游忽略；请移除账号后以个人身份（退出企业空间）重新登录")
 		return
 	}
+	// 新号静默期：单任务与自动链路跑的是同一套行为动作（真实对话 + 事件上报），
+	// 默认一并拦；?force=1 显式越过（口径见 graceguard.go）。
+	if blocked, why := p.graceBlockedManual(r, uid, "growth-manual"); blocked {
+		writeGraceBlocked(w, why)
+		return
+	}
 	var body struct {
 		TaskCode string `json:"task_code"`
 	}
@@ -1732,6 +1738,11 @@ func (p *Panel) accountTaskAutoAll(w http.ResponseWriter, r *http.Request) {
 	if a.IsEnterpriseSession() {
 		writeErr(w, http.StatusUnprocessableEntity,
 			"该账号为企业版/已绑定企业租户的会话，无个人成长体系，成长任务行为事件会被上游忽略；请移除账号后以个人身份（退出企业空间）重新登录")
+		return
+	}
+	// 新号静默期：一键完成跑的就是成长队列那套动作，默认一并拦（force=1 越过）。
+	if blocked, why := p.graceBlockedManual(r, uid, "growth-manual-all"); blocked {
+		writeGraceBlocked(w, why)
 		return
 	}
 	// per-account 互斥（与单任务动作共用一把锁）：重复点击 409。

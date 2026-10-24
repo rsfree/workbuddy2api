@@ -292,6 +292,9 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 	var accts []queueAccount
 	var wg sync.WaitGroup
 	var mu sync.Mutex
+	// mutedN 仅统计「被新号静默期跳过」的账号数：串行收集阶段累加，无需加锁。
+	// 用途是让下面"无可执行待办"的回执不再把静默跳过说成"任务都做完了"。
+	mutedN := 0
 	for _, st := range states {
 		if st.Disabled {
 			continue
@@ -301,6 +304,7 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 		if p.cfg.Scheduler != nil {
 			if muted, why := p.cfg.Scheduler.TaskMuted(st); muted {
 				p.cfg.Scheduler.NoteTaskGraceSkip(st, "growth", why)
+				mutedN++
 				continue
 			}
 		}
@@ -368,11 +372,17 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 		}
 	}
 	if len(items) == 0 {
-		log.Printf("panel: 队列启动：无可执行待办（全部账号任务已完成）")
 		q.mu.Lock()
 		q.running = false
 		q.startedAt = time.Time{}
 		q.mu.Unlock()
+		// 静默期把账号整账号跳过后队列必然为空，此时回"全部账号没有待办任务"是
+		// 假话，会让人以为任务真做完了、转而去查账号状态。分开报。
+		if mutedN > 0 {
+			log.Printf("panel: 队列启动：无待办，其中 %d 个账号处于新号静默期被跳过（不是任务已完成）", mutedN)
+			return false, 0, 0, fmt.Sprintf("%d 个账号处于新号静默期被跳过，无其他可执行待办", mutedN)
+		}
+		log.Printf("panel: 队列启动：无可执行待办（全部账号任务已完成）")
 		return false, 0, 0, "全部账号没有待办任务"
 	}
 

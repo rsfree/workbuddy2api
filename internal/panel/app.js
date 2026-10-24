@@ -63,8 +63,21 @@ async function api(path, opts = {}) {
   const r = await fetch('/panel/api/' + path, Object.assign({}, opts, { headers: h }));
   if (r.status === 401) { openKey(); throw new Error('密钥无效或未填写'); }
   const d = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+  if (!r.ok) {
+    // 带上状态码：409 有两种语义（任务锁冲突 / 新号静默期拦截），只有后者允许
+    // 带 force=1 重试（见 retryForced）。混为一谈会把互斥锁也一起绕过去。
+    const err = new Error(d.error || ('HTTP ' + r.status));
+    err.status = r.status;
+    throw err;
+  }
   return d;
+}
+// retryForced 新号静默期 409 的显式越权重试：只在用户二次确认后带 ?force=1 重放一次。
+// 判据必须同时满足「409 + 文案含静默期」——任务锁冲突也是 409，重试它等于破坏互斥。
+async function retryForced(path, opts, e, what) {
+  if (!e || e.status !== 409 || !/静默期/.test(e.message || '')) return null;
+  if (!confirm(e.message + '\n\n仍要立刻执行「' + what + '」？\n这会立即消耗真实对话配额，新号在风控窗口内跑重行为链存在被封风险。')) return null;
+  return api(path + (path.includes('?') ? '&' : '?') + 'force=1', opts);
 }
 function toast(msg, cls) {
   const el = document.createElement('div');
@@ -1878,7 +1891,14 @@ $('btnTaskAutoAll').onclick = async () => {
   if (!confirm('将依次执行：补报对话事件、领取 Buddy、glm-5.2 对话、尝试上报。\n过程约 1-2 分钟（含真实对话），确认继续？')) return;
   btn.disabled = true; btn.textContent = '执行中…';
   try {
-    const r = await api('accounts/' + encodeURIComponent(taskUID) + '/tasks/auto_all', { method: 'POST' });
+    const allUrl = 'accounts/' + encodeURIComponent(taskUID) + '/tasks/auto_all';
+    let r;
+    try {
+      r = await api(allUrl, { method: 'POST' });
+    } catch (e) {
+      r = await retryForced(allUrl, { method: 'POST' }, e, '一键完成');
+      if (!r) throw e;
+    }
     const okN = (r.results || []).filter(x => x.status === 'done').length;
     const skipN = (r.results || []).filter(x => x.status === 'skipped').length;
     const errN = (r.results || []).filter(x => x.status === 'error').length;
@@ -1950,9 +1970,15 @@ $('taskBody').addEventListener('click', async ev => {
     if (kind === 'auto') {
       // 一键完成：后端执行动作 → 回读进度 → 汇报（耗时可到分钟级，含真实对话）
       b.textContent = '执行中…';
-      const r = await api('accounts/' + encodeURIComponent(taskUID) + '/tasks/auto', {
-        method: 'POST', body: JSON.stringify({ task_code: code })
-      });
+      const oneUrl = 'accounts/' + encodeURIComponent(taskUID) + '/tasks/auto';
+      const oneOpts = { method: 'POST', body: JSON.stringify({ task_code: code }) };
+      let r;
+      try {
+        r = await api(oneUrl, oneOpts);
+      } catch (e) {
+        r = await retryForced(oneUrl, oneOpts, e, code);
+        if (!r) throw e;
+      }
       if (r.skipped) {
         toast(r.message || '已跳过', 'ok');
       } else {
