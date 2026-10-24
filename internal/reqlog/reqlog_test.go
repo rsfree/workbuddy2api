@@ -340,3 +340,27 @@ func TestCacheMetricsAggregate(t *testing.T) {
 		t.Errorf("empty snapshot should be zero: %+v", empty.Cache)
 	}
 }
+
+// TestAffinityMetricsAggregate 锁住前缀亲和的累计口径：
+//   - 分母只含 hit/miss/new 之和，无亲和标记的请求（会话已有绑定）不进分母；
+//   - 三个计数各自独立，不能共用一个桶（否则看不出"被带离"和"新建"的区别）。
+func TestAffinityMetricsAggregate(t *testing.T) {
+	r := New(Config{})
+	r.Record(Event{Status: 200, OK: true, Affinity: AffinityNew})
+	r.Record(Event{Status: 200, OK: true, Affinity: AffinityHit})
+	r.Record(Event{Status: 200, OK: true, Affinity: AffinityHit})
+	r.Record(Event{Status: 200, OK: true, Affinity: AffinityMiss})
+	// 会话已有绑定：亲和不参与，不进分母。
+	r.Record(Event{Status: 200, OK: true, Sticky: StickyHit})
+
+	s := r.Snapshot().Cache
+	if s.AffinityHit != 2 || s.AffinityMiss != 1 || s.AffinityNew != 1 {
+		t.Fatalf("affinity counts hit=%d miss=%d new=%d", s.AffinityHit, s.AffinityMiss, s.AffinityNew)
+	}
+	if s.AffinityHitRate != 50 { // 2 / 4
+		t.Errorf("affinity_hit_rate=%v want 50", s.AffinityHitRate)
+	}
+	if s.StickyHit != 1 {
+		t.Errorf("sticky counters must stay independent: %+v", s)
+	}
+}

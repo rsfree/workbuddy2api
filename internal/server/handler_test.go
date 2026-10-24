@@ -624,8 +624,24 @@ func TestChatStickySuccessKeepsBinding(t *testing.T) {
 	}
 }
 
-// TestChatStickyFullFallsBackToRotation 端到端验证 C3 语义：粘性号满载不可用时，
-// 请求在同一轮内解绑并回落普通轮换选中健康账号，绑定收敛到最终成功号——而非空耗一轮。
+// TestChatStickyFullFallsBackToRotation 端到端验证 C3 语义：粘性号在途满载时，
+// 请求在**同一轮内**回落普通轮换选中健康账号，不必空耗一轮重试。
+//
+// 🔴 2026-10-25 修订（原断言与此相反，此处刻意改）：溢出成功后**不**把绑定搬到
+// 溢出号，绑定留在原号等压力消退。
+//
+// 原断言是「绑定收敛到最终成功号 good」。那个口径只在**非流式**路径成立，而流式
+// 路径自 2026-10-24（v1.13.36）起已改为不重绑——同一份语义按 stream 取值不同，
+// 本身就是 bug。线上实测（1.6h/1000 条）把理由说得很清楚：
+//   - 同号相邻请求：前缀缓存命中 94.2%
+//   - 换号相邻请求：命中 34.2%，其中 78.6% 几乎全 miss
+//   - 换号请求占 70%，吃掉 59% credit
+//
+// 而「粘性号只是满载」是最常见的溢出原因（max_in_flight=8，并发一高就触发）。
+// 若每次都把绑定搬到临时接活的号，下一次满载再搬一次 = 乒乓漂移，每个号都冷。
+//
+// 保留绑定的代价：该号长期满载时这段会话会持续溢出（缓存拿不到）。这由会话 TTL
+// （默认 30m）兜底——长期没用上的绑定自然过期并按当时负载重新分配。
 func TestChatStickyFullFallsBackToRotation(t *testing.T) {
 	st := newBindStore()
 	sess := session.New(session.Config{
@@ -641,7 +657,9 @@ func TestChatStickyFullFallsBackToRotation(t *testing.T) {
 	p.SetMaxInFlight(1)
 	p.Acquire("bad")
 
+	var seen []string
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		seen = append(seen, authz)
 		return 200, sseOK, true
 	})
 	h := NewHandler(Config{
@@ -657,11 +675,26 @@ func TestChatStickyFullFallsBackToRotation(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
-	// 满载粘性号被解绑，绑定收敛到最终成功号 good。
-	if uid, ok := st.lastUID("conv-1"); !ok || uid != "good" {
-		t.Fatalf("sticky binding should fall back to good, got %s ok=%v (binds=%v)", uid, ok, st.binds)
+	// 本次请求确实由 good 服务（同轮回落生效，没空耗）。
+	if len(seen) != 1 || !strings.Contains(seen[0], "at-good") {
+		t.Fatalf("request should be served by fallback account good, upstream saw %v", seen)
 	}
+	// 但绑定必须留在原号 bad：满载是临时压力，搬走等于把缓存全冷掉。
+	if uid, ok := st.lastUID("conv-1"); !ok || uid != "bad" {
+		t.Fatalf("busy overflow must keep the original binding bad, got %s ok=%v (binds=%v)", uid, ok, st.binds)
+	}
+
+	// 压力解除 → 下一次请求回到原号（缓存能重新热起来）。
 	p.Release("bad")
+	seen = nil
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"conv-1"}}`)))
+	if rec2.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec2.Code, rec2.Body)
+	}
+	if len(seen) != 1 || !strings.Contains(seen[0], "at-bad") {
+		t.Fatalf("after release the bound account should serve again, upstream saw %v", seen)
+	}
 }
 
 func TestChatHardCreditCooldownUntilNextDay4AM(t *testing.T) {

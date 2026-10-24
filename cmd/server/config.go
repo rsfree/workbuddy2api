@@ -339,6 +339,13 @@ type Config struct {
 		Enabled    bool   `json:"enabled"`     // 默认 true
 		TTL        string `json:"ttl"`         // 会话绑定 TTL，默认 "30m"
 		GCInterval string `json:"gc_interval"` // 会话 GC 周期，默认 "5m"
+		// PrefixAffinity 前缀亲和：把「system + tools 相同」的多个会话尽量撮合到同一
+		// 账号，让那段共同前缀的缓存只在一个号上冷启动一次（见 session.PrefixKey）。
+		//
+		// 默认 true（缺省开启）。用 *bool 是为了区分「配置里没写」与「显式写了 false」——
+		// bool 零值是 false，没有指针就无法表达"缺省开启"。只在 session_sticky.enabled
+		// 为 true 时生效。
+		PrefixAffinity *bool `json:"prefix_affinity"`
 	} `json:"session_sticky"`
 
 	// 解析后

@@ -127,6 +127,9 @@ func main() {
 			// 命中校验独立口径：满载在途只是临时压力，不能据此搬走绑定
 			// （搬走 = 账号级前缀缓存全冷）。
 			StickyUsable: realmAwareStickyUsable(p),
+			// 前缀亲和：把共享同一段 system+tools 的多个会话撮合到同一账号。
+			// 缺省开启（config 里写 false 才关）。
+			PrefixAffinity: cfg.SessionSticky.PrefixAffinity == nil || *cfg.SessionSticky.PrefixAffinity,
 		})
 		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
 		sessRouter.StartGC()

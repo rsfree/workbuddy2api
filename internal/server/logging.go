@@ -76,6 +76,9 @@ type chatStat struct {
 	userAgent string
 	// sticky 本轮粘性落点（reqlog.Sticky*）；空 = 无会话键，不参与换号率统计。
 	sticky string
+	// affinity 本轮前缀亲和落点（reqlog.Affinity*）；空 = 会话已有绑定（亲和不参与）
+	// 或该请求没有可用的前缀指纹。
+	affinity string
 
 	logged bool
 }
@@ -487,6 +490,7 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		e.CacheMissTokens = s.cacheMiss
 		e.Egress = s.egress
 		e.Sticky = s.sticky
+		e.Affinity = s.affinity
 	}
 	if e.Egress == "" {
 		e.Egress = t.egress

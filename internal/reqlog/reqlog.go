@@ -47,6 +47,20 @@ const (
 	StickyNew  = "new"  // 会话首次出现，本次分配
 )
 
+// Affinity 前缀亲和落点取值（Event.Affinity）。
+//
+// 与会话粘性分开统计，因为两者回答的是不同问题：
+//   - sticky 回答「同一会话有没有换号」；
+//   - affinity 回答「共享同一段 system+tools 的多个会话，有没有被撮合到同一个号」。
+//
+// 把两者混进一个比例会让诊断失真：一个纯新建会话很多的时段，sticky 全是 new、
+// affinity 却可能大面积 hit，混在一起看不出究竟哪条机制在起作用。
+const (
+	AffinityHit  = "hit"  // 用亲和号服务（前缀缓存应命中）
+	AffinityMiss = "miss" // 有亲和但本次没用上（满载溢出 / 竞态失效）→ 前缀被带离
+	AffinityNew  = "new"  // 此前无亲和记录，本次成功后建立
+)
+
 const (
 	OutcomeSuccess     = "success"
 	OutcomeHTTPError   = "http_error"
@@ -108,6 +122,10 @@ type Event struct {
 	//   miss = 绑定号持久不可用（冷却/封禁/该模型限额），已解绑并重新分配
 	//   new  = 该会话首次出现，本次分配并绑定
 	Sticky string `json:"sticky,omitempty"`
+	// Affinity 前缀亲和落点（hit / miss / new；空 = 该请求未参与前缀亲和）。
+	// 只在「会话尚无绑定」时才有值——会话强粘性命中时亲和根本不参与决策，
+	// 那种情况记空串，避免把两条机制的指标混在一起。
+	Affinity string `json:"affinity,omitempty"`
 }
 
 // Filter 用于从归档中筛选最近记录。字符串字段一律「包含」匹配（大小写不敏感），
@@ -153,6 +171,12 @@ type CacheMetrics struct {
 	StickyMiss    int64   `json:"sticky_miss"`
 	StickyNew     int64   `json:"sticky_new"`
 	StickyHitRate float64 `json:"sticky_hit_rate"`
+	// Affinity 计数与命中率：hit/miss/new 之和为分母（只统计会话尚未绑定的请求）。
+	// 这是**前缀级**聚合——它上升意味着同一段 system 提示词不再在每个号上重复冷启动。
+	AffinityHit     int64   `json:"affinity_hit"`
+	AffinityMiss    int64   `json:"affinity_miss"`
+	AffinityNew     int64   `json:"affinity_new"`
+	AffinityHitRate float64 `json:"affinity_hit_rate"`
 }
 
 // Snapshot 一次面板读取的完整指标快照。
@@ -189,6 +213,9 @@ type Recorder struct {
 	stickyBusy      int64
 	stickyMiss      int64
 	stickyNew       int64
+	affinityHit     int64
+	affinityMiss    int64
+	affinityNew     int64
 	recent          []Event
 	archive         *archiveWriter
 }
@@ -259,6 +286,14 @@ func (r *Recorder) Record(e Event) {
 	case StickyNew:
 		r.stickyNew++
 	}
+	switch e.Affinity {
+	case AffinityHit:
+		r.affinityHit++
+	case AffinityMiss:
+		r.affinityMiss++
+	case AffinityNew:
+		r.affinityNew++
+	}
 	r.recent = append([]Event{e}, r.recent...)
 	if len(r.recent) > recentLimit {
 		r.recent = r.recent[:recentLimit]
@@ -295,12 +330,18 @@ func (r *Recorder) Snapshot() Snapshot {
 		StickyBusy:      r.stickyBusy,
 		StickyMiss:      r.stickyMiss,
 		StickyNew:       r.stickyNew,
+		AffinityHit:     r.affinityHit,
+		AffinityMiss:    r.affinityMiss,
+		AffinityNew:     r.affinityNew,
 	}
 	if total := r.cacheHitTokens + r.cacheMissTokens; total > 0 {
 		s.Cache.CacheHitRate = round1(float64(r.cacheHitTokens) / float64(total) * 100)
 	}
 	if total := r.stickyHit + r.stickyBusy + r.stickyMiss + r.stickyNew; total > 0 {
 		s.Cache.StickyHitRate = round1(float64(r.stickyHit) / float64(total) * 100)
+	}
+	if total := r.affinityHit + r.affinityMiss + r.affinityNew; total > 0 {
+		s.Cache.AffinityHitRate = round1(float64(r.affinityHit) / float64(total) * 100)
 	}
 	r.mu.Unlock()
 	if r.archive != nil {

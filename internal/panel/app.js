@@ -590,6 +590,16 @@ async function loadOverview(quiet) {
           ' · 换号 ' + (cm.sticky_miss || 0) + ' · 新会话 ' + (cm.sticky_new || 0)
         : '还没有带会话键的请求';
     }
+    // 前缀亲和：分母为 0 时显示 "-"（0% 会被误读成「机制失效」，实际只是还没有
+    // 新建会话）。
+    if ($('sAffinityHit')) {
+      const den = (cm.affinity_hit || 0) + (cm.affinity_miss || 0) + (cm.affinity_new || 0);
+      $('sAffinityHit').textContent = den ? cm.affinity_hit_rate + '%' : '-';
+      $('sAffinityHit').parentNode.title = den
+        ? '同前缀命中 ' + (cm.affinity_hit || 0) + ' · 满载被带离 ' + (cm.affinity_miss || 0) +
+          ' · 新建落点 ' + (cm.affinity_new || 0) + '（只统计会话尚无绑定的请求）'
+        : '还没有需要分配落点的新会话';
+    }
     $('navSub').textContent = 'v' + d.version;
     $('navVer').textContent = 'v' + d.version;
     $('navRedis').textContent = d.redis_mode === 'upstash' ? 'Redis 镜像' : '本地内存';

@@ -59,14 +59,36 @@ type Config struct {
 	//
 	// nil 时回落 AvailableForModel（旧语义：满载也算不可用），保持向后兼容。
 	StickyUsable func(uid, model string) bool
+
+	// PrefixAffinity 开启**前缀亲和**：把「system + tools 相同」的多个会话尽量
+	// 引到同一个账号，让那段共同前缀的缓存只在一个号上冷启动一次。
+	//
+	// 与会话粘性的分工（粒度不同、强/弱关系）：
+	//   - 粘性（entries）：同一会话多轮 → 同号。命中时亲和根本不参与。
+	//   - 亲和（aff）：不同会话共享前缀 → 同号。只在「会话尚未绑定」时当提示用。
+	//
+	// 为什么另一份收益：客户端并行跑多个会话（或没有 conversation_id 而落到派生键）
+	// 时，每个会话都是独立键，会各自哈希到不同账号，同一段几万 token 的 system
+	// 提示词因此被重复冷启动 N 次。线上实测换号请求的命中率是 34.2% 而非 0，
+	// 说明各账号里本来就散落着同前缀的碎片缓存。
+	PrefixAffinity bool
+
+	// AffinityTTL 亲和记录存活时长（0 = 默认 20m）。故意比会话 TTL 短：
+	// 见 internal/session/affinity.go 的 defaultAffinityTTL 注释。
+	AffinityTTL time.Duration
+
+	// AffinityMax 亲和注册表容量上限（0 = 默认 4096）。
+	AffinityMax int
 }
 
 // Router 会话粘性路由器。
 type Router struct {
 	mu      sync.RWMutex
 	entries map[string]entry
-	cfg     Config
-	stop    chan struct{}
+	// aff 前缀亲和注册表：前缀指纹 → 该前缀缓存目前热在哪个账号（见 affinity.go）。
+	aff  map[string]affEntry
+	cfg  Config
+	stop chan struct{}
 }
 
 // New 构建路由器。若 cfg.Store 为 nil 则用 Noop（纯内存）；cfg.Available 为 nil 视为空池。
@@ -81,7 +103,7 @@ func New(cfg Config) *Router {
 	if cfg.GCInterval <= 0 {
 		cfg.GCInterval = 5 * time.Minute
 	}
-	return &Router{entries: map[string]entry{}, cfg: cfg}
+	return &Router{entries: map[string]entry{}, aff: map[string]affEntry{}, cfg: cfg}
 }
 
 // StartGC 启动后台 GC goroutine（幂等）。进程退出时调 StopGC。
@@ -312,6 +334,12 @@ func (r *Router) gcOnce(now time.Time) int {
 	for _, key := range expiredKeys {
 		delete(r.entries, key)
 	}
+	// 前缀亲和同样按 TTL 清理：过期不清会让前缀长期押在一个已不再承接它的账号上。
+	for k, e := range r.aff {
+		if now.Sub(e.lastSeen) > r.affinityTTL() {
+			delete(r.aff, k)
+		}
+	}
 	r.mu.Unlock()
 	for _, key := range expiredKeys {
 		r.cfg.Store.DelBind(key)
@@ -415,13 +443,41 @@ func hashIndex(key string, n int) int {
 //
 // 无 user_id 的请求哈希材料与旧实现逐字节一致，既有绑定不受影响。
 func ExtractKey(body []byte) string {
-	if len(body) == 0 {
+	obj := parseBody(body)
+	if obj == nil {
 		return ""
+	}
+	return extractKeyFrom(obj)
+}
+
+// parseBody 把请求体解析成通用 map；空体 / 非法 JSON / 字面 null 均返回 nil。
+func parseBody(body []byte) map[string]any {
+	if len(body) == 0 {
+		return nil
 	}
 	var obj map[string]any
 	if err := json.Unmarshal(body, &obj); err != nil {
-		return ""
+		return nil
 	}
+	return obj
+}
+
+// ExtractKeys 一次解析同时取会话键与前缀指纹（前缀指纹见 PrefixKey）。
+//
+// 为什么合并：热路径上 handler 本来就要解析一次 body 拿会话键，前缀亲和如果再
+// 单独调 PrefixKey(body) 就会为同一个几十 KB 的 body 多解一次。合并后解析次数
+// 不增，前缀指纹的边际成本只剩一次 SHA-256。ExtractKey 保留为薄包装（外部
+// 调用方与既有测试不变）。
+func ExtractKeys(body []byte) (sessKey, prefixKey string) {
+	obj := parseBody(body)
+	if obj == nil {
+		return "", ""
+	}
+	return extractKeyFrom(obj), prefixKeyOf(obj)
+}
+
+// extractKeyFrom 是 ExtractKey 的「已解析」版本，键优先级链见 ExtractKey 注释。
+func extractKeyFrom(obj map[string]any) string {
 	if meta, ok := obj["metadata"].(map[string]any); ok {
 		if v := strOrEmpty(meta["conversation_id"]); v != "" {
 			return v

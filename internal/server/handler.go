@@ -885,7 +885,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	// ExtractKey 与粘性开关解耦（issue #35 侧）：关闭粘性时会话头族的聚合主键仍按
 	// 会话级（RequestIDForKey(sessKey)），不悄悄退化成轮级——提取本身与粘性无关。
-	sessKey := session.ExtractKey(body)
+	// 一次解析同时取会话键与「共享前缀指纹」（前缀亲和用，见 session.PrefixKey）。
+	sessKey, prefixKey := session.ExtractKeys(body)
 	// prevBound 是**本次请求之前**的绑定（只读快照，不续期）。必须在这里取：
 	// ResolveForModel 可能已经把绑定换掉，事后看返回值分不清「命中同号」和
 	// 「失效换号」——两者都返回一个 uid，而面板的换号率正是靠这个区分。
@@ -895,17 +896,51 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			prevBound = uid
 		}
 	}
+	// 落点解析分三步，顺序不可交换：
+	//   ① 已有绑定 → 复用（粘性，强）
+	//   ② 无绑定 → 前缀亲和（弱，只给提示）
+	//   ③ 仍无 → 按策略分配（加权随机走哈希并写绑定；其余策略交给 Pool 选号）
+	//
+	// 🔴 曾经写成 ①+③ 合成一步（直接 ResolveForModel），那会让亲和永远不生效：
+	// ResolveForModel 对新会话**立刻**完成哈希分配并写入 entries，等它返回时
+	// stickyUID 已非空，亲和分支永远进不去——线上表现为「亲和率恒为 0 而看不出
+	// 任何异常」。所以这里必须先用 LookupForModel（只复用、不分配）腾出空档。
+	//
+	// 用规范名（realm + 别名归一后的 bareModel）查可用性：6004 模型级冷却按规范名
+	// 记账，若拿别名/原名来查会漏判「绑定号对该模型正限额」。
+	canonModel := realm + ":" + bareModel
 	stickyUID := ""
 	if h.cfg.Session != nil && sessKey != "" {
-		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
-		// 而不是钉在限额号上反复失败（"限额后换不动号"的正解）。
-		resolve := h.cfg.Session.ResolveForModel
-		if h.cfg.Pool.StrategyForRealm(realm) != pool.WeightedRandom {
-			resolve = h.cfg.Session.LookupForModel
+		if uid, ok := h.cfg.Session.LookupForModel(sessKey, canonModel); ok {
+			stickyUID = uid
 		}
-		// 用规范名（realm + 别名归一后的 bareModel）查可用性：6004 模型级冷却
-		// 按规范名记账，若拿别名/原名来查会漏判「绑定号对该模型正限额」。
-		if uid, ok := resolve(sessKey, realm+":"+bareModel); ok {
+	}
+
+	// ② 前缀亲和：会话**还没有绑定**时，用「这段 system+tools 的共同前缀缓存热在
+	// 哪个号」做弱提示。它是粘性的补充而不是替代——粒度为前缀而非会话，正好覆盖
+	// 「一个客户端并行跑多个会话、每个会话键不同、同一段几万 token 的 system 提示词
+	// 却在每个号上各冷启动一次」这种场景（线上换号请求命中 34.2% 而非 0 的成因）。
+	//
+	// 只把亲和号写进 stickyUID（复用既有 PickStickyForModel 的 busy/unusable 语义），
+	// 不新建一条选号路径：少一条路径就少一处与限额/在途/realm 判定不一致的风险。
+	affKey, affinityUID := "", ""
+	if h.cfg.Session != nil && prefixKey != "" {
+		// 键里带规范化模型：上游前缀缓存是账号级**且模型级**的，同一段 system 在
+		// 不同模型上是两份缓存，混用一个键会把其中一份的落点带到另一份上。
+		affKey = prefixKey + "\x00" + canonModel
+		if stickyUID == "" {
+			if uid, ok := h.cfg.Session.AffinityFor(affKey, canonModel); ok {
+				affinityUID = uid
+				stickyUID = uid
+			}
+		}
+	}
+
+	// ③ 真正的新会话才分配。加权随机策略下由 session 做双段哈希分配（并落绑定）；
+	// 其余有序策略历来交给 Pool 选号（LookupForModel 只复用），保持一致。
+	if stickyUID == "" && h.cfg.Session != nil && sessKey != "" &&
+		h.cfg.Pool.StrategyForRealm(realm) == pool.WeightedRandom {
+		if uid, ok := h.cfg.Session.ResolveForModel(sessKey, canonModel); ok {
 			stickyUID = uid
 		}
 	}
@@ -939,8 +974,38 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 幂等：stickyUID 已空则空操作；不会误解绑其他轮的绑定。仅当 Session != nil 时 stickyUID 才会非空。
 	unbindSticky := func() {
 		if stickyUID != "" {
-			h.cfg.Session.Unbind(sessKey)
+			// 亲和提示（affinityUID）不是真实会话绑定：此时 sessKey 可能压根没有
+			// 绑定项，对 aff 号调 Unbind 是空操作但语义误导，且会把 stickyUID 抹掉
+			// 导致后续「是不是亲和号」的判断失灵。只对真绑定解绑。
+			if stickyUID != affinityUID {
+				h.cfg.Session.Unbind(sessKey)
+			}
 			stickyUID = ""
+		}
+	}
+	// stickyOverflow 标记「本轮粘性号只是在途满载、请求溢出到别的号」。
+	// 溢出是临时压力，成功后台**不能**把会话重绑到溢出号：否则每一次满载都会
+	// 把会话永久搬到另一个账号，而上游前缀缓存是账号级的，搬走即全冷——线上
+	// 实测换号请求占 70%、吃掉 59% credit。绑定保留，压力一过立刻回热。
+	//
+	// 声明位置在选号循环**之前**：noteAffinity 闭包要读它。
+	stickyOverflow := false
+
+	// noteAffinity 在**真实成功**后登记「这段前缀的缓存已在这个号上热」。
+	//
+	// 写入门槛刻意很窄（两个条件缺一不可）：
+	//   - acct.UID == affinityUID：给已有的亲和记录续期；
+	//   - affinityUID == "" && prevBound == "":  会话此前无绑定，本次是「新会话首次
+	//     落点」，由它建立亲和。
+	// 其余情况（尤其「亲和号满载、本次溢出到别的号」）**不写**——写了会把整段
+	// 前缀拖到一个临时接活的账号上，下次再搬一次，形成前缀级乒乓。这种漂移交给
+	// TTL 兜底：亲和号长期接不到该前缀，20 分钟后记录过期并按新落点重建。
+	noteAffinity := func(uid string) {
+		if affKey == "" || h.cfg.Session == nil || stickyOverflow {
+			return
+		}
+		if uid == affinityUID || (affinityUID == "" && prevBound == "") {
+			h.cfg.Session.NoteAffinity(affKey, uid)
 		}
 	}
 	// fail 在轮转失败分支统一：释放租约 + 若失败号正是粘性号则解绑（下次请求重新分配）。
@@ -1088,17 +1153,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
-	// stickyOverflow 标记「本轮粘性号只是在途满载、请求溢出到别的号」。
-	// 溢出是临时压力，成功后台**不能**把会话重绑到溢出号：否则每一次满载都会
-	// 把会话永久搬到另一个账号，而上游前缀缓存是账号级的，搬走即全冷——线上
-	// 实测换号请求占 70%、吃掉 59% credit。绑定保留，压力一过立刻回热。
-	stickyOverflow := false
 	// stickyBound 用**请求前**的绑定（prevBound）而不是 resolve 后的 stickyUID：
 	// 后者在「失效换号」时已经变成新号，拿它比对会把换号误记成命中。
 	stickyBound := prevBound
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		stickyOverflow = false
 		st.sticky = ""
+		st.affinity = ""
 		// 选号：粘性号优先（PickStickyForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
 		if stickyUID != "" {
@@ -1111,12 +1172,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 搬走即全冷（实测命中率从 99.9% 掉到 0）。本次请求溢出到普通轮换，
 				// 绑定留给下一个（通常是串行的）轮次继续命中。
 				// 保留绑定的代价只是每轮多一次 PickByUID 读锁查询，可忽略。
-				stickyOverflow = true
-				st.sticky = reqlog.StickyBusy
+				if affinityUID != "" {
+					// 弱粘性（前缀亲和）没有会话绑定需要保全，也**不能**设
+					// stickyOverflow：否则本次成功的号永不 Bind，该会话下次仍从亲和
+					// 出发、又被判 busy，逐轮换号。让绑定落在真正服务的号上才收敛。
+					// acct 保持 nil → 落到下面普通选号，本次由别的号服务。
+					st.affinity = reqlog.AffinityMiss
+				} else {
+					stickyOverflow = true
+					st.sticky = reqlog.StickyBusy
+				}
 			case acct == nil:
 				// 持久不可用：账号不存在/冷却/封禁/该模型被限额/积分保底 → 解绑重分配。
+				if affinityUID != "" {
+					st.affinity = reqlog.AffinityMiss
+				} else {
+					st.sticky = reqlog.StickyMiss
+				}
 				unbindSticky()
-				st.sticky = reqlog.StickyMiss
 			case realm != "" && acct.Realm() != realm && !crossRealm:
 				// 跨域回退开启且请求为裸名时，粘性号可以落在任一域（回退成功后绑定的是另一域
 				// 的账号，下一轮不该被 realm 校验立刻解绑）。
@@ -1167,6 +1240,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		tried[acct.UID] = true
 
+		// 前缀亲和归类：只在「会话此前无绑定」时统计——有绑定说明亲和根本没参与
+		// 决策，算进去会让 affinity_hit_rate 被大量无关请求稀释。
+		if affKey != "" && st.affinity == "" && prevBound == "" {
+			switch {
+			case affinityUID != "" && acct.UID == affinityUID:
+				st.affinity = reqlog.AffinityHit
+			case affinityUID != "":
+				st.affinity = reqlog.AffinityMiss
+			default:
+				st.affinity = reqlog.AffinityNew
+			}
+		}
+
 		// 粘性落点归类（面板换号率 / 请求日志排查用）。只在本轮尚未被
 		// busy/miss 标记时归类：那两种情况已经定性，不需要"事后归因"。
 		if sessKey != "" && st.sticky == "" {
@@ -1190,7 +1276,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				unbindSticky()
 			}
 			// 粘性号压线被并发抢走名额：对本次请求等价于「临时繁忙」，记 busy。
-			if stickyBound != "" {
+			// 亲和号被抢同理，但记在 affinity 计上（两条机制的指标不混）。
+			switch {
+			case affinityUID != "" && acct.UID == affinityUID:
+				st.affinity = reqlog.AffinityMiss
+			case stickyBound != "":
 				st.sticky = reqlog.StickyBusy
 			}
 			if !rotateBackoff(i, r.Context()) {
@@ -1460,6 +1550,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				if sessKey != "" && h.cfg.Session != nil && !stickyOverflow {
 					h.cfg.Session.Bind(sessKey, acct.UID)
 				}
+				noteAffinity(acct.UID)
 			default:
 				// 真成功：这一跳读完且上游没有报错，才记成功并让粘性跟上。
 				st.outcome = reqlog.OutcomeSuccess
@@ -1474,6 +1565,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				if sessKey != "" && h.cfg.Session != nil && !stickyOverflow {
 					h.cfg.Session.Bind(sessKey, acct.UID)
 				}
+				noteAffinity(acct.UID)
 			}
 			credit, hasCredit := stats.Credit()
 			if hit, miss, ok := stats.CacheTokens(); ok {
@@ -1552,9 +1644,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 非流式同理：聚合成功（无 error 帧、非空流）才算这一跳成功，事后才记成功/绑粘性。
 		h.cfg.Pool.NoteSuccess(acct.UID)
 		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
-		if sessKey != "" && h.cfg.Session != nil {
+		// 与非流式口径对齐：粘性号只是满载的溢出轮不重绑（否则乒乓漂移）。
+		if sessKey != "" && h.cfg.Session != nil && !stickyOverflow {
 			h.cfg.Session.Bind(sessKey, acct.UID)
 		}
+		noteAffinity(acct.UID)
 		// 成本账本（非流式）：从聚合响应的 usage 取 credit 与 token 总数。
 		if hasCredit {
 			st.credit = credit

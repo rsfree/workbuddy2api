@@ -702,6 +702,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
              本身没缓存（网关无从优化）。数值是进程内累计，重启归零。 -->
         <div class="stat" title="上游回报的前缀缓存命中 token 占比（hit / (hit+miss)），进程内累计"><div class="v" id="sCacheHit">-</div><div class="k">前缀缓存命中</div></div>
         <div class="stat" title="会话粘性命中率（同号比例）。掉下去说明会话在被搬号，缓存必然全冷"><div class="v" id="sStickyHit">-</div><div class="k">粘性命中（同号）</div></div>
+        <!-- 前缀亲和：不同会话但共享同一段 system+tools 时，是否被撮合到同一个号。
+             它是粘性解决不了的那一半——粘性管「同一会话多轮」，亲和管「多个并行会话
+             共享的共同前缀」。只看粘性正常就以为缓存没问题，是这里最常见的误判。 -->
+        <div class="stat" title="前缀亲和命中率：会话新建时，是否落到了「这段 system+tools 缓存已热」的账号"><div class="v" id="sAffinityHit">-</div><div class="k">前缀亲和（同前缀）</div></div>
       </div>
 
       <!-- 卡片默认可见：此前 hidden + 「仅点检查才渲染」形成死锁（按钮藏在隐藏卡片里，
