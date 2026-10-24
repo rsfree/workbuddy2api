@@ -235,3 +235,36 @@ count_tokens 再探（完全命中）        35      ← 与上游一字不差�
 追加一条 51
 token_baseline {"limit":128,"entries":2,"hits":2,"misses":1,"oversize":0}
 ```
+
+## 1.13.33：tail 段独立比例 + 容量 1024（2026-10-24 17:00）
+
+上一版 `AdjustTail` 借整段回归的 `slope`（实测 1.28）。问题在于整段斜率把 system / tools
+的固定开销摊进了比例，而增量段没有这部分开销，于是按比例地高估。现在 tail 单独学一个
+**纯比例**（不拟合 intercept）：样本来自「count_tokens 的预测 vs 随后那次真实 usage」——
+base 是上游真数，`actual - base` 就是新增内容在上游的真实 token 数，除以字符粗估即样本。
+待验证的预测由 `Baseline.Predict(base, tailRaw)` 登记，`Record` 配对上同一批 messages 时
+回调 `ObserveTail`；完全命中（增量 0）、负增量、指纹不同都不学。
+
+```
+固定基线（35）+ 每轮一个不同长度的增量，6 轮实测（deepseek-v4.1-flash）
+轮  粗估   预测   真实   误差     tail_ratio
+1   129   168   171   -1.8%   1.005
+2   225   265   270   -1.9%   1.008
+3   321   363   369   -1.6%   1.011
+4   417   461   468   -1.5%   1.014
+5   513   559   567   -1.4%   1.015
+6   609   657   666   -1.4%   1.017
+
+token_calib.deepseek-v4.1-flash  {"slope":1.522,"tail_ratio":1.017,"tail_samples":6}
+token_baseline                   {"limit":1024,"entries":11,"hits":6,"misses":0,
+                                  "pred_by_model":{"deepseek-v4.1-flash":{"mae":0.0158,"worst":0.0185}}}
+日志                             [tokencalib] model=… tail 样本=5 ratio=1.02（本次 raw=517 真实增量=532）
+                                 count_tokens model=… mode=prefix matched=1/2 base=35 tail=517 out=559
+```
+
+> **结论**：`tail_ratio` 收敛到 **1.017** —— 说明「1 token ≈ 3 字符」对中英混合文本本来就
+> 接近真值，1.13.32 那个 +22% 完全是借用整段 slope 造成的高估。误差从 +22% 降到 **-1.5%**
+> （`mae` 0.0158），且随样本略有收敛。
+>
+> 极端输入仍会失真：3000 个重复字符的 `tail_ratio` 会掉到 0.13 附近，被 clamp 在 0.5 并
+> 被指数遗忘稀释——这类流量不该主导系数，属于有意为之的保守。
