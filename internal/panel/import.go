@@ -15,32 +15,36 @@ import (
 
 // cockpitAccount 映射 cockpit tools 导出格式的单个账号。
 type cockpitAccount struct {
-	ID            string `json:"id"`
-	Email         string `json:"email"`
-	UID           string `json:"uid"`
-	Nickname      string `json:"nickname"`
-	AccessToken   string `json:"access_token"`
-	RefreshToken  string `json:"refresh_token"`
-	TokenType     string `json:"token_type"`
-	ExpiresAt     int64  `json:"expires_at"`
-	Domain        string `json:"domain"`
-	DosageNotify  string `json:"dosage_notify_code"`
-	PaymentType   string `json:"payment_type"`
-	Status        string `json:"status"`
-	UsageUpdatedAt int64 `json:"usage_updated_at"`
-	LastCheckin   int64  `json:"last_checkin_time"`
-	CheckinStreak int    `json:"checkin_streak"`
-	CreatedAt     int64  `json:"created_at"`
-	LastUsed      int64  `json:"last_used"`
+	ID             string `json:"id"`
+	Email          string `json:"email"`
+	UID            string `json:"uid"`
+	Nickname       string `json:"nickname"`
+	AccessToken    string `json:"access_token"`
+	RefreshToken   string `json:"refresh_token"`
+	TokenType      string `json:"token_type"`
+	ExpiresAt      int64  `json:"expires_at"`
+	Domain         string `json:"domain"`
+	DosageNotify   string `json:"dosage_notify_code"`
+	PaymentType    string `json:"payment_type"`
+	Status         string `json:"status"`
+	UsageUpdatedAt int64  `json:"usage_updated_at"`
+	LastCheckin    int64  `json:"last_checkin_time"`
+	CheckinStreak  int    `json:"checkin_streak"`
+	CreatedAt      int64  `json:"created_at"`
+	LastUsed       int64  `json:"last_used"`
 }
 
 // importCockpit 接收 cockpit tools 导出的 JSON 文件，批量导入账号到池中。
 //
-//	POST /panel/api/import/cockpit
+//	POST /panel/api/import/cockpit[?onboard=auto|1|0]
 //	Content-Type: multipart/form-data
 //	Body: file=<json>
 //
-// 返回 {ok, total, imported, skipped, errors}。
+// onboard 控制「新账号导入后是否自动跑完全部成长任务并领奖」（详见 onboard.go）：
+// 缺省 auto = 本次恰好进 1 个新账号时触发（授权链接登录的形态），批量导入不动；
+// 1/true = 新账号全部触发；0/false = 关闭。
+//
+// 返回 {ok, total, imported, skipped, errors, onboard_queued}。
 func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		writeErr(w, http.StatusBadRequest, "parse form: "+err.Error())
@@ -71,6 +75,11 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 
 	var total, imported, skipped int
 	var errs []string
+
+	// 自动清任务（onboard.go）：只收集本次「新进池」的账号，already-exist 的
+	// 重复导入不触发（任务幂等，跑一遍没新增收益，只白耗真实对话）。
+	onboardMode := parseOnboardMode(r.FormValue("onboard"))
+	var onboardNew []*auth.Auth
 
 	for _, acc := range accounts {
 		uid := strings.TrimSpace(acc.UID)
@@ -131,6 +140,7 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
+		isNew := p.cfg.Pool.AuthByUID(uid) == nil
 		p.cfg.Pool.Add(a)
 		p.cfg.Pool.Revive(uid)
 
@@ -156,16 +166,34 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 		}
 
 		imported++
+		if isNew {
+			onboardNew = append(onboardNew, a)
+		}
 	}
 
 	total = len(accounts)
-	log.Printf("panel: cockpit import finished total=%d imported=%d skipped=%d", total, imported, skipped)
+	log.Printf("panel: cockpit import finished total=%d imported=%d skipped=%d new=%d",
+		total, imported, skipped, len(onboardNew))
+
+	// 异步入队即返回：auto_all 单号实测 ~124s，同步跑会把导入请求拖过 HTTP 超时。
+	queued := 0
+	if shouldOnboard(onboardMode, len(onboardNew)) {
+		reason := "auto:single-new-account"
+		if onboardMode == onboardModeForce {
+			reason = "forced"
+		}
+		p.enqueueOnboard(onboardNew, reason)
+		queued = len(onboardNew)
+		log.Printf("panel: onboard 入队 %d 个新账号（mode=%s reason=%s）", queued, onboardMode, reason)
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":       true,
-		"total":    total,
-		"imported": imported,
-		"skipped":  skipped,
-		"errors":   errs,
+		"ok":             true,
+		"total":          total,
+		"imported":       imported,
+		"skipped":        skipped,
+		"errors":         errs,
+		"onboard_queued": queued,
 	})
 }
 

@@ -112,6 +112,14 @@ type Panel struct {
 	// 容量分析扫描完整请求归档，低频读取并缓存；互斥同时合并相同/不同参数的并发计算。
 	capacityMu    sync.Mutex
 	capacityCache map[string]capacityCacheEntry
+
+	// onboard* 授权登录新账号自动清成长任务（onboard.go）：单 worker 串行队列，
+	// 首个任务到达时惰性启动；留痕只放内存（最近 onboardMaxRecords 条）。
+	onboardOnce sync.Once
+	onboardCh   chan onboardJob
+	onboardMu   sync.Mutex
+	onboardLog  []onboardRecord
+	onboardRun  onboardExecutor // 测试注入替身；nil 时用 execOnboard 走真实上游
 }
 
 // tryLockAccount 尝试锁定账号的任务执行；已在执行返回 false。
@@ -183,6 +191,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
 	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.withAuth(p.importCockpit))
+	p.mux.HandleFunc("GET /panel/api/onboard", p.withAuth(p.onboardStatus))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/pause", p.withAuth(p.accountPause))
