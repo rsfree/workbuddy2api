@@ -93,7 +93,7 @@ func TestBaselineRejectsBadInput(t *testing.T) {
 	// 裸 nil 也是合法用法（Config.Baseline 未装配），不能崩。
 	var nilB *Baseline
 	nilB.Record("m", []uint64{1}, 10)
-	nilB.Predict("m", []uint64{1}, 10)
+	nilB.Predict("m", []uint64{1}, 10, 0, 0)
 	if _, _, ok := nilB.Lookup("m", []uint64{1}); ok {
 		t.Fatal("nil Baseline 不该命中")
 	}
@@ -106,7 +106,7 @@ func TestBaselineRejectsBadInput(t *testing.T) {
 // 这是线上判断「估得准不准」的唯一数据来源。
 func TestBaselinePredictScoredByRecord(t *testing.T) {
 	b := NewBaseline(4)
-	b.Predict("m", []uint64{1, 2}, 110)
+	b.Predict("m", []uint64{1, 2}, 110, 0, 0)
 
 	snap := b.Snapshot()
 	if snap["pred_pending"].(int) != 1 || snap["pred_verified"].(int) != 0 {
@@ -142,7 +142,7 @@ func TestBaselinePredictScoredByRecord(t *testing.T) {
 // 乱配对：上下文被压缩后 messages 变短，拿它的 usage 去评旧预测会把 mae 算假。
 func TestBaselinePredictNotScoredOnDifferentDigests(t *testing.T) {
 	b := NewBaseline(4)
-	b.Predict("m", []uint64{1, 2}, 110)
+	b.Predict("m", []uint64{1, 2}, 110, 0, 0)
 	b.Record("m", []uint64{1, 2, 3}, 999) // 更长的另一批，不等于预测的那批
 
 	snap := b.Snapshot()
@@ -156,7 +156,7 @@ func TestBaselinePredictNotScoredOnDifferentDigests(t *testing.T) {
 func TestBaselinePendingBounded(t *testing.T) {
 	b := NewBaseline(4)
 	for i := 0; i < maxPreds+4; i++ {
-		b.Predict("m", []uint64{uint64(i + 1)}, 100+i)
+		b.Predict("m", []uint64{uint64(i + 1)}, 100+i, 0, 0)
 	}
 	if n := b.Snapshot()["pred_pending"].(int); n != maxPreds {
 		t.Fatalf("pending=%d want %d", n, maxPreds)
@@ -203,5 +203,64 @@ func TestNewBaselineDefaultLimit(t *testing.T) {
 	// 显式传值仍要生效（测试用得到小容量）。
 	if got := NewBaseline(4).Snapshot()["limit"].(int); got != 4 {
 		t.Fatalf("显式 limit=%d want 4", got)
+	}
+}
+
+// TestBaselineReportsTailDelta 配对成功后要把「新增段的真实增量」交给回调——
+// 这是 tail 比例唯一的样本来源（base 是上游真数，actual-base 就是新增内容的
+// 上游 token 数，比整段口径干净）。
+func TestBaselineReportsTailDelta(t *testing.T) {
+	b := NewBaseline(8)
+	var calls int
+	var gotModel string
+	var gotRaw, gotDelta int
+	b.SetTailObserver(func(model string, rawEst, actualDelta int) {
+		calls++
+		gotModel, gotRaw, gotDelta = model, rawEst, actualDelta
+	})
+
+	b.Predict("m", []uint64{1, 2, 3}, 1150, 1000, 150) // 基线 1000 + 新增粗估 150
+	b.Record("m", []uint64{1, 2, 3}, 1300)             // 真实 1300 ⇒ 增量 300
+
+	if calls != 1 {
+		t.Fatalf("回调次数=%d want 1", calls)
+	}
+	if gotModel != "m" || gotRaw != 150 || gotDelta != 300 {
+		t.Fatalf("回调参数=(%s,%d,%d) want (m,150,300)", gotModel, gotRaw, gotDelta)
+	}
+}
+
+// TestBaselineSkipsTailOnFullMatch 完全命中（tailRaw=0）时不能回调：增量恒为 0，
+// 喂进去只会把比例往 0 压，之后所有增量估算都偏小。
+func TestBaselineSkipsTailOnFullMatch(t *testing.T) {
+	b := NewBaseline(8)
+	calls := 0
+	b.SetTailObserver(func(string, int, int) { calls++ })
+
+	b.Predict("m", []uint64{1, 2}, 1000, 1000, 0) // 完全命中：没有新增段
+	b.Record("m", []uint64{1, 2}, 1000)
+	if calls != 0 {
+		t.Fatalf("完全命中仍回调了 %d 次", calls)
+	}
+
+	// 真值比基线还小时（客户端删了消息）也不学：负增量没有意义。
+	b.Predict("m", []uint64{1, 2, 3}, 900, 1000, 100)
+	b.Record("m", []uint64{1, 2, 3}, 950)
+	if calls != 0 {
+		t.Fatalf("负增量仍回调了 %d 次", calls)
+	}
+}
+
+// TestBaselineTailNeedsMatchingDigests 预测与真值不是同一批消息时不学：
+// 上下文被压缩后 messages 变短，拿它的 usage 去算「增量」会得到错值。
+func TestBaselineTailNeedsMatchingDigests(t *testing.T) {
+	b := NewBaseline(8)
+	calls := 0
+	b.SetTailObserver(func(string, int, int) { calls++ })
+
+	b.Predict("m", []uint64{1, 2}, 1100, 1000, 100)
+	b.Record("m", []uint64{1, 2, 3}, 1400) // 更长的一批，不是那条预测
+	if calls != 0 {
+		t.Fatalf("指纹不同的记录触发了 tail 学习 %d 次", calls)
 	}
 }

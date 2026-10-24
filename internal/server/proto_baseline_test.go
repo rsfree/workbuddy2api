@@ -179,3 +179,62 @@ func TestCountTokensBaselineIgnoresErrorResponses(t *testing.T) {
 		t.Fatalf("错误响应被记进基线: entries=%d", n)
 	}
 }
+
+// TestCountTokensLearnsTailRatio 「探 → 真跑」的配对要把新增段学成一个比例。
+//
+// 之前的实现直接拿整段回归的 slope 乘增量，而那个斜率混着 system/tools 的固定
+// 开销（线上实测 1.28，增量段没有这部分），系统性高估 ~20%。这里验证样本确实
+// 从 count_tokens 的预测流到了 tail 系数，且学到的比例就是「真实增量/粗估」。
+func TestCountTokensLearnsTailRatio(t *testing.T) {
+	calls := 0
+	up, _ := newProtoUpstream(t, func(string) (int, string, bool) {
+		calls++
+		if calls == 1 {
+			return 200, calibSSE(1000), true
+		}
+		return 200, calibSSE(1200), true
+	})
+	cal := tokencalib.New("")
+	base := tokencalib.NewBaseline(0)
+	h := NewHandler(Config{
+		Pool:       testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream:   up,
+		TokenCalib: cal,
+		Baseline:   base,
+	})
+
+	// ① 先建基线：单条消息对应上游真实 1000。
+	m1 := `[{"role":"user","content":"hello baseline"}]`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages",
+		strings.NewReader(`{"model":"glm-5.2","max_tokens":16,"messages":`+m1+`}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("建基线 code=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// ② 探「基线 + 一条新消息」：命中基线 1000，增量按初始比例 1 原样加上去。
+	m2 := `[{"role":"user","content":"hello baseline"},{"role":"user","content":"` +
+		strings.Repeat("y", 300) + `"}]`
+	probe := postCountTokens(t, h, `{"model":"glm-5.2","messages":`+m2+`}`)
+	if probe <= 1000 {
+		t.Fatalf("探针=%d 应大于基线 1000", probe)
+	}
+
+	// ③ 同批发 chat，上游回 1200 ⇒ 真实增量 200 与步骤 ② 的粗估配成一对。
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages",
+		strings.NewReader(`{"model":"glm-5.2","max_tokens":16,"messages":`+m2+`}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("真跑 code=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	p := cal.Params("glm-5.2")
+	if p.TailSamples != 1 {
+		t.Fatalf("TailSamples=%d want 1（count_tokens 的预测没流到 tail 系数）", p.TailSamples)
+	}
+	// 单样本权重 w=1/(1+4)=0.2：ratio = 0.2*(200/粗估) + 0.8*1。
+	// 粗估约 100 ⇒ 学到 ≈1.2。只断言「确实朝真实比例动了」，不绑死估算公式。
+	if p.TailRatio <= 1.05 || p.TailRatio > 1.4 {
+		t.Fatalf("TailRatio=%.2f want (1.05,1.4]", p.TailRatio)
+	}
+}

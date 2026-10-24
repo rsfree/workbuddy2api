@@ -85,7 +85,9 @@ func (h *Handler) countTokens(w http.ResponseWriter, r *http.Request) {
 			// 登记预测：客户端多半紧接着用同一批 messages 发 chat，那次的真实
 			// usage.prompt_tokens 会在 Record 里与这条配对，累计成 /status 的
 			// token_baseline.pred_by_model.mae——这是判断「估得准不准」的唯一数据源。
-			h.cfg.Baseline.Predict(key, idx.Digests, out)
+			// 同时带上 base 与 tail 的字符粗估：配对后相减即「新增段的真实增量」，
+			// 交给 tail 比例单独学习（整段 slope 混着固定开销，不能直接用于增量）。
+			h.cfg.Baseline.Predict(key, idx.Digests, out, base, tail)
 			// 只在新增段较长时留痕：tail 小（常见的一两条 user）没什么可优化的，
 			// 逐次打日志会把 INFO 刷满；tail 大说明客户端在灌大块上下文，正是误差来源。
 			if tail >= baselineLogTail {
@@ -104,7 +106,8 @@ func (h *Handler) countTokens(w http.ResponseWriter, r *http.Request) {
 	// 没有匹配的基线（首轮、上下文被压缩、换了会话）：回落到整段系数换算。
 	out := h.cfg.TokenCalib.Adjust(key, idx.Total)
 	if h.cfg.Baseline != nil {
-		h.cfg.Baseline.Predict(key, idx.Digests, out)
+		// 无基线可用：预测值与 tail 段无从拆分（base=0），只登记整体误差。
+		h.cfg.Baseline.Predict(key, idx.Digests, out, 0, 0)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"input_tokens": out})
 }

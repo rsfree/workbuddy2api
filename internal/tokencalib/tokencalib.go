@@ -73,6 +73,17 @@ type stats struct {
 	Sxy float64 `json:"sxy"` // Σxy
 	// Total 累计观测次数（不衰减，仅用于日志/运维展示「学了多久」）。
 	Total int64 `json:"total"`
+
+	// tail 段（基线之后的增量）单独的比例统计。
+	//
+	// 为什么要单开一套：基线命中时只有「新增的那几条消息」需要估，而整段回归的
+	// slope 把 system/tools 这类固定开销也摊进了比例（线上实测 slope≈1.28），
+	// 拿去乘增量就系统性高估——增量段本身没有任何固定开销。
+	// 不拟合 intercept（增量段没有它），只求一个纯比例 ratio = Σ真实增量/Σ粗估。
+	TailN     float64 `json:"tail_n,omitempty"`
+	TailSx    float64 `json:"tail_sx,omitempty"`
+	TailSy    float64 `json:"tail_sy,omitempty"`
+	TailTotal int64   `json:"tail_total,omitempty"`
 }
 
 // Params 单模型的校准参数（对外快照，用于 /status 与日志）。
@@ -82,6 +93,10 @@ type Params struct {
 	// Samples 累计观测次数；Weighted 是衰减后的有效样本数（回归实际权重）。
 	Samples  int64   `json:"samples"`
 	Weighted float64 `json:"weighted_samples"`
+	// TailRatio 基线命中时「新增段」的字符/token 比（1.0 = 粗估原值）。
+	// TailSamples 是它的有效样本数：为 0 时 ratio 恒为 1，即退化成粗估。
+	TailRatio   float64 `json:"tail_ratio"`
+	TailSamples int64   `json:"tail_samples"`
 }
 
 // Calibrator 按模型维护校准参数。零值不可用，用 New 构造。
@@ -145,11 +160,15 @@ func (c *Calibrator) Adjust(model string, est int) int {
 	return int(math.Round(v))
 }
 
-// AdjustTail 只对「基线之后的增量」做比例放大，不加 intercept。
+// AdjustTail 只对「基线之后的增量」做比例放大，不加 intercept、也不用整段 slope。
 //
 // 与 Adjust 的分工：上下文没变的那部分已由 Baseline 用上游真数覆盖，intercept
 // （system 模板等固定开销）也含在那条记录里；这里若再叠加一次 intercept、或用
-// 全量估算重算，都会把固定开销重复计进去。只把增量按学到的字符/token 比放大。
+// 全量估算重算，都会把固定开销重复计进去。
+//
+// 也不用整段的 slope：那个斜率把固定开销摊进了比例（线上实测 1.28），而增量段
+// 没有固定开销，直接乘会系统性高估 ~20%（1789 字符中英混合实测 770 vs 真实 623）。
+// 这里用它自己的比例 TailRatio，样本来自「基线预测 vs 随后那次真实 usage」的差。
 func (c *Calibrator) AdjustTail(model string, est int) int {
 	if est <= 0 {
 		return 0
@@ -158,7 +177,42 @@ func (c *Calibrator) AdjustTail(model string, est int) int {
 		return est
 	}
 	p := c.Params(model)
-	return int(math.Round(p.Slope * float64(est)))
+	return int(math.Round(p.TailRatio * float64(est)))
+}
+
+// ObserveTail 记录一对（新增段的字符粗估, 上游该段的真实增量）。
+//
+// 增量由调用方算好（actual - base）：基线本身是上游真数，两者相减得到的就是
+// 「这一轮新加的内容」在上游的真实 token 数，比整段口径干净。
+// 任一侧非正数时忽略——完全命中（增量 0）的样本学不到比例，还会把轴压向 0。
+func (c *Calibrator) ObserveTail(model string, rawEst, actualDelta int) {
+	if c == nil || model == "" || rawEst <= 0 || actualDelta <= 0 {
+		return
+	}
+	c.mu.Lock()
+	s := c.models[model]
+	if s == nil {
+		s = &stats{}
+		c.models[model] = s
+	}
+	s.TailN = s.TailN*decay + 1
+	s.TailSx = s.TailSx*decay + float64(rawEst)
+	s.TailSy = s.TailSy*decay + float64(actualDelta)
+	s.TailTotal++
+
+	samples := s.TailTotal
+	p := s.params()
+	c.dirty = true
+	save := c.path != "" && time.Since(c.lastSave) >= saveInterval
+	c.mu.Unlock()
+
+	if save {
+		c.Save()
+	}
+	if milestone(samples) {
+		log.Printf("[tokencalib] model=%s tail 样本=%d ratio=%.2f（本次 raw=%d 真实增量=%d）",
+			model, samples, p.TailRatio, rawEst, actualDelta)
+	}
 }
 
 // Observe 记录一对（本地估算, 上游实际 prompt_tokens）。任一侧非正数时忽略：
@@ -208,15 +262,17 @@ func milestone(n int64) bool {
 
 // Params 返回单模型当前参数（无历史时为 slope=1, intercept=0）。
 func (c *Calibrator) Params(model string) Params {
+	// 无历史时是恒等变换，两个系数都必须是 1：TailRatio 漏掉默认值会让
+	// AdjustTail 恒返回 0（增量被整个吃掉），比不校准糟得多。
 	if c == nil {
-		return Params{Slope: 1}
+		return Params{Slope: 1, TailRatio: 1}
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if s := c.models[model]; s != nil {
 		return s.params()
 	}
-	return Params{Slope: 1}
+	return Params{Slope: 1, TailRatio: 1}
 }
 
 // Snapshot 返回全模型参数快照（/status 展示用）。无历史时返回空 map 而非 nil。
@@ -235,7 +291,14 @@ func (c *Calibrator) Snapshot() map[string]Params {
 
 // params 由统计量解出回归参数（调用方需持锁或持有独占引用）。
 func (s *stats) params() Params {
-	p := Params{Slope: 1, Intercept: 0, Samples: s.Total, Weighted: s.N}
+	p := Params{Slope: 1, Intercept: 0, Samples: s.Total, Weighted: s.N, TailRatio: 1, TailSamples: s.TailTotal}
+	// tail 比例独立于整段回归：只喂过 tail 样本（理论上不会，但别依赖调用顺序）
+	// 时也要能算出来，所以放在 early return 之前。
+	if s.TailN > 0 && s.TailSx > 0 {
+		r := s.TailSy / s.TailSx
+		w := float64(s.TailTotal) / (float64(s.TailTotal) + priorN)
+		p.TailRatio = clamp(w*r+(1-w)*1, ratioOnlyMinSlope, ratioOnlyMaxSlope)
+	}
 	if s.N <= 0 {
 		return p
 	}

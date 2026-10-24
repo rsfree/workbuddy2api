@@ -209,6 +209,13 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.PromptMode == "" {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
+	// 把基线的「新增段配对」接到系数校准器上：count_tokens 每次给出预测都会登记
+	// （base + tail 粗估），下一次同一批 messages 的真实 usage 回来时，相减得到的
+	// 真实增量就喂给 tail 比例。接在 NewHandler 而不是 main：任何构造路径
+	//（含测试、面板内嵌启动）都不该漏这一步，漏了 tail 系数永远学不到。
+	if cfg.Baseline != nil && cfg.TokenCalib != nil {
+		cfg.Baseline.SetTailObserver(cfg.TokenCalib.ObserveTail)
+	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	// 另外两种对话协议的前门（见 proto_chat.go / bridge.go）：入口把请求翻成

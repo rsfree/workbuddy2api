@@ -189,3 +189,79 @@ func TestRatioOnlyBandCapsSlope(t *testing.T) {
 		t.Fatalf("单样本 Adjust(10)=%d want ≤40（宁可保守，等样本覆盖不同长度再放开）", got)
 	}
 }
+
+// TestAdjustTailLearnsOwnRatio tail 段用自己的比例，不借用整段 slope。
+//
+// 为什么必须分开：整段回归里 slope 混着 system/tools 的固定开销（线上实测 1.28），
+// 而增量段没有这部分，直接乘会系统性高估 ~20%。这里让整段学成 y=3x、tail 学成
+// y=1.5x，两者必须各走各的。
+func TestAdjustTailLearnsOwnRatio(t *testing.T) {
+	c := New("")
+
+	// 没有 tail 样本时，AdjustTail 是恒等变换（不能因为整段 slope 变了就放大）。
+	if got := c.AdjustTail("m", 100); got != 100 {
+		t.Fatalf("无 tail 样本 AdjustTail(100)=%d want 100", got)
+	}
+
+	// 整段学成 y=3x：若 AdjustTail 借用 slope，这里会变成 300。
+	for i := 0; i < 40; i++ {
+		x := 1000 + i*100
+		c.Observe("m", x, 3*x)
+	}
+	if got := c.AdjustTail("m", 100); got != 100 {
+		t.Fatalf("整段 slope 影响到了 tail：AdjustTail(100)=%d want 100", got)
+	}
+
+	// tail 学成 y=1.5x：40 条样本后应接近 150（先验收缩会让它略低）。
+	for i := 0; i < 40; i++ {
+		c.ObserveTail("m", 100, 150)
+	}
+	p := c.Params("m")
+	if p.TailSamples != 40 {
+		t.Fatalf("TailSamples=%d want 40", p.TailSamples)
+	}
+	if p.TailRatio < 1.3 || p.TailRatio > 1.51 {
+		t.Fatalf("TailRatio=%.2f want ≈1.5（含收缩）", p.TailRatio)
+	}
+	if got := c.AdjustTail("m", 100); got < 130 || got > 151 {
+		t.Fatalf("AdjustTail(100)=%d want ≈150", got)
+	}
+	// 整段参数不能被 tail 样本带跑。
+	if p.Slope < 2.4 || p.Slope > 3.05 {
+		t.Fatalf("tail 样本污染了整段 slope=%.2f want ≈3", p.Slope)
+	}
+}
+
+// TestAdjustTailIgnoresFixedCost 增量段不加 intercept：基线已经含了固定开销，
+// 再加一次就是重复计费（长 system 的网关会让每个短增量凭空多出几百 token）。
+func TestAdjustTailIgnoresFixedCost(t *testing.T) {
+	c := New("")
+	for i := 0; i < 40; i++ {
+		x := 1000 + i*100
+		c.Observe("m", x, 2*x+500) // intercept 学到 500
+	}
+	if p := c.Params("m"); p.Intercept < 300 {
+		t.Fatalf("intercept=%.0f want ≈500（用例前提没成立）", p.Intercept)
+	}
+	if got := c.AdjustTail("m", 100); got != 100 {
+		t.Fatalf("AdjustTail 叠加了 intercept: got=%d want 100", got)
+	}
+}
+
+// TestObserveTailRejectsInvalid 完全命中（增量 0）与缺数据的样本不能学：
+// 它们会把比例往 0 压，之后所有增量估算都偏小。
+func TestObserveTailRejectsInvalid(t *testing.T) {
+	c := New("")
+	c.ObserveTail("m", 0, 100)   // 无粗估
+	c.ObserveTail("m", 100, 0)   // 无真实增量
+	c.ObserveTail("m", 100, -20) // 负增量（客户端删了消息）
+	c.ObserveTail("", 100, 100)  // 无模型
+	if p := c.Params("m"); p.TailSamples != 0 || p.TailRatio != 1 {
+		t.Fatalf("脏样本被计入: samples=%d ratio=%.2f", p.TailSamples, p.TailRatio)
+	}
+	var nilC *Calibrator
+	nilC.ObserveTail("m", 100, 100)
+	if got := nilC.AdjustTail("m", 777); got != 777 {
+		t.Fatalf("nil AdjustTail(777)=%d want 777", got)
+	}
+}

@@ -30,8 +30,10 @@ type Baseline struct {
 	entries []baseEntry
 	preds   []predEntry
 	predsBy map[string]*predStat
-	hits    uint64
-	misses  uint64
+	// onTail tail 段配对回调（Calibrator.ObserveTail）。启动时设一次，之后只读。
+	onTail func(model string, rawEst, actualDelta int)
+	hits   uint64
+	misses uint64
 	// oversize 因消息条数超 maxDigests 而放弃记录的轮数（长会话）。
 	// 它是「该不该做滑动窗口」的唯一判据：持续增长说明长会话根本没基线可用。
 	oversize uint64
@@ -52,6 +54,10 @@ type predEntry struct {
 	model     string
 	digests   []uint64
 	predicted int
+	// base / tailRaw 供配对后单独学 tail 段的比例：真实增量 = actual - base，
+	// 与 tailRaw 配成一对喂给 Calibrator.ObserveTail。完全命中时 tailRaw=0，不参与。
+	base    int
+	tailRaw int
 }
 
 // predStat 单个模型的预测误差累计。
@@ -68,11 +74,11 @@ const (
 	maxDigests = 512
 	// defaultBaselineLimit 默认保留多少个会话/批次。
 	//
-	// 128 而不是更小：线上实测（68 账号的网关）每轮 chat 都会新增一条（messages 变长），
+	// 1024 而不是更小：线上实测（68 账号的网关）每轮 chat 都会新增一条（messages 变长），
 	// 旧轮次只能等 LRU 淘汰，一个活跃会话就会占好几条。32 条上线 3 分钟即打满，
-	// 之后每次 Record 都要淘汰一条——被淘汰的若是另一会话的最新记录，那次 count_tokens
-	// 就白白 miss。每条最多 512*8B ≈ 4KB，128 条约 512KB，对常驻进程仍可忽略。
-	defaultBaselineLimit = 128
+	// 128 对多客户端并发仍偏紧——被淘汰的若是另一会话的最新记录，那次 count_tokens
+	// 就白 miss。每条最多 512*8B ≈ 4KB，1024 条约 4MB，对常驻进程仍可接受。
+	defaultBaselineLimit = 1024
 	// maxPreds 同时挂多少条待验证预测。count_tokens 是客户端高频动作（每轮数次），
 	// 只保留最近若干条足够配对——真正要验证的是「紧接着那次 chat」。
 	maxPreds = 16
@@ -122,6 +128,12 @@ func (b *Baseline) Record(model string, digests []uint64, tokens int) {
 		p := b.preds[i]
 		if p.model == model && equalDigests(p.digests, cp) {
 			b.scorePredict(p, tokens)
+			// 顺带把「新增段」的真实增量交给 tail 系数学习：base 是当时的基线真值，
+			// 相减即本轮新增内容在上游的 token 数。回调只拿 Calibrator 自己的锁，
+			// 不会反向调用 Baseline，所以在这里持锁调用不成环。
+			if b.onTail != nil && p.base > 0 && p.tailRaw > 0 && tokens > p.base {
+				b.onTail(p.model, p.tailRaw, tokens-p.base)
+			}
 			b.preds = append(b.preds[:i], b.preds[i+1:]...)
 			break
 		}
@@ -150,7 +162,9 @@ func (b *Baseline) Record(model string, digests []uint64, tokens int) {
 //
 // 只在 count_tokens 真正给出数字后调用；随后同一批 messages 的 chat 响应回来时，
 // Record 会自动配对打分。重复调用（客户端多次探同一批上下文）就地更新，不占新槽位。
-func (b *Baseline) Predict(model string, digests []uint64, predicted int) {
+// base 是预测时用到的基线真值，tailRaw 是新增段的字符粗估（未乘任何系数）——
+// 两者用来在配对时单独给 tail 段学比例，不参与命中判定。
+func (b *Baseline) Predict(model string, digests []uint64, predicted, base, tailRaw int) {
 	if b == nil || model == "" || len(digests) == 0 || len(digests) > maxDigests {
 		return
 	}
@@ -165,13 +179,29 @@ func (b *Baseline) Predict(model string, digests []uint64, predicted int) {
 	for i := range b.preds {
 		if b.preds[i].model == model && equalDigests(b.preds[i].digests, cp) {
 			b.preds[i].predicted = predicted
+			b.preds[i].base = base
+			b.preds[i].tailRaw = tailRaw
 			return
 		}
 	}
 	if len(b.preds) >= maxPreds {
 		b.preds = append(b.preds[:0], b.preds[1:]...)
 	}
-	b.preds = append(b.preds, predEntry{model: model, digests: cp, predicted: predicted})
+	b.preds = append(b.preds, predEntry{model: model, digests: cp, predicted: predicted, base: base, tailRaw: tailRaw})
+}
+
+// SetTailObserver 注册「新增段配对」回调，把真实增量交给 tail 比例学习。
+//
+// 用回调而不是让 Baseline 直接持有 *Calibrator：两者解决的是不同问题（一个是
+// 前缀缓存、一个是系数回归），绑在一起以后不好单独换掉或单独测试。
+// 只在启动装配时调用一次；之后 Record 在锁内直接读这个字段。
+func (b *Baseline) SetTailObserver(fn func(model string, rawEst, actualDelta int)) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	b.onTail = fn
+	b.mu.Unlock()
 }
 
 // scorePredict 把一次预测与它的真实值配对，累计误差。调用方已持锁。
