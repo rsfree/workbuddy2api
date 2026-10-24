@@ -574,6 +574,22 @@ async function loadOverview(quiet) {
   const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
   $('sCredits').textContent = totSum > 0 ? remSum + ' / ' + totSum : remSum;
     $('sSticky').textContent = d.sticky_sessions;
+    // 缓存命中率 / 粘性命中率：分母为 0 时显示 "-"（不是 0%——0% 会被误读成
+    // "缓存完全不工作"，而实际只是还没有带 cache 维度的请求）。
+    const cm = d.cache || {};
+    if ($('sCacheHit')) {
+      const den = (cm.cache_hit_tokens || 0) + (cm.cache_miss_tokens || 0);
+      $('sCacheHit').textContent = den ? cm.cache_hit_rate + '%' : '-';
+    }
+    if ($('sStickyHit')) {
+      const den = (cm.sticky_hit || 0) + (cm.sticky_busy || 0) + (cm.sticky_miss || 0) + (cm.sticky_new || 0);
+      $('sStickyHit').textContent = den ? cm.sticky_hit_rate + '%' : '-';
+      // 悬停看明细：同号 / 满载溢出 / 换号重分配 / 新会话。
+      $('sStickyHit').parentNode.title = den
+        ? 'hit ' + (cm.sticky_hit || 0) + ' · 满载溢出 ' + (cm.sticky_busy || 0) +
+          ' · 换号 ' + (cm.sticky_miss || 0) + ' · 新会话 ' + (cm.sticky_new || 0)
+        : '还没有带会话键的请求';
+    }
     $('navSub').textContent = 'v' + d.version;
     $('navVer').textContent = 'v' + d.version;
     $('navRedis').textContent = d.redis_mode === 'upstash' ? 'Redis 镜像' : '本地内存';
@@ -1287,7 +1303,7 @@ function renderRequestTable() {
       '<td class="num">' + esc(when) + '</td>' +
       '<td>' + reqOutcomeTag(e) + '</td>' +
       '<td>' + esc(e && e.model || '—') + '</td>' +
-      '<td>' + esc(e && e.account || '—') + '</td>' +
+      '<td>' + esc(e && e.account || '—') + stickyBadge(e) + '</td>' +
       '<td>' + (ip ? '<span class="clip ip" title="' + esc(ip) + '">' + esc(ip) + '</span>' : '<span class="muted">—</span>') +
         (eg ? '<div class="' + egCls + '" title="出口 ' + esc(eg) + '">→ ' + esc(eg) + '</div>' : '') + '</td>' +
       '<td>' + (ua ? '<span class="clip" title="' + esc(ua) + '">' + esc(ua) + '</span>' : '<span class="muted">—</span>') + '</td>' +
@@ -1329,6 +1345,20 @@ if ($('reqRange')) trangeBind('reqRange', loadLogs, '0');
 if ($('creditLimit')) $('creditLimit').onchange = loadCreditHistory;
 if ($('btnCreditReload')) $('btnCreditReload').onclick = loadCreditHistory;
 
+/* stickyBadge 会话粘性落点的小角标（运行日志「账号」列第二行）。
+   只标「非命中」的三种：换号（miss）会打掉账号级前缀缓存，是排查缓存命中最直接
+   的一眼线索；同号（hit）不标，否则整表都是噪声。 */
+function stickyBadge(e) {
+  const st = (e && e.sticky) || '';
+  const label = { busy: '满载溢出', miss: '换号', new: '新会话' }[st];
+  if (!label) return '';
+  return '<div class="muted sticky-badge" title="' +
+    (st === 'busy' ? '绑定号在途满载：本次走了别的号，绑定保留' :
+     st === 'miss' ? '绑定号持久不可用：已解绑并重新分配（上游前缀缓存会全冷）' :
+     '该会话首次出现：本次分配并绑定') +
+    '">' + label + '</div>';
+}
+
 function requestLogText(e) {
   const when = e && e.time ? new Date(e.time).toLocaleTimeString('zh-CN', { hour12: false }) : '—';
   const outcomeLabel = { success: '成功', http_error: 'HTTP 错误', stream_error: '流错误', interrupted: '中断' };
@@ -1351,6 +1381,8 @@ function requestLogText(e) {
     fmtTok(token) + ' tok',
     credit,
     cacheRateText(e && e.cache_hit_tokens, e && e.cache_miss_tokens) === '—' ? '' : '命中 ' + cacheRateText(e && e.cache_hit_tokens, e && e.cache_miss_tokens),
+    // 粘性落点：同号=命中缓存的前提，换号=缓存全冷的前提（面板换号率的分母来源）。
+    ({ hit: '粘性 同号', busy: '粘性 满载溢出', miss: '粘性 换号', new: '粘性 新会话' })[e && e.sticky] || '',
     e && e.request_id || '—',
   ].filter(Boolean).join(' | ');
 }

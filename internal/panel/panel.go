@@ -357,7 +357,19 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		// 更新（默认每 5 分钟）——把这两个数透出，前端才能如实标注「x 分钟前更新」。
 		"balance_refresh_sec":  p.balanceRefreshSec(),
 		"balance_refreshed_at": p.balanceRefreshedAt(),
+		// 上游前缀缓存命中率 + 会话粘性命中率（进程内累计）。两个比例放一起
+		// 才有判断力：粘性命中率掉 = 会话在被搬号（账号级前缀缓存必然全冷）；
+		// 粘性命中率正常而缓存命中率低 = 上游/模型本身没缓存（网关无从优化）。
+		"cache": p.cacheMetrics(),
 	})
+}
+
+// cacheMetrics 前缀缓存与粘性路由的累计指标；未接入请求日志记录器时返回零值。
+func (p *Panel) cacheMetrics() reqlog.CacheMetrics {
+	if p.cfg.RequestLog == nil {
+		return reqlog.CacheMetrics{}
+	}
+	return p.cfg.RequestLog.Snapshot().Cache
 }
 
 // balanceRefreshSec 余额后台刷新间隔（秒）；无调度器/未开启时为 0。

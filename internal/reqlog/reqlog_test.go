@@ -305,3 +305,38 @@ func TestArchiveFilterByEgress(t *testing.T) {
 		t.Fatalf("unfiltered rows = %d, want 3", len(got))
 	}
 }
+
+// TestCacheMetricsAggregate 锁住缓存/粘性累计口径：
+//   - CacheHitRate 的分母是 hit+miss token，两者都为 0 的请求不进分母
+//     （上游没回缓存维度 ≠ 命中 0%，混进去会把面板指标长期压在低位）；
+//   - StickyHitRate 的分母是「被判定的请求数」（hit/busy/miss/new 之和），
+//     无会话键（Sticky 为空）的请求不进分母。
+func TestCacheMetricsAggregate(t *testing.T) {
+	r := New(Config{})
+	r.Record(Event{Status: 200, OK: true, CacheHitTokens: 900, CacheMissTokens: 100, Sticky: StickyHit})
+	r.Record(Event{Status: 200, OK: true, Sticky: StickyNew}) // 无缓存维度：不进 cache 分母
+	r.Record(Event{Status: 200, OK: true, CacheMissTokens: 500, Sticky: StickyBusy})
+	r.Record(Event{Status: 200, OK: true, Sticky: StickyMiss})
+	r.Record(Event{Status: 200, OK: true, CacheHitTokens: 50}) // 无会话键：不进 sticky 分母
+
+	s := r.Snapshot()
+	if s.Cache.CacheHitTokens != 950 || s.Cache.CacheMissTokens != 600 {
+		t.Fatalf("cache tokens hit=%d miss=%d", s.Cache.CacheHitTokens, s.Cache.CacheMissTokens)
+	}
+	if s.Cache.CacheHitRate != 61.3 { // 950 / 1550
+		t.Errorf("cache_hit_rate=%v want 61.3", s.Cache.CacheHitRate)
+	}
+	if s.Cache.StickyHit != 1 || s.Cache.StickyBusy != 1 || s.Cache.StickyMiss != 1 || s.Cache.StickyNew != 1 {
+		t.Fatalf("sticky counts hit=%d busy=%d miss=%d new=%d",
+			s.Cache.StickyHit, s.Cache.StickyBusy, s.Cache.StickyMiss, s.Cache.StickyNew)
+	}
+	if s.Cache.StickyHitRate != 25 {
+		t.Errorf("sticky_hit_rate=%v want 25", s.Cache.StickyHitRate)
+	}
+
+	// 完全无观测时两个比例都是 0（前端据此显示 "-"，不显示 "0%"）。
+	empty := New(Config{}).Snapshot()
+	if empty.Cache.CacheHitRate != 0 || empty.Cache.StickyHitRate != 0 {
+		t.Errorf("empty snapshot should be zero: %+v", empty.Cache)
+	}
+}

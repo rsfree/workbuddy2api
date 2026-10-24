@@ -40,7 +40,25 @@ type Config struct {
 	// 为什么粘性需要模型维度：绑定只记 uid，而同一个会话可能换模型。账号被 6004
 	// 模型级限额后对**其他模型**仍可用（issue #31 豁免），此时若只按账号级可用性
 	// 校验，会话会被钉在这个号上反复失败——正是"限额后换不动号"的观感来源。
+	//
+	// 🔴 它只用于**分配新会话**（必须能立刻承接），不要拿来做已绑定会话的命中校验：
+	// 该列表排除了满载在途的账号，拿它校验会把「临时繁忙」误判成「持久失效」，
+	// 见 StickyUsable。
 	AvailableForModel func(model string) []string
+
+	// StickyUsable 判断**已绑定**的账号在该模型上还能不能继续用：只看健康/封禁/
+	// 冷却/模型级限额，**不看 inFlight 在途名额**。
+	//
+	// 这是 2026-10-24 修掉的一处成本大坑：此前命中校验复用 AvailableForModel，
+	// 粘性号一旦被并发占满就会被判失效 → 解绑并重新哈希 → 会话被搬到另一个号，
+	// 而上游前缀缓存是账号级的，搬走即全冷。线上实测「同号相邻请求命中 94.2%、
+	// 换号相邻请求命中 34.2%」，换号请求占 70%、吃掉 59% 成本。
+	//
+	// 满载时返回 true → 调用方拿到该 uid 后由 handler 判 StickyBusy：本次请求
+	// 溢出到普通轮换，绑定保留，压力一过立刻回热。
+	//
+	// nil 时回落 AvailableForModel（旧语义：满载也算不可用），保持向后兼容。
+	StickyUsable func(uid, model string) bool
 }
 
 // Router 会话粘性路由器。
@@ -141,15 +159,33 @@ func (r *Router) Resolve(key string) (string, bool) {
 // 有序账号池策略用它保留粘性，未绑定会话由 Pool 选号并在成功后 Bind。
 func (r *Router) LookupForModel(key, model string) (string, bool) {
 	now := time.Now()
-	available := r.availableSet(model)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e, found := r.entries[key]
-	if !found || expired(e, now, r.cfg.TTL) || !available[e.uid] {
+	if !found || expired(e, now, r.cfg.TTL) || !r.stickyOK(e.uid, model) {
 		return "", false
 	}
 	r.entries[key] = entry{uid: e.uid, lastActive: now}
 	r.cfg.Store.SetBind(key, e.uid, r.cfg.TTL)
+	return e.uid, true
+}
+
+// Peek 只读返回当前绑定（不续期、不分配、不解绑）。
+//
+// 供调用方做「换号观测」：handler 需要在 ResolveForModel **之前**拿到旧绑定，
+// 才能在事后区分「命中同号（hit）」与「绑定号失效被换掉（miss）」——只看
+// ResolveForModel 的返回值永远无法分辨这两者，因为两者都会返回一个 uid。
+// 没有它，面板的换号率会把真实换号误记成同号命中，指标就失去意义。
+func (r *Router) Peek(key string) (string, bool) {
+	if key == "" {
+		return "", false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	e, ok := r.entries[key]
+	if !ok || expired(e, time.Now(), r.cfg.TTL) {
+		return "", false
+	}
 	return e.uid, true
 }
 
@@ -162,18 +198,19 @@ func (r *Router) LookupForModel(key, model string) (string, bool) {
 // 可用性校验，会话会被钉在一个"对当前模型不可用"的号上反复失败。
 func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	now := time.Now()
-	available := r.availableSet(model)
 
 	// ── Fast path: RLock 快查 ──────────────────────────────
 	r.mu.RLock()
 	e, found := r.entries[key]
 	r.mu.RUnlock()
 	if found && !expired(e, now, r.cfg.TTL) {
-		if available[e.uid] {
+		if r.stickyOK(e.uid, model) {
 			r.touch(key, e.uid, now)
 			return e.uid, true
 		}
-		// 绑定号已冷却/占满 → 失效，落入慢路径重分配。
+		// 绑定号已冷却/封禁/该模型限额 → 持久失效，落入慢路径重分配。
+		// 注意：在途满载**不**走这里（stickyOK 不看 inFlight），满载由 handler
+		// 判 StickyBusy 后本次溢出、绑定保留——见 StickyUsable 注释。
 	}
 
 	// ── Slow path: 写锁 re-check 后分配 ────────────────────
@@ -182,11 +219,11 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 
 	// re-check：并发同 key 可能已被其他 goroutine 分配好。
 	if e2, found2 := r.entries[key]; found2 && !expired(e2, now, r.cfg.TTL) {
-		if available[e2.uid] {
+		if r.stickyOK(e2.uid, model) {
 			r.entries[key] = entry{uid: e2.uid, lastActive: now}
 			return e2.uid, true
 		}
-		delete(r.entries, key) // 失效：清掉再分配
+		delete(r.entries, key) // 持久失效：清掉再分配
 	}
 
 	uids := r.availableSlice(model)
@@ -280,6 +317,20 @@ func (r *Router) gcOnce(now time.Time) int {
 		r.cfg.Store.DelBind(key)
 	}
 	return len(expiredKeys)
+}
+
+// stickyOK 判断已绑定账号能否继续承接当前模型：优先用注入的 StickyUsable
+// （健康口径，不看 inFlight），未注入时回落 availableSet（旧口径，含 inFlight）。
+//
+// 回落分支只服务不注入的调用方（测试/老装配）；生产由 cmd/server/wiring.go 注入。
+func (r *Router) stickyOK(uid, model string) bool {
+	if uid == "" {
+		return false
+	}
+	if r.cfg.StickyUsable != nil {
+		return r.cfg.StickyUsable(uid, model)
+	}
+	return r.availableSet(model)[uid]
 }
 
 // availableSet 把 AvailableForModel(model) 的有序列表转集合（快路径命中校验用）。

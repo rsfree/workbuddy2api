@@ -447,3 +447,88 @@ func TestLookupForModelOnlyReusesValidBinding(t *testing.T) {
 		t.Fatal("lookup allocated a replacement")
 	}
 }
+
+// TestResolveKeepsBindingWhenOnlyBusy 锁住「在途满载不解绑」：
+// 绑定号因为并发满载从 AvailableForModel 列表里消失时，ResolveForModel
+// 必须仍然返回原绑定（交给 handler 判 StickyBusy、本次溢出），
+// 而不是解绑后重新哈希 → 会话被永久搬到另一个账号（上游前缀缓存全冷）。
+//
+// 线上实测口径（2026-10-24，1.6h/1000 条请求）：
+//   - 相邻请求同号 <5m → 前缀缓存命中 94.2%
+//   - 相邻请求换号 <5m → 命中 34.2%，78.6% 的请求几乎全 miss
+//   - 换号请求占 70%，吃掉 59% credit
+func TestResolveKeepsBindingWhenOnlyBusy(t *testing.T) {
+	var mu sync.Mutex
+	// assigning 是「可承接新分配」的号（池 Pick 口径，已排除满载）。
+	assigning := []string{"a", "b", "c"}
+	// eligible 是「已绑定会话还能用」的号（健康口径，不看满载）。
+	eligible := map[string]bool{"a": true, "b": true, "c": true}
+
+	r := New(Config{
+		TTL:               time.Minute,
+		Store:             newCountingStore(),
+		AvailableForModel: func(string) []string { mu.Lock(); defer mu.Unlock(); return append([]string(nil), assigning...) },
+		StickyUsable: func(uid, _ string) bool {
+			mu.Lock()
+			defer mu.Unlock()
+			return eligible[uid]
+		},
+	})
+
+	first, ok := r.ResolveForModel("k", "m")
+	if !ok || first == "" {
+		t.Fatal("initial allocation failed")
+	}
+
+	// 模拟 max_in_flight 打满：该号暂时不能承接**新**分配，但仍健康。
+	mu.Lock()
+	rest := []string{}
+	for _, u := range assigning {
+		if u != first {
+			rest = append(rest, u)
+		}
+	}
+	assigning = rest
+	mu.Unlock()
+
+	for i := 0; i < 5; i++ {
+		uid, ok := r.ResolveForModel("k", "m")
+		if !ok || uid != first {
+			t.Fatalf("round %d: binding drifted under in-flight fullness: got %q want %q", i, uid, first)
+		}
+	}
+	if r.Count() != 1 {
+		t.Fatalf("binding count=%d want 1 (no extra session created)", r.Count())
+	}
+
+	// 健康度恶化（封禁/冷却/该模型限额）→ 必须能换号，不能钉死。
+	mu.Lock()
+	eligible[first] = false
+	mu.Unlock()
+	uid, ok := r.ResolveForModel("k", "m")
+	if !ok || uid == first {
+		t.Fatalf("unhealthy binding must be replaced, got %q ok=%v", uid, ok)
+	}
+}
+
+// TestResolveWithoutStickyUsableFallsBack 锁住向后兼容：
+// 未注入 StickyUsable 时命中校验回落 AvailableForModel（旧语义，满载即失效）。
+func TestResolveWithoutStickyUsableFallsBack(t *testing.T) {
+	var mu sync.Mutex
+	available := []string{"a", "b"}
+	r := New(Config{
+		TTL:               time.Minute,
+		Store:             newCountingStore(),
+		AvailableForModel: func(string) []string { mu.Lock(); defer mu.Unlock(); return available },
+	})
+	r.Bind("k", "a")
+	if uid, ok := r.ResolveForModel("k", "m"); !ok || uid != "a" {
+		t.Fatalf("hit=%q %v", uid, ok)
+	}
+	mu.Lock()
+	available = []string{"b"}
+	mu.Unlock()
+	if uid, ok := r.ResolveForModel("k", "m"); !ok || uid != "b" {
+		t.Fatalf("fallback should reallocate when binding leaves AvailableForModel: got %q", uid)
+	}
+}

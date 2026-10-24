@@ -127,3 +127,35 @@ func (p *Pool) AvailableUIDsForModelRealm(model, realm string) []string {
 	sort.Strings(uids)
 	return uids
 }
+
+// StickyEligibleForModelRealm 报告「已绑定会话还能否继续用这个号」，与
+// AvailableUIDsForModelRealm 的关键差别是**不看 inFlight（在途名额）**。
+//
+// 为什么必须拆开（2026-10-24 复盘，线上实测）：
+// 会话粘性路由把它拿到 AvailableForModel 列表做**命中校验**，而那份列表排除了
+// 满载在途的账号。于是只要粘性号在某一瞬间被并发占满（max_in_flight=8），
+// ResolveForModel 就判定「绑定号不可用」→ delete 绑定 → 重新哈希分配。
+// 这等于把「临时繁忙」当成「持久失效」，会话被永久搬到另一个账号；而上游前缀
+// 缓存是**账号级**的，搬走即全冷。线上 1.6h/1000 条实测：
+//   - 同一客户端+模型，相邻请求同号（<5m）→ 缓存命中 94.2%
+//   - 相邻请求换号（<5m）→ 命中 34.2%，且 78.6% 的请求几乎全 miss
+//   - 换号请求占 70%，吃掉 59% 的 credit 成本
+//
+// 正确的分工：
+//   - 「能不能承接新会话的分配」→ AvailableUIDsForModelRealm（含 inFlight）
+//   - 「已绑定的会话还能不能留在这个号上」→ 本方法（只看健康/封禁/冷却/模型限额）
+//
+// 满载时返回 true，交给 handler 的 PickStickyForModel 判 StickyBusy：本次请求
+// 溢出到普通轮换，绑定**保留**（与 handler「StickyBusy 不解绑」的口径对齐）。
+func (p *Pool) StickyEligibleForModelRealm(uid, model, realm string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	if realm != "" && e.a.Realm() != realm {
+		return false
+	}
+	return e.healthyForModel(time.Now(), model)
+}

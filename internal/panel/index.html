@@ -599,6 +599,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .id.egress { font-size: 11px; }
   .clip.rid { max-width: 150px; font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); }
   .acc.req .muted { color: var(--ink-3); }
+  /* 粘性落点角标（运行日志账号列第二行）：换号/满载溢出/新会话。
+     与 .egress 同形态（小字第二行），不额外占列宽。 */
+  .sticky-badge { font-size: 11px; line-height: 1.25; margin-top: 2px; }
   .src-off { color: var(--warn); }
 
   /* 用量统计条已改用 .kpis（见「用量视图」段），此处不再保留 .stats.compact 变体。 */
@@ -694,6 +697,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="stat warn"><div class="v" id="sPaused">-</div><div class="k">已暂停选号</div></div>
         <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分剩余 / 总额</div></div>
         <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
+        <!-- 缓存命中率与粘性命中率必须并排看：粘性命中率掉 = 会话在被搬号（账号级
+             前缀缓存必然全冷，该修路由）；粘性命中率高而缓存命中率低 = 上游/该模型
+             本身没缓存（网关无从优化）。数值是进程内累计，重启归零。 -->
+        <div class="stat" title="上游回报的前缀缓存命中 token 占比（hit / (hit+miss)），进程内累计"><div class="v" id="sCacheHit">-</div><div class="k">前缀缓存命中</div></div>
+        <div class="stat" title="会话粘性命中率（同号比例）。掉下去说明会话在被搬号，缓存必然全冷"><div class="v" id="sStickyHit">-</div><div class="k">粘性命中（同号）</div></div>
       </div>
 
       <!-- 卡片默认可见：此前 hidden + 「仅点检查才渲染」形成死锁（按钮藏在隐藏卡片里，

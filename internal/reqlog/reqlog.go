@@ -39,6 +39,14 @@ func NewRequestID() string {
 	return fmt.Sprintf("req-%d", time.Now().UnixNano())
 }
 
+// Sticky 会话粘性落点取值（Event.Sticky）。
+const (
+	StickyHit  = "hit"  // 命中绑定号
+	StickyBusy = "busy" // 绑定号满载，本次溢出（绑定保留）
+	StickyMiss = "miss" // 绑定号持久不可用，已解绑重分配
+	StickyNew  = "new"  // 会话首次出现，本次分配
+)
+
 const (
 	OutcomeSuccess     = "success"
 	OutcomeHTTPError   = "http_error"
@@ -92,6 +100,14 @@ type Event struct {
 	// 失败回落直连是 "direct"。看到 direct 就说明这一请求没走专属出口——排查
 	// 「代理配了但没生效」的第一现场。旧归档行没有该字段（omitempty）。
 	Egress string `json:"egress,omitempty"`
+	// Sticky 会话粘性路由本轮的落点（hit / busy / miss / new；空 = 无会话键）。
+	// 它回答「这一跳的账号是不是会话原来绑定的那个」——换号会打掉账号级上游
+	// 前缀缓存，所以这是缓存命中的**先行指标**：
+	//   hit  = 命中绑定号（应命缓存）
+	//   busy = 绑定号在途满载，本次溢出到别的号（绑定保留，压力过后回热）
+	//   miss = 绑定号持久不可用（冷却/封禁/该模型限额），已解绑并重新分配
+	//   new  = 该会话首次出现，本次分配并绑定
+	Sticky string `json:"sticky,omitempty"`
 }
 
 // Filter 用于从归档中筛选最近记录。字符串字段一律「包含」匹配（大小写不敏感），
@@ -118,18 +134,43 @@ type ArchiveStats struct {
 	LastError     string `json:"last_error,omitempty"`
 }
 
+// CacheMetrics 上游前缀缓存与粘性路由的累计指标（自进程启动）。
+//
+// 两个比例的分母刻意不同：
+//   - CacheHitRate 用 upstream 回报的 hit+miss token 做分母（缺该维度的请求不计入）；
+//   - StickyHitRate 用「粘性被判定的请求数」做分母（hit+busy+miss+new），
+//     无会话键的请求不计入。
+//
+// 之所以把两者并列：换号是缓存冷的主因（账号级前缀缓存），先看 StickyHitRate
+// 掉不掉，再看 CacheHitRate 跟不跟，能一眼分出「路由搬了号」还是「上游没缓存」。
+type CacheMetrics struct {
+	CacheHitTokens  int64   `json:"cache_hit_tokens"`
+	CacheMissTokens int64   `json:"cache_miss_tokens"`
+	CacheHitRate    float64 `json:"cache_hit_rate"`
+	// Sticky 计数与命中率：hit/busy/miss/new 之和为分母。
+	StickyHit     int64   `json:"sticky_hit"`
+	StickyBusy    int64   `json:"sticky_busy"`
+	StickyMiss    int64   `json:"sticky_miss"`
+	StickyNew     int64   `json:"sticky_new"`
+	StickyHitRate float64 `json:"sticky_hit_rate"`
+}
+
 // Snapshot 一次面板读取的完整指标快照。
 type Snapshot struct {
-	StartedAt       time.Time    `json:"started_at"`
-	Completed       int64        `json:"completed"`
-	InFlight        int64        `json:"in_flight"`
-	Succeeded       int64        `json:"succeeded"`
-	Failed          int64        `json:"failed"`
-	SuccessRate     float64      `json:"success_rate"`
-	HTTPSuccessRate float64      `json:"http_success_rate"`
-	AvgDurationMs   float64      `json:"avg_duration_ms"`
-	Recent          []Event      `json:"recent"`
-	Archive         ArchiveStats `json:"archive"`
+	StartedAt       time.Time `json:"started_at"`
+	Completed       int64     `json:"completed"`
+	InFlight        int64     `json:"in_flight"`
+	Succeeded       int64     `json:"succeeded"`
+	Failed          int64     `json:"failed"`
+	SuccessRate     float64   `json:"success_rate"`
+	HTTPSuccessRate float64   `json:"http_success_rate"`
+	AvgDurationMs   float64   `json:"avg_duration_ms"`
+	// 前缀缓存与粘性：进程内累计（自启动起），供面板「缓存命中率 / 换号率」展示。
+	// 与 Recent 不同，这里不受 recentLimit 影响——它是整段运行期的比例，
+	// 用来回答「这次优化到底有没有让缓存热起来」，短窗口抖动不会把它带偏。
+	Cache   CacheMetrics `json:"cache"`
+	Recent  []Event      `json:"recent"`
+	Archive ArchiveStats `json:"archive"`
 }
 
 // Recorder 并发安全的有界请求指标与归档记录器。
@@ -141,8 +182,15 @@ type Recorder struct {
 	succeeded   int64
 	httpSuccess int64
 	durationSum int64
-	recent      []Event
-	archive     *archiveWriter
+	// 缓存与粘性累计（见 CacheMetrics）。
+	cacheHitTokens  int64
+	cacheMissTokens int64
+	stickyHit       int64
+	stickyBusy      int64
+	stickyMiss      int64
+	stickyNew       int64
+	recent          []Event
+	archive         *archiveWriter
 }
 
 // New 创建记录器；Dir 为空或 Enabled=false 时只启用内存指标。
@@ -195,6 +243,22 @@ func (r *Recorder) Record(e Event) {
 		r.httpSuccess++
 	}
 	r.durationSum += e.DurationMs
+	// hit+miss 才是「上游回报了缓存维度」的请求；两者皆 0 的（上游没给该维度、
+	// 或非 chat 路径）不进分母，避免把无观测请求算成「命中 0%」。
+	if e.CacheHitTokens > 0 || e.CacheMissTokens > 0 {
+		r.cacheHitTokens += e.CacheHitTokens
+		r.cacheMissTokens += e.CacheMissTokens
+	}
+	switch e.Sticky {
+	case StickyHit:
+		r.stickyHit++
+	case StickyBusy:
+		r.stickyBusy++
+	case StickyMiss:
+		r.stickyMiss++
+	case StickyNew:
+		r.stickyNew++
+	}
 	r.recent = append([]Event{e}, r.recent...)
 	if len(r.recent) > recentLimit {
 		r.recent = r.recent[:recentLimit]
@@ -223,6 +287,20 @@ func (r *Recorder) Snapshot() Snapshot {
 		s.SuccessRate = round1(float64(r.succeeded) / float64(r.completed) * 100)
 		s.HTTPSuccessRate = round1(float64(r.httpSuccess) / float64(r.completed) * 100)
 		s.AvgDurationMs = float64(r.durationSum) / float64(r.completed)
+	}
+	s.Cache = CacheMetrics{
+		CacheHitTokens:  r.cacheHitTokens,
+		CacheMissTokens: r.cacheMissTokens,
+		StickyHit:       r.stickyHit,
+		StickyBusy:      r.stickyBusy,
+		StickyMiss:      r.stickyMiss,
+		StickyNew:       r.stickyNew,
+	}
+	if total := r.cacheHitTokens + r.cacheMissTokens; total > 0 {
+		s.Cache.CacheHitRate = round1(float64(r.cacheHitTokens) / float64(total) * 100)
+	}
+	if total := r.stickyHit + r.stickyBusy + r.stickyMiss + r.stickyNew; total > 0 {
+		s.Cache.StickyHitRate = round1(float64(r.stickyHit) / float64(total) * 100)
 	}
 	r.mu.Unlock()
 	if r.archive != nil {

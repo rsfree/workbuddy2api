@@ -886,6 +886,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// ExtractKey 与粘性开关解耦（issue #35 侧）：关闭粘性时会话头族的聚合主键仍按
 	// 会话级（RequestIDForKey(sessKey)），不悄悄退化成轮级——提取本身与粘性无关。
 	sessKey := session.ExtractKey(body)
+	// prevBound 是**本次请求之前**的绑定（只读快照，不续期）。必须在这里取：
+	// ResolveForModel 可能已经把绑定换掉，事后看返回值分不清「命中同号」和
+	// 「失效换号」——两者都返回一个 uid，而面板的换号率正是靠这个区分。
+	prevBound := ""
+	if h.cfg.Session != nil && sessKey != "" {
+		if uid, ok := h.cfg.Session.Peek(sessKey); ok {
+			prevBound = uid
+		}
+	}
 	stickyUID := ""
 	if h.cfg.Session != nil && sessKey != "" {
 		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
@@ -1079,7 +1088,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
+	// stickyOverflow 标记「本轮粘性号只是在途满载、请求溢出到别的号」。
+	// 溢出是临时压力，成功后台**不能**把会话重绑到溢出号：否则每一次满载都会
+	// 把会话永久搬到另一个账号，而上游前缀缓存是账号级的，搬走即全冷——线上
+	// 实测换号请求占 70%、吃掉 59% credit。绑定保留，压力一过立刻回热。
+	stickyOverflow := false
+	// stickyBound 用**请求前**的绑定（prevBound）而不是 resolve 后的 stickyUID：
+	// 后者在「失效换号」时已经变成新号，拿它比对会把换号误记成命中。
+	stickyBound := prevBound
 	for i := 0; i < h.cfg.MaxRotate; i++ {
+		stickyOverflow = false
+		st.sticky = ""
 		// 选号：粘性号优先（PickStickyForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
 		if stickyUID != "" {
@@ -1092,9 +1111,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 搬走即全冷（实测命中率从 99.9% 掉到 0）。本次请求溢出到普通轮换，
 				// 绑定留给下一个（通常是串行的）轮次继续命中。
 				// 保留绑定的代价只是每轮多一次 PickByUID 读锁查询，可忽略。
+				stickyOverflow = true
+				st.sticky = reqlog.StickyBusy
 			case acct == nil:
 				// 持久不可用：账号不存在/冷却/封禁/该模型被限额/积分保底 → 解绑重分配。
 				unbindSticky()
+				st.sticky = reqlog.StickyMiss
 			case realm != "" && acct.Realm() != realm && !crossRealm:
 				// 跨域回退开启且请求为裸名时，粘性号可以落在任一域（回退成功后绑定的是另一域
 				// 的账号，下一轮不该被 realm 校验立刻解绑）。
@@ -1145,12 +1167,31 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		tried[acct.UID] = true
 
+		// 粘性落点归类（面板换号率 / 请求日志排查用）。只在本轮尚未被
+		// busy/miss 标记时归类：那两种情况已经定性，不需要"事后归因"。
+		if sessKey != "" && st.sticky == "" {
+			switch {
+			case stickyBound != "" && acct.UID == stickyBound:
+				st.sticky = reqlog.StickyHit
+			case stickyBound == "":
+				st.sticky = reqlog.StickyNew
+			default:
+				// 有绑定却没用上、且没被标 busy/miss（例如解绑后重新分配到同一个号
+				// 之外的路径）——保守记为 miss，宁可让面板显得"换号多"也不要漏报。
+				st.sticky = reqlog.StickyMiss
+			}
+		}
+
 		// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
 		if !h.cfg.Pool.Acquire(acct.UID) {
 			// 若被抢的正是粘性号，立即解绑并回落普通轮换，避免下一轮仍撞同一个
 			// 满载粘性号再浪费一次 PickByUID 往返（语义与 fail()/PickByUID-nil 的解绑一致）。
 			if stickyUID != "" && acct.UID == stickyUID {
 				unbindSticky()
+			}
+			// 粘性号压线被并发抢走名额：对本次请求等价于「临时繁忙」，记 busy。
+			if stickyBound != "" {
+				st.sticky = reqlog.StickyBusy
 			}
 			if !rotateBackoff(i, r.Context()) {
 				// 客户端已断连：换号重试无意义，终止轮转走末端错误透传。
@@ -1416,7 +1457,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeInterrupted
 				h.cfg.Pool.NoteSuccess(acct.UID)
 				h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
-				if sessKey != "" && h.cfg.Session != nil {
+				if sessKey != "" && h.cfg.Session != nil && !stickyOverflow {
 					h.cfg.Session.Bind(sessKey, acct.UID)
 				}
 			default:
@@ -1428,7 +1469,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
 				// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
 				// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
-				if sessKey != "" && h.cfg.Session != nil {
+				// 但「粘性号只是满载」的溢出轮**不重绑**：那会把会话永久搬到一个临时接活的号上，
+				// 下一次满载又搬一次，形成乒乓漂移（前缀缓存每跳全冷）。绑定留在原号等压力消退。
+				if sessKey != "" && h.cfg.Session != nil && !stickyOverflow {
 					h.cfg.Session.Bind(sessKey, acct.UID)
 				}
 			}

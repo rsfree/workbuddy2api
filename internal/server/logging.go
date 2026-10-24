@@ -74,6 +74,8 @@ type chatStat struct {
 	// 关闭，或非 chat 路径），展示层一律以 "-" 兜底。
 	clientIP  string
 	userAgent string
+	// sticky 本轮粘性落点（reqlog.Sticky*）；空 = 无会话键，不参与换号率统计。
+	sticky string
 
 	logged bool
 }
@@ -484,6 +486,7 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		e.CacheHitTokens = s.cacheHit
 		e.CacheMissTokens = s.cacheMiss
 		e.Egress = s.egress
+		e.Sticky = s.sticky
 	}
 	if e.Egress == "" {
 		e.Egress = t.egress

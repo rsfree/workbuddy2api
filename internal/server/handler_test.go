@@ -970,8 +970,38 @@ func TestChatModelForbiddenByAccountTypeReturns400(t *testing.T) {
 	}
 }
 
+// resetModelsCache 隔离包级 dynamicModelsCache：调用时清空，测试结束再清一次。
+//
+// 为什么必须有（2026-10-24 修 flaky）：缓存是**包级全局**，任何测试写入的失败
+// 负缓存（5min lastFail）或临时目录都会跨测试泄漏。此前 TestModelsEndpoint 直接
+// 用 upstream.New() 打真上游，网络不通就写负缓存，后续测试的 /v1/models 全变空
+// 列表（count=0），-shuffle 下必挂；即使网络通，也会让测试结果依赖机器环境。
+func resetModelsCache(t *testing.T) {
+	t.Helper()
+	clear := func() {
+		dynamicModelsCache.Lock()
+		dynamicModelsCache.ids = nil
+		dynamicModelsCache.fetched = time.Time{}
+		dynamicModelsCache.lastFail = time.Time{}
+		dynamicModelsCache.Unlock()
+	}
+	clear()
+	t.Cleanup(clear)
+}
+
 func TestModelsEndpoint(t *testing.T) {
-	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}), Upstream: upstream.New()})
+	// 假上游给固定目录（不再打真网络：那既 flaky 又会把失败负缓存泄漏给其他测试）。
+	resetModelsCache(t)
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		return 200, `{"code":0,"data":{"models":[` +
+			`{"id":"glm-5.2","maxInputTokens":200000,"maxOutputTokens":8192},` +
+			`{"id":"glm-5.3","maxInputTokens":200000,"maxOutputTokens":8192},` +
+			`{"id":"kimi-k2.7","maxInputTokens":200000,"maxOutputTokens":8192},` +
+			`{"id":"deepseek-v4.1-flash","maxInputTokens":200000,"maxOutputTokens":8192},` +
+			`{"id":"minimax-m3","maxInputTokens":200000,"maxOutputTokens":8192}` +
+			`]}}`, false
+	})
+	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}), Upstream: up})
 	req := httptest.NewRequest("GET", "/v1/models", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -979,14 +1009,17 @@ func TestModelsEndpoint(t *testing.T) {
 		t.Fatalf("code=%d", rec.Code)
 	}
 	var resp map[string]any
-	json.Unmarshal(rec.Body.Bytes(), &resp)
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("bad json: %v body=%s", err, rec.Body.String())
+	}
 	if resp["object"] != "list" {
 		t.Errorf("object=%v", resp["object"])
 	}
-	data := resp["data"].([]any)
-	if len(data) < 5 {
-		t.Errorf("models count=%d", len(data))
+	data, _ := resp["data"].([]any)
+	if len(data) != 5 {
+		t.Fatalf("models count=%d want 5 (body=%s)", len(data), rec.Body.String())
 	}
+	// cn 域模型统一加 "cn:" 前缀（客户端用带前缀的名字点名 CN 池）。
 	found := false
 	for _, m := range data {
 		if m.(map[string]any)["id"] == "cn:glm-5.2" {
@@ -994,17 +1027,13 @@ func TestModelsEndpoint(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Error("cn:glm-5.2 missing")
+		t.Errorf("cn:glm-5.2 missing, got %v", data)
 	}
 }
 
 func TestModelsDynamic(t *testing.T) {
-	// 清缓存
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = nil
-	dynamicModelsCache.fetched = time.Time{}
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
+	// 清缓存（并保证测试结束后不把本次目录/负缓存泄漏给后续测试）
+	resetModelsCache(t)
 
 	// 假上游返回动态模型（含 agents + maxInputTokens/maxOutputTokens + reasoning 档位）
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {

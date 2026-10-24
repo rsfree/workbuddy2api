@@ -22,3 +22,16 @@ func realmAwareAvailableForModel(p *pool.Pool) func(model string) []string {
 		return p.WeightedAvailableUIDsForModelRealm(bare, realm)
 	}
 }
+
+// realmAwareStickyUsable 构造「已绑定会话还能否继续用这个号」的 realm 感知闭包。
+//
+// 与 realmAwareAvailableForModel 的唯一差别：**不看 inFlight 在途名额**。
+// 前者回答"能不能分配一个新会话给它"（满载就不能，否则选完立刻抢不到名额），
+// 本闭包回答"已绑定的会话还能不能留在这"（满载只是临时压力，把会话搬走会让
+// 账号级上游前缀缓存全冷）。两者的分工见 session.Config.StickyUsable 的注释。
+func realmAwareStickyUsable(p *pool.Pool) func(uid, model string) bool {
+	return func(uid, model string) bool {
+		realm, bare := server.ResolveModel(model)
+		return p.StickyEligibleForModelRealm(uid, bare, realm)
+	}
+}
