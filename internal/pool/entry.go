@@ -118,6 +118,10 @@ type Status struct {
 	// ImportedAt 首次进池时间（导入时间）。旧凭证未记录时为零值（前端显示 —）；
 	// 与 LastSuccessTime 同形态（RFC3339），omitempty 让零值不出现在 JSON。
 	ImportedAt time.Time `json:"imported_at,omitempty"`
+	// ImportedAtSource ImportedAt 的来源："import" = 导入动作写入（可信，
+	// 参与新号任务静默期）；"mtime" = 文件 mtime 推断（搬机器/重写会漂移，
+	// 只作展示）；"" = 未知。
+	ImportedAtSource string `json:"imported_at_source,omitempty"`
 	// CheckinDone 本地今日已签到（签到成功或上游"今天已签到"幂等拒绝均算）。
 	// global 域账号无签到体系，恒为 false。面板签到按钮据此显示 签到/已签。
 	CheckinDone bool       `json:"checkin_done,omitempty"`

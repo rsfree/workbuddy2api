@@ -1023,6 +1023,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             </div>
             <div class="hint">周期扫描全部账号，把「进度已达标但尚未领奖」的成长任务补领掉（不含自动动作的口令任务也能领），并顺带接受未接受的任务。只发 accept / claim 两条<b>幂等</b>请求，不跑任何对话或上报行为，开销可忽略。<br>用途：真实对话点亮的任务不在自动动作白名单里，成长队列与「一键完成」都不会去领它——积分因此卡在半路上不去（#174）。</div>
             <div class="hr"></div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">新号任务静默期（天）</span>
+                <input name="new_account_grace_days" type="number" min="0" max="30" placeholder="3"></label>
+              <div class="hint">导入后前 N 天只做保号动作（签到 / 连登兑换 / Token 保活 / 余额刷新 / 任务补领），跳过旅行、活跃上报、夜猫子与成长任务——新号刚换设备或出口就跑去领养、上报、发对话最容易触发上游风控。<br>例外：积分清光（credits=0）时提前放行，让号自己回血。填 <b>0</b> 关闭；上限 30 天。<br>只认「导入动作」写入的进池时间：老号由文件时间推断的日期不参与判定，搬机器不会把整池误判成新号。</div>
+            </div>
+            <div class="hr"></div>
             <div class="switch"><span class="lb">保号任务覆盖已禁用账号</span>
               <input type="checkbox" name="include_disabled_in_tasks"></div>
             <div class="hint">禁用只关选号：打开后已禁用的账号仍会签到 / 活跃上报 / 保活 / 刷新余额（依旧不参与选号）。适合「一次只放开一个账号、用禁用做流量开关」的轮换养号用法，默认关闭。<br>若只想让<b>单个</b>账号临时退出选号但保留保号，直接用账号行的「<b>暂停选号</b>」按钮（账号级，无需打开本开关）。</div>

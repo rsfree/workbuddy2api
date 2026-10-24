@@ -296,6 +296,14 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 		if st.Disabled {
 			continue
 		}
+		// 新号任务静默期：成长队列跑的是行为链路（真实对话 + 事件上报），
+		// 与调度器 travel/activity/blackcat 同口径跳过；签到/补领不受影响。
+		if p.cfg.Scheduler != nil {
+			if muted, why := p.cfg.Scheduler.TaskMuted(st); muted {
+				p.cfg.Scheduler.NoteTaskGraceSkip(st, "growth", why)
+				continue
+			}
+		}
 		a := p.cfg.Pool.AuthByUID(st.UID)
 		if a == nil {
 			continue
@@ -411,6 +419,14 @@ func (p *Panel) runDiscoveredTasks(codes []string) {
 	for _, ps := range p.cfg.Pool.List() {
 		if ps.Disabled {
 			continue
+		}
+		// 新号任务静默期：新发现的任务同样是行为链路，与定时队列同口径跳过
+		// （待办仍会入库/展示，只是不自动执行）。
+		if p.cfg.Scheduler != nil {
+			if muted, why := p.cfg.Scheduler.TaskMuted(ps); muted {
+				p.cfg.Scheduler.NoteTaskGraceSkip(ps, "growth", why)
+				continue
+			}
 		}
 		a := p.cfg.Pool.AuthByUID(ps.UID)
 		if a == nil || a.IsGlobal() || a.IsEnterprise() || a.IsEnterpriseSession() {

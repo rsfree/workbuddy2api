@@ -111,6 +111,10 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 			FilePath:     filepath.Join(p.cfg.AuthDir, fmt.Sprintf("workbuddy-%s.json", uid)),
 		}
 
+		// 标记可信进池时间并落盘（SaveAtomic 会在顶层写 imported_at）：
+		// 调度器的新号任务静默期只认这个来源，mtime 推断值在搬机器后会漂移。
+		a.EnsureImportedAt(time.Now())
+
 		if realm == "global" {
 			if _, err := auth.BackfillRealmFor(a, "global"); err != nil {
 				skipped++

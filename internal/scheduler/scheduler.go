@@ -51,6 +51,16 @@ type Config struct {
 	// GrowthDisabled 显式关闭成长任务自动排程（schedule.growth_enabled=false）。
 	GrowthDisabled bool
 
+	// NewAccountGraceDays 新号任务静默期天数（schedule.new_account_grace_days，默认 3）。
+	//
+	// 语义：进池时间（可信来源）在 N×24h 内的账号，跳过「赚积分」类任务——旅行 /
+	// 活跃上报 / 夜猫子 / 成长队列；签到、连登兑换、token 保活、余额刷新、任务补领
+	// 照常。积分清光（credits=0 且总额已知）时提前放行，让号自己回血。<=0 关闭。
+	//
+	// 为什么只停行为类任务：新号换设备/换出口后立刻跑旅行、上报、真实对话最容易
+	// 触发上游风控，而签到动作最轻且是积分与解冻的唯一来源（见 grace.go）。
+	NewAccountGraceDays int
+
 	// IncludeDisabledInTasks 让「保号类」四任务（签到 / 活跃上报 / token 保活 / 余额刷新）
 	// 对已禁用（disabled）的账号也执行（schedule.include_disabled_in_tasks）。
 	// 缺省 false = 保持「禁用的跳过」既有语义；打开后禁用号照常签到保号，但**仍不参与
@@ -76,6 +86,9 @@ type Scheduler struct {
 	// 避免同日多趟对上游重试轰炸；进程重启即清零（无需持久化）。
 	mu         sync.Mutex
 	adoptTried map[string]string
+	// graceLogged 静默期跳过日志节流：key = uid|task → 最近打日志的自然日。
+	// 静默期内每小时都会命中，逐次打会把日志刷成噪音（与 adoptTried 同锁）。
+	graceLogged map[string]string
 
 	// schedMu 保护排程参数（时点/开关）；Reconfigure 可在运行期热改（面板保存配置时调用）。
 	// rearmSchedule/rearmBalance/rearmSweep 是「排程已变，立即重算」通知：Run 与
@@ -180,6 +193,14 @@ func (s *Scheduler) includeDisabledInTasks() bool {
 func (s *Scheduler) SetIncludeDisabledInTasks(v bool) {
 	s.schedMu.Lock()
 	s.cfg.IncludeDisabledInTasks = v
+	s.schedMu.Unlock()
+}
+
+// SetNewAccountGraceDays 热改新号任务静默期天数（面板保存配置时调用）。
+// <=0 关闭；已导入满 N 天的号自然退出静默（判定按时刻算，不靠定时器）。
+func (s *Scheduler) SetNewAccountGraceDays(days int) {
+	s.schedMu.Lock()
+	s.cfg.NewAccountGraceDays = days
 	s.schedMu.Unlock()
 }
 
@@ -549,6 +570,10 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
+			continue
+		}
+		// 新号任务静默期：活跃上报是旅行领养的前置，一起停；签到/保活不受影响。
+		if s.graceSkip(st, "activity") {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)

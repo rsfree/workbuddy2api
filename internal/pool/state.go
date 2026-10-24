@@ -586,6 +586,17 @@ func (p *Pool) List() []Status {
 	}
 	return out
 }
+// importedAtSource 把 Auth 的进池时间来源翻成对外字符串（空串 = 未知）。
+func importedAtSource(a *auth.Auth) string {
+	if a == nil || a.ImportedAtTime().IsZero() {
+		return ""
+	}
+	if a.ImportedAtExplicit() {
+		return "import"
+	}
+	return "mtime"
+}
+
 func (p *Pool) statusOf(uid string, e *entry) Status {
 	now := time.Now()
 	st := Status{
@@ -617,6 +628,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		LastSuccessTime:      e.lastSuccess,
 		LastErrTime:          e.lastErr,
 		ImportedAt:           e.a.ImportedAtTime(),
+		ImportedAtSource:     importedAtSource(e.a),
 		Until:                e.until,
 		SoftStreak:           e.softStreak,
 		ModelCosts:           p.modelCostsStatusLocked(e, now),

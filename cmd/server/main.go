@@ -219,6 +219,7 @@ func main() {
 		GrowthDisabled:     !cfg.Schedule.GrowthEnabled,
 		// 保号类四任务是否覆盖禁用账号（缺省 false = 禁用即跳过，保持既有行为）。
 		IncludeDisabledInTasks: cfg.Schedule.IncludeDisabledInTasks,
+		NewAccountGraceDays:    cfg.Schedule.NewAccountGraceDays,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -263,6 +264,12 @@ func main() {
 	}
 	if cfg.Schedule.IncludeDisabledInTasks {
 		log.Printf("保号任务覆盖禁用账号（schedule.include_disabled_in_tasks=true）：禁用号仍签到 / 活跃 / 保活 / 刷新余额，但不参与选号")
+	}
+	switch days := cfg.Schedule.NewAccountGraceDays; {
+	case days <= 0:
+		log.Printf("新号任务静默期已关闭（schedule.new_account_grace_days=%d）", days)
+	default:
+		log.Printf("新号任务静默期：导入后 %d 天内只签到/保活/刷新余额，跳过旅行 / 活跃上报 / 夜猫子 / 成长任务（积分清光则提前放行）", days)
 	}
 
 	// 管理面板日志镜像：标准 log（stderr）与 chat 表格日志（stdout）双路复制进
@@ -628,6 +635,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
+	sch.SetNewAccountGraceDays(newCfg.Schedule.NewAccountGraceDays)
 
 	return restartRequiredFields(newCfg), nil
 }

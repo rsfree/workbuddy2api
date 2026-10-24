@@ -52,6 +52,11 @@ func (s *Scheduler) RunTravelNow() {
 		if st.Disabled {
 			continue
 		}
+		// 新号任务静默期：旅行（领养/派出/领奖）是新号最"像机器人"的行为链，
+		// 导入后前 N 天跳过；签到照常（见 grace.go）。
+		if s.graceSkip(st, "travel") {
+			continue
+		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue

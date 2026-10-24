@@ -35,7 +35,8 @@
     "blackcat_enabled": true,
     "balance_refresh_enabled": true,
     "balance_refresh_minutes": 5,
-    "include_disabled_in_tasks": false
+    "include_disabled_in_tasks": false,
+    "new_account_grace_days": 3
   },
   "global": {
     "enabled": true,

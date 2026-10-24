@@ -119,6 +119,17 @@ type Config struct {
 		// 只做 accept/claim 两条幂等请求，不跑任何行为链路；分钟级开销可忽略。
 		TaskSweepEnabled bool `json:"task_sweep_enabled"` // 缺省 true；false = 关闭
 		TaskSweepMinutes int  `json:"task_sweep_minutes"` // 缺省 15；<=0 回落 15
+
+		// NewAccountGraceDays 新号任务静默期天数（缺省 3；<=0 关闭）。
+		//
+		// 进池时间在 N×24h 内的账号只做「保号」类动作（签到 / 连登兑换 / token
+		// 保活 / 余额刷新 / 任务补领），跳过行为类任务（旅行 / 活跃上报 / 夜猫子 /
+		// 成长队列）——新号刚换设备/出口就跑去领养、上报、发对话最容易被上游风控。
+		// 例外：积分清光（credits=0 且总额已知）时提前放行，让号自己回血。
+		//
+		// 只认「导入动作」写入的进池时间（auth 文件顶层 imported_at）；老凭证由
+		// 文件 mtime 推断的时间不参与判定（搬机器会集体漂移，见 auth.importedAt）。
+		NewAccountGraceDays int `json:"new_account_grace_days"`
 	} `json:"schedule"`
 
 	Global struct {
@@ -371,6 +382,8 @@ func Default() *Config {
 	c.Schedule.KeepaliveHours = []int{22}
 	c.Schedule.BlackcatHours = []int{23}
 	c.Schedule.GrowthHours = []int{1}
+	// 新号静默期缺省 3 天：显式写 0（或负数）才关闭。
+	c.Schedule.NewAccountGraceDays = 3
 	// 开关「缺省 true」靠这几行实现：Load 先取 Default() 再 json.Unmarshal 覆盖，
 	// 键缺席（或为 null）时字段原样保留 true，只有显式 false 才关。
 	c.Schedule.CheckinEnabled = true
@@ -931,7 +944,15 @@ func (c *Config) validateScheduleHours() error {
 	if err := checkHourRange("schedule.blackcat_hours", "blackcat_enabled", c.Schedule.BlackcatHours); err != nil {
 		return err
 	}
-	return checkHourRange("schedule.growth_hours", "growth_enabled", c.Schedule.GrowthHours)
+	if err := checkHourRange("schedule.growth_hours", "growth_enabled", c.Schedule.GrowthHours); err != nil {
+		return err
+	}
+	// 静默期上限 30 天：多打一个 0（300）会让整池新号任务停摆大半年，
+	// 而配置页又不会立刻报错——这种"静默生效"的错误必须挡住。
+	if c.Schedule.NewAccountGraceDays > 30 {
+		return fmt.Errorf("schedule.new_account_grace_days: %d 过大（上限 30 天；<=0 表示关闭）", c.Schedule.NewAccountGraceDays)
+	}
+	return nil
 }
 
 func checkHourRange(field, switchKey string, hours []int) error {

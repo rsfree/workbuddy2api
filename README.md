@@ -424,6 +424,7 @@ curl -s http://localhost:7863/v1/images/edits \
 | `schedule.keepalive_enabled` | `true` | token 保活总开关 |
 | `schedule.blackcat_enabled` | `true` | 夜猫子总开关 |
 | `schedule.include_disabled_in_tasks` | `false` | 让**保号类**四任务（签到 / 活跃上报 / token 保活 / 余额刷新）对**已禁用**账号也执行——「禁用」只关选号，不停保号。`false`（默认）保持「禁用的跳过」 |
+| `schedule.new_account_grace_days` | `3` | **新号任务静默期**：导入后 N 天内只做保号动作（签到 / 连登兑换 / token 保活 / 余额刷新 / 任务补领），跳过旅行、活跃上报、夜猫子、成长任务。积分清光（`credits=0` 且总额已知）时提前放行。`<=0` 关闭，上限 30 |
 | `upstream.timeout_seconds` | `120` | 短 RPC（刷新 / 签到 / 余额 / 模型列表）总时长上限 |
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
@@ -641,6 +642,21 @@ export WB2A_EGRESS_PASSWORD=<口令>
 | 猫猫旅行 | `schedule.travel_enabled` | `travel_hours` `[9, 21]` 整点 | 独立排程：无猫领养 / `idle` 派出 / `arrived` 领奖 |
 | 保活 | `schedule.keepalive_enabled` | `keepalive_hours` `[22]` 整点 | 全账号刷新 token；session 失效**连续 3 次**才自动禁用 |
 | 夜猫子 | `schedule.blackcat_enabled` | `blackcat_hours` `[23]` 整点 | **先查任务进度再决定**：`black_cat` 未达标才在 23:00–08:00 计数窗口内补足 glm-5.2 短对话（每天 1 次累计 3 天，漏跑次日窗口自动补） |
+
+#### 新号任务静默期（`schedule.new_account_grace_days`，默认 3 天）
+
+刚导入的账号在前 N 天**只做保号动作**，不做「赚积分」类任务：
+
+| | 静默期内 | 说明 |
+|---|---|---|
+| ✅ 照常 | 签到 / 连登兑换与抽奖 / token 保活 / 余额刷新 / 任务补领清扫 | 这些是每天必须的回血与保号链路，动作最轻 |
+| ⛔ 跳过 | 猫猫旅行（领养/派出/领奖）、活跃上报、夜猫子对话、成长任务队列（含「新发现任务」自动执行） | 都是行为链，新号换设备/换出口后立刻跑最容易被上游风控盯上 |
+
+**积分清光例外**：`credits=0` 且总额已知时不静默，直接放行——号没钱了既不接流量也赚不了，静默等于干耗。积分未知（`credits_total=0`，查询失败/旧 state）按「未清光」处理，保守跳过。
+
+**判定只认可信来源**：`ImportedAtSource == "import"`，即导入动作写入进池时间并落盘到 auth 文件顶层的 `imported_at` 键。老凭证没有该键时由文件 mtime 兜底，**只作面板展示、不参与判定**——`rsync/scp -p` 缺 `-p`、`git checkout`、重新落盘都会让整批文件的 mtime 塌到同一秒（2026-10-24 实例迁移实测：32 个老号的进池时间全变成同一时刻），拿它判新号会把整池老号误静默三天。
+
+手动触发类入口（面板按钮「执行全部待办」「签到」等）不受静默期限制：静默期管的是**自动**行为链，人点一下是明确意图。
 
 #### 禁用账号与保号任务（`schedule.include_disabled_in_tasks`）
 

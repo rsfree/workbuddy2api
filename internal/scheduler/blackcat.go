@@ -31,6 +31,10 @@ func (s *Scheduler) RunBlackcatNow() {
 		if st.Disabled || st.Paused {
 			continue
 		}
+		// 新号任务静默期：夜猫子是真实模型对话（最重的行为链），前 N 天不做。
+		if s.graceSkip(st, "blackcat") {
+			continue
+		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.AccessTokenValue() == "" {
 			continue

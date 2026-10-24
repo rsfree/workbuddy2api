@@ -224,6 +224,8 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		Nickname:     acct.Nickname,
 		FilePath:     filepath.Join(p.cfg.AuthDir, fmt.Sprintf("workbuddy-%s.json", acct.UID)),
 	}
+	// 登录新增 = 导入动作：标记可信进池时间（落盘后新号静默期才认得出它）。
+	a.EnsureImportedAt(time.Now())
 	// global 登录：落盘 auth.realm=global（Realm() 按此判域；不写则依赖 domain 后缀回落）。
 	if sess.realm == "global" {
 		if _, err := auth.BackfillRealmFor(a, "global"); err != nil {

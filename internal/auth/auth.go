@@ -49,12 +49,20 @@ type Auth struct {
 	// 顶层 device_token 也会被解析（与桌面端共用状态文件的部署方式）。
 	DeviceToken string
 
-	// importedAt 首次进池时间（导入时间）。来源：LoadDir 读文件 mtime；运行中经
-	// 面板导入的账号由 pool.upsertLocked 兜底填 now（文件刚写入，mtime 即导入时刻）。
-	// 只写一次（SetImportedAtIfZero），token 刷新 / SaveAtomic 均不改写 —— 语义是
+	// importedAt 首次进池时间（导入时间）。只写一次，token 刷新不改写 —— 语义是
 	// 「这个号什么时候进池」，不是「最后一次写文件」。并发纪律同 group：加载期写、
 	// 运行期只读，故不加锁。
+	//
+	// 两个来源必须区分（importedAtExplicit）：
+	//   - 显式（true）：导入动作写入，会落盘进 auth 文件的顶层 imported_at 键，
+	//     重启 / 搬机器后仍然可信 —— 新号任务静默期只认这个来源。
+	//   - 推断（false）：老文件没有该键时用文件 mtime 兜底。mtime 在 rsync/scp
+	//     -p 缺失、git checkout、重新落盘后都会集体漂移成"刚刚导入"（2026-10-24
+	//     实例迁移实测：32 个老号的 imported_at 全塌到同一秒），一旦拿它判新号，
+	//     整池老号会被误静默 3 天。故推断值只作展示，不参与门控。
 	importedAt time.Time
+	// importedAtExplicit importedAt 是否来自导入动作的可信来源（见上）。
+	importedAtExplicit bool
 }
 
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
@@ -72,8 +80,41 @@ func (a *Auth) ImportedAtTime() time.Time {
 }
 
 // SetImportedAtIfZero 仅在尚未记录时写入进池时间（幂等：启动加载 / 重复 upsert
-// 不覆盖，保证「第一次进池」语义稳定）。
+// 不覆盖，保证「第一次进池」语义稳定）。不改变来源标记。
 func (a *Auth) SetImportedAtIfZero(t time.Time) {
+	if a == nil || t.IsZero() {
+		return
+	}
+	if a.importedAt.IsZero() {
+		a.importedAt = t
+	}
+}
+
+// ImportedAtExplicit 报告 importedAt 是否来自「导入动作」的可信来源。
+// false = 未知（零值）或由文件 mtime 推断（会随搬机器/重写漂移，不可信）。
+func (a *Auth) ImportedAtExplicit() bool {
+	if a == nil {
+		return false
+	}
+	return a.importedAtExplicit
+}
+
+// EnsureImportedAt 导入动作专用：尚未记录进池时间时写入 t 并标记为可信来源。
+// 幂等：已有值的号重复导入不刷新（"第一次进池"语义不变）。
+// 与 SetImportedAtIfZero 的区别只在来源标记 —— 它就是调度器判断"新号"的依据。
+func (a *Auth) EnsureImportedAt(t time.Time) {
+	if a == nil || t.IsZero() {
+		return
+	}
+	if a.importedAt.IsZero() {
+		a.importedAt = t
+		a.importedAtExplicit = true
+	}
+}
+
+// SetImportedAtFromFile 加载期兜底：auth 文件没有显式 imported_at 键时用 mtime 推断。
+// 只写值、**不打可信标记**（见 importedAt 注释：mtime 会集体漂移）。
+func (a *Auth) SetImportedAtFromFile(t time.Time) {
 	if a == nil || t.IsZero() {
 		return
 	}
@@ -369,6 +410,9 @@ func Parse(raw []byte) (*Auth, error) {
 			} `json:"account"`
 			// DeviceToken 顶层 device_token（嵌套形与扁平形共用；手写时无需嵌进 auth 对象）。
 			DeviceToken string `json:"device_token"`
+			// ImportedAt 顶层 imported_at（RFC3339）：由导入动作写入的可信进池时间。
+			// 插件读取忽略未知键，写在顶层不影响桌面端注入。
+			ImportedAt string `json:"imported_at"`
 		}
 		if err := json.Unmarshal(raw, &n); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -385,6 +429,7 @@ func Parse(raw []byte) (*Auth, error) {
 			group:        n.Account.Group,
 			DeviceToken:  n.DeviceToken,
 		}
+		a.applyImportedAt(n.ImportedAt)
 	} else {
 		var f struct {
 			AccessToken  string `json:"accessToken"`
@@ -397,6 +442,7 @@ func Parse(raw []byte) (*Auth, error) {
 			Nickname     string `json:"nickname"`
 			Group        string `json:"group"`
 			DeviceToken  string `json:"device_token"`
+			ImportedAt   string `json:"imported_at"`
 		}
 		if err := json.Unmarshal(raw, &f); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -413,11 +459,30 @@ func Parse(raw []byte) (*Auth, error) {
 			group:        f.Group,
 			DeviceToken:  f.DeviceToken,
 		}
+		a.applyImportedAt(f.ImportedAt)
 	}
 	if strings.TrimSpace(a.AccessToken) == "" {
 		return nil, fmt.Errorf("parse_error: missing accessToken")
 	}
 	return &a, nil
+}
+
+// applyImportedAt 解析 auth 文件里的 imported_at 字符串（RFC3339/RFC3339Nano）。
+// 解析失败视为缺失（退回 mtime 推断），不让一个坏时间戳挡住整个号加载。
+func (a *Auth) applyImportedAt(s string) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return
+	}
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		t, err = time.Parse(time.RFC3339, s)
+	}
+	if err != nil || t.IsZero() {
+		return
+	}
+	a.importedAt = t
+	a.importedAtExplicit = true
 }
 
 // SaveAtomic 以嵌套形原子写回 FilePath（tmp + rename），保持嵌套形（插件可读）格式。
@@ -454,6 +519,11 @@ func (a *Auth) SaveAtomic() error {
 	}
 	if a.DeviceToken != "" {
 		doc["device_token"] = a.DeviceToken
+	}
+	// 只写可信来源的进池时间：mtime 推断值不落盘（否则一次搬运就把推断值固化成
+	// "显式导入"，静默期判定彻底失真）。
+	if a.importedAtExplicit && !a.importedAt.IsZero() {
+		doc["imported_at"] = a.importedAt.Format(time.RFC3339Nano)
 	}
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
@@ -498,9 +568,11 @@ func LoadDir(dir string) ([]*Auth, error) {
 			continue
 		}
 		a.FilePath = f
-		// 导入时间取文件 mtime：auths/ 下的文件由导入动作写入，mtime 即导入时刻。
+		// 导入时间：auth 文件里有显式 imported_at（导入动作写入）就信它；没有才用
+		// 文件 mtime 兜底，且只当展示值 —— mtime 在搬机器/重写后会集体漂移，
+		// 拿它判"新号"会把整池老号误静默（见 importedAt 注释）。
 		if fi, err := os.Stat(f); err == nil {
-			a.SetImportedAtIfZero(fi.ModTime())
+			a.SetImportedAtFromFile(fi.ModTime())
 		}
 		if prev, ok := seenUID[a.UID]; ok {
 			log.Printf("WARN: uid %s duplicated across %s and %s — 后者覆盖（不同 realm 同名 UID？）",
