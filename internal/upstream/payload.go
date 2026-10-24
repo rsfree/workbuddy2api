@@ -66,6 +66,11 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 		msgs, _ = mergeAdjacentToolCalls(msgs)
 		msgs, _ = repackToolResultBlocks(msgs)
 		msgs, _ = cleanupOrphanToolCalls(msgs)
+		// 空串 content 收尾修复（见 repairEmptyContent）：必须排在 cleanup 之后——
+		// cleanup 摘掉孤儿 tool_calls 后，一条 content:"" 的 assistant 会变成
+		// 「裸空消息」，正是上游 11151 的触发面（tool_pairing_test.go 的
+		// 「空name带结果」用例就是这条路径）。
+		msgs, _ = repairEmptyContent(msgs)
 		// 无改动时两步都返回原 slice，这里回写等于零操作；任一步重排/删除
 		// （哪怕后续步骤零改动）也必须落到 obj——不能只在「最后一步改动」时回写，
 		// 否则 repack 单独生效的结果会被原 slice 覆盖丢失。
@@ -488,4 +493,69 @@ func unescapePatternLiteralEscapes(node any) {
 			unescapePatternLiteralEscapes(v)
 		}
 	}
+}
+
+// repairEmptyContent 修掉「content 为空」的 assistant/system 消息——上游 11151
+// "a message has empty content" 的唯一触发面。
+//
+// 实测矩阵（2026-10-24，cn:kimi-k2.7 / kimi-k2.7，同 body 逐形态探测；每组探测
+// 前清 state.json 重启，避免被罚号污染后续判定）：
+//
+//	assistant + ""      + 无 tool_calls → 400 11151
+//	assistant + null    + 无 tool_calls → 400 11151
+//	assistant + 缺键    + 无 tool_calls → 400 11151
+//	system    + ""/null/缺键            → 400 11151
+//	assistant + ""/null/缺键 + 有 tool_calls → 200（tool_calls 消息的标准形状）
+//	assistant + "   "   + 无 tool_calls → 200（空白串不被判空）
+//	assistant + []      + 无 tool_calls → 200
+//	user      + ""      → 200
+//	tool      + ""/null → 200
+//
+// 判据因此不是「content 为空」，而是「assistant/system 且没有 tool_calls 时 content
+// 必须是有内容的字符串」。修法：把这三种空形态换成单空格。
+//
+// 为什么是单空格而不是删消息：
+//   - 条数与顺序零变化，依赖「第 N 条是 user/assistant」的位置语义（prefill、
+//     few-shot 交替约束、reasoning 回填）全不受影响；
+//   - 单空格对模型等价于无内容，语义不变，且实测各模型均放行；
+//   - 删除会改变对话轮次结构，prefill 场景下行为变化不可控。
+//
+// 刻意不动 tool_calls 消息的 content：null 是它的标准形状，改它反而破坏规范形态。
+//
+// 这个修复同时消掉一个隐性损失：修复前该 400 被归为 ErrClient → 罚号 + 轮转，
+// 一条坏请求连坐 MaxRotate(3) 个健康账号进软冷却；修好后请求直接成功，不再罚号。
+// 触发面只限 assistant/system、user/tool 已实测放行，故不扩大改动面。
+func repairEmptyContent(messages []any) ([]any, bool) {
+	if len(messages) == 0 {
+		return messages, false
+	}
+	changed := false
+	for _, m := range messages {
+		msg, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		// 触发面只限 assistant / system（user/tool 空 content 实测放行）。
+		// normalizeRoles 已在管线更早处执行，developer 到这里已是 system。
+		if role, _ := msg["role"].(string); role != "assistant" && role != "system" {
+			continue
+		}
+		// 带 tool_calls 的消息放行：content null 是它的标准形状，不能改。
+		if tcs, ok := msg["tool_calls"].([]any); ok && len(tcs) > 0 {
+			continue
+		}
+		switch c := msg["content"].(type) {
+		case nil:
+			// 同时覆盖「键存在但为 null」与「键缺失」（取值为 nil）。
+			msg["content"] = " "
+			changed = true
+		case string:
+			if c == "" {
+				msg["content"] = " "
+				changed = true
+			}
+		}
+		// "   "（空白串）、[]、正常文本一律不动：实测全部放行，改它们只增加风险面。
+	}
+	return messages, changed
 }
