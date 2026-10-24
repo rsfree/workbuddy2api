@@ -57,6 +57,15 @@ type Config struct {
 
 	// StickyCount 返回粘性会话绑定数；nil 时报告 0。
 	StickyCount func() int
+	// AffinityCount 返回前缀亲和注册表里的**前缀种数**；nil 时报告 0。
+	//
+	// 为什么要这个数：面板上的 affinity_hit_rate 为 0 有两种完全不同的成因——
+	//   (a) 还没有「同前缀的第二个新会话」出现（样本不够，机制没问题）；
+	//   (b) 前缀指纹不稳定（客户端把时间戳/工作目录/文件列表写进 system），
+	//       于是每次请求都是一个新前缀，永远凑不成一对。
+	// 单看命中率无法区分这两者。把「种数」和「新会话数」并排看就能：种数几乎按
+	// 1:1 跟着新会话数涨 = (b)；种数涨得慢 = (a)。
+	AffinityCount func() int
 
 	// Usage 逐请求用量记录器（nil = 用量接口返回 501）。
 	Usage *usage.Recorder
@@ -296,6 +305,10 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.StickyCount != nil {
 		sticky = p.cfg.StickyCount()
 	}
+	affinityPrefixes := 0
+	if p.cfg.AffinityCount != nil {
+		affinityPrefixes = p.cfg.AffinityCount()
+	}
 	// accounts 只取一次快照：概览与「可剔除的封禁号」计数必须来自同一时刻。
 	// 各自 List() 一次会在两次读锁之间被新到的 11140 插队，出现「已禁用 5 / 可剔除 6」
 	// 这种自相矛盾的展示。计数口径与 Pool.Banned 一致（同用 IsUpstreamBannedReason）。
@@ -332,10 +345,14 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"auth_required":   p.apiKey() != "",
 		"redis_mode":      p.cfg.RedisMode,
 		"sticky_sessions": sticky,
-		"total":           total,
-		"healthy":         healthy,
-		"cooling":         cooling,
-		"disabled":        disabled,
+		// 前缀亲和的「前缀种数」。与 cache.affinity_new（累计新建次数）并排读：
+		// 种数≈新建次数 → 前缀在漂移（每次都是新指纹）；种数涨得慢 → 只是还没凑到
+		// 同前缀的第二个会话。详见 Config.AffinityCount 注释。
+		"affinity_prefixes": affinityPrefixes,
+		"total":             total,
+		"healthy":           healthy,
+		"cooling":           cooling,
+		"disabled":          disabled,
 		// banned 是 disabled 的子集：其中因上游 11140 等硬处置封停、面板可一键剔除的。
 		// 前端据此禁用/标注「剔除封禁号」按钮；两类分开是因为人工禁用与 14017
 		// 试用未激活都还能救，混在一起剔会误伤。

@@ -141,6 +141,13 @@ func main() {
 		}
 		return 0
 	}
+	// 前缀亲和注册表的种数（诊断「前缀指纹是否稳定」用，见 panel.Config.AffinityCount）。
+	sessAffinityCount := func() int {
+		if sessRouter != nil {
+			return sessRouter.AffinityCount()
+		}
+		return 0
+	}
 
 	up := upstream.New()
 
@@ -334,17 +341,18 @@ func main() {
 	log.Printf("[credithist] 积分历史已启用: %s", stateSibling(cfg.StateFile, "credit-history.json"))
 
 	pn := panel.New(panel.Config{
-		Pool:        p,
-		Usage:       rec,
-		RequestLog:  requestLog,
-		Upstream:    up,
-		Scheduler:   sch,
-		AuthDir:     cfg.AuthDir,
-		APIKey:      cfg.APIKey,
-		RedisMode:   redisMode,
-		StickyCount: sessCount,
-		Version:     appVersion,
-		Live:        live,
+		Pool:          p,
+		Usage:         rec,
+		RequestLog:    requestLog,
+		Upstream:      up,
+		Scheduler:     sch,
+		AuthDir:       cfg.AuthDir,
+		APIKey:        cfg.APIKey,
+		RedisMode:     redisMode,
+		StickyCount:   sessCount,
+		AffinityCount: sessAffinityCount,
+		Version:       appVersion,
+		Live:          live,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),

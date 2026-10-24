@@ -595,10 +595,15 @@ async function loadOverview(quiet) {
     if ($('sAffinityHit')) {
       const den = (cm.affinity_hit || 0) + (cm.affinity_miss || 0) + (cm.affinity_new || 0);
       $('sAffinityHit').textContent = den ? cm.affinity_hit_rate + '%' : '-';
+      // 附上前缀种数：命中率为 0 时，种数≈新建次数说明前缀在漂移（客户端 system 里
+      // 有会变的内容），种数涨得慢只是还没凑到同前缀的第二个会话。两者都叫 0%，
+      // 但一个要改指纹口径、一个什么都不用做。
+      const np = d.affinity_prefixes || 0;
       $('sAffinityHit').parentNode.title = den
         ? '同前缀命中 ' + (cm.affinity_hit || 0) + ' · 满载被带离 ' + (cm.affinity_miss || 0) +
-          ' · 新建落点 ' + (cm.affinity_new || 0) + '（只统计会话尚无绑定的请求）'
-        : '还没有需要分配落点的新会话';
+          ' · 新建落点 ' + (cm.affinity_new || 0) + '（只统计会话尚无绑定的请求）\n' +
+          '已注册前缀 ' + np + ' 种：接近新建次数说明前缀在漂移，远小于则只是样本还没重复'
+        : '还没有需要分配落点的新会话（已注册前缀 ' + np + ' 种）';
     }
     $('navSub').textContent = 'v' + d.version;
     $('navVer').textContent = 'v' + d.version;
