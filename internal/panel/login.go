@@ -240,6 +240,8 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "save auth: "+err.Error())
 		return
 	}
+	// 进池前先判新号：Add 之后再查就恒为「已存在」，自动清任务会永远不触发。
+	isNewAccount := p.cfg.Pool.AuthByUID(acct.UID) == nil
 	p.cfg.Pool.Add(a)
 	p.cfg.Pool.Revive(acct.UID) // 全新登录 = 人工恢复口径：清掉旧号遗留的禁用/冷却/熔断
 
@@ -278,6 +280,12 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		p.cfg.Pool.ReenableIfCredits(acct.UID, rm, tt)
 	}
 
+	// 授权登录成功 = 触发点（onboard.go）：新号在进池这一刻就开始清成长任务，
+	// 不再依赖「有人把它导入面板」——面板自身的登录流程本来就不走 import/cockpit。
+	// 只对新号触发：老号重登只是刷凭证，任务幂等重跑无新增收益，只白耗真实对话。
+	// 单 worker 串行异步执行（单号实测 ~124s），不阻塞本次登录响应。
+	onboardQueued := p.onboardOnLogin(a, isNewAccount, sess.realm)
+
 	p.loginMu.Lock()
 	delete(p.logins, state)
 	p.loginMu.Unlock()
@@ -297,6 +305,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		"credits":         remain,
 		"credits_total":   total,
 		"checkin_message": checkinMsg,
+		"onboard_queued":  onboardQueued,
 	})
 }
 

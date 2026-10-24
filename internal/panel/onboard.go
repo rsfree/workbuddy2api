@@ -14,16 +14,23 @@ import (
 
 // onboard.go 授权登录新账号「自动清空成长任务」。
 //
-// 触发链路：
+// 触发链路（两个入口，都只认「新号」）：
 //
-//	POST /panel/api/import/cockpit?onboard=auto|1|0（缺省 **off**）
+//	① 授权登录成功（主入口，面板自带 OAuth，账号直接进池、不经导入）：
+//	   POST /panel/api/login/start → 浏览器授权 → GET /panel/api/login/poll
+//	   → loginPoll 内先判 isNewAccount（Add 之前查）→ p.onboardOnLogin 立即入队
+//	② 批量导入（显式声明意图才可能触发）：
+//	   POST /panel/api/import/cockpit?onboard=auto|1|0（缺省 **off**）
 //	  → 导入成功且新账号数满足条件 → p.enqueueOnboard
 //	  → 单 worker 串行：基线余额 → runAutoAll（批量接受 + 全动作表 + 达标补领）
 //	    → 补一轮 accept/claim → 终值余额
 //	  → GET /panel/api/onboard 查看每号 before/after/增量
 //
-// 为什么 auto 只认「本次恰好 1 个新账号」：授权链接登录（`./login url` → 浏览器授权
-// → `./login poll`）天然是单账号导入；批量导入（csv/多文件）一次几十个号，每个号的
+// 为什么登录入口不需要这种「数量」判据：login/poll 一次只处理一个 state = 一个账号，
+// 天然不可能被批量绕过，所以登录路径无条件对新号触发。
+//
+// 为什么导入入口的 auto 只认「本次恰好 1 个新账号」：授权链接登录（`./login url` → 浏览器授权
+// → `./login poll`）在旧链路里要靠脚本导入面板，天然是单账号；批量导入（csv/多文件）一次几十个号，每个号的
 // 全量动作都含真实对话，自动跑会成倍消耗上游配额。用户 2026-10-24 明确：只对
 // 「登录授权链接」进来的账号自动做任务，批量导入不跑。批量也要跑时显式传 onboard=1。
 //
@@ -121,6 +128,18 @@ func (p *Panel) enqueueOnboard(list []*auth.Auth, reason string) {
 	for _, a := range list {
 		p.onboardCh <- onboardJob{a: a, reason: reason}
 	}
+}
+
+// onboardOnLogin 授权登录成功后的触发判定：只有新号入队，返回是否已入队。
+// 独立成函数是为了让 loginPoll 的接线可被单测覆盖 —— loginPoll 本体要打真实上游
+// 端点（auth/token、login/account），无法在单测里跑完整流程。
+func (p *Panel) onboardOnLogin(a *auth.Auth, isNew bool, realm string) bool {
+	if a == nil || !isNew {
+		return false
+	}
+	p.enqueueOnboard([]*auth.Auth{a}, "login:poll:"+realm)
+	log.Printf("panel: onboard 入队（授权登录新号）uid=%s realm=%s", a.UID, realm)
+	return true
 }
 
 // onboardWorker 串行消费队列（单 goroutine = 串行，天然节流）。

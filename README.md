@@ -944,7 +944,7 @@ http://127.0.0.1:7863/panel/
 
 账号运维操作均落到池既有入口（`Revive`/`Disable`/`Remove` 等），与 `/status` 观测口径一致。
 
-**导入即自动清任务**：`POST import/cockpit` 的 `onboard` 参数控制「新号进池后是否自动把成长任务做完并领奖」（`internal/panel/onboard.go`）。取值 `auto` 时只在**本次恰好导入 1 个新账号**时触发——这正好是 `login/start` → 浏览器授权 → `login/poll` 那条授权链接登录的形态；`1` 强制全部新号、`0` 关闭。**缺省是 `0`（关闭）**，原因见下：导入端为并发按账号拆单请求，批量 20 个号会变成 20 个「只含 1 个新号」的请求，服务端无法凭请求形态区分授权登录与批量的某一条，任何 `auto` 缺省都会被拆单绕过，一次批量就把全部号的行为动作（每条含真实对话）跑一遍。因此由客户端显式声明：`import_accounts.py` 在待导入恰好 1 个账号时自动带 `auto`，多个时带 `0`（`--onboard` 可覆盖）。触发后由单 worker 串行执行：`余额基线 → 全部任务动作（含批量接受与达标补领）→ 补一轮 accept/claim → 终值余额`，异步执行不阻塞导入响应（`auto_all` 单号实测约 124s），结果通过 `GET onboard` 查询。企业版/绑定租户、global 账号自动跳过（无个人成长体系）。
+**新号进池即自动清任务**：账号以任何方式**新进池**后，服务端自动把成长任务做完并领奖（`internal/panel/onboard.go`）。**主入口是授权登录本身**——`login/start` → 浏览器授权 → `login/poll` 这条链路账号直接进池、不经过导入，`loginPoll` 在 `Pool.Add` 之前判定是否新号，新号立即入队（响应里 `onboard_queued=true`），老号重登只刷凭证不触发。批量导入走的是另一条入口：`POST import/cockpit` 的 `onboard` 参数控制是否触发。取值 `auto` 时只在**本次恰好导入 1 个新账号**时触发——这正好是 `login/start` → 浏览器授权 → `login/poll` 那条授权链接登录的形态；`1` 强制全部新号、`0` 关闭。**缺省是 `0`（关闭）**，原因见下：导入端为并发按账号拆单请求，批量 20 个号会变成 20 个「只含 1 个新号」的请求，服务端无法凭请求形态区分授权登录与批量的某一条，任何 `auto` 缺省都会被拆单绕过，一次批量就把全部号的行为动作（每条含真实对话）跑一遍。因此由客户端显式声明：`import_accounts.py` 在待导入恰好 1 个账号时自动带 `auto`，多个时带 `0`（`--onboard` 可覆盖）。触发后由单 worker 串行执行：`余额基线 → 全部任务动作（含批量接受与达标补领）→ 补一轮 accept/claim → 终值余额`，异步执行不阻塞导入响应（`auto_all` 单号实测约 124s），结果通过 `GET onboard` 查询。企业版/绑定租户、global 账号自动跳过（无个人成长体系）。
 
 **安全响应头**：面板页面与全部 `/panel/api/*` 响应统一带 `Content-Security-Policy`（`default-src 'none'`，脚本仅同源，`frame-ancestors 'none'` 禁嵌套）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer` 等；前端脚本独立为同源 `app.js`，不含内联脚本与内联事件处理器。
 

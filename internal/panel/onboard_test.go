@@ -350,3 +350,67 @@ func TestImportForceOnboardBatch(t *testing.T) {
 		t.Fatalf("执行次数=%d want 3", calls.Load())
 	}
 }
+
+// TestOnboardOnLoginQueuesNewAccount 授权登录成功（新号）→ 立即入队执行。
+// 这是面板 login/start → 浏览器授权 → login/poll 链路的触发点：账号直接进池，
+// 全程不经过 import/cockpit，所以触发必须挂在这里而不是导入接口上。
+func TestOnboardOnLoginQueuesNewAccount(t *testing.T) {
+	p := &Panel{}
+	ran := make(chan string, 1)
+	p.onboardRun = func(_ *Panel, a *auth.Auth) (int, int64, int64, error) {
+		ran <- a.UID
+		return 20, 1947, 4147, nil
+	}
+
+	if ok := p.onboardOnLogin(&auth.Auth{UID: "login-new", Nickname: "n"}, true, "cn"); !ok {
+		t.Fatal("新号登录应触发自动清任务")
+	}
+	select {
+	case uid := <-ran:
+		if uid != "login-new" {
+			t.Fatalf("onboard 跑的是 %s", uid)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("登录成功后 onboard 未执行")
+	}
+	recs := waitOnboard(t, p, 1)
+	if recs[0].Reason != "login:poll:cn" {
+		t.Errorf("reason=%q want login:poll:cn", recs[0].Reason)
+	}
+	if recs[0].Status != "done" || recs[0].Delta != 2200 {
+		t.Errorf("留痕错误: %+v", recs[0])
+	}
+}
+
+// TestOnboardOnLoginSkipsExisting 老号重登（只是刷凭证）不触发：
+// 任务幂等重跑无新增收益，只白耗真实对话。
+func TestOnboardOnLoginSkipsExisting(t *testing.T) {
+	p := &Panel{}
+	var calls atomic.Int32
+	p.onboardRun = func(_ *Panel, _ *auth.Auth) (int, int64, int64, error) {
+		calls.Add(1)
+		return 0, 0, 0, nil
+	}
+
+	if ok := p.onboardOnLogin(&auth.Auth{UID: "login-old"}, false, "cn"); ok {
+		t.Fatal("老号重登不应触发")
+	}
+	time.Sleep(80 * time.Millisecond)
+	if calls.Load() != 0 {
+		t.Fatalf("不应执行 onboard，实际跑了 %d 次", calls.Load())
+	}
+	p.onboardMu.Lock()
+	n := len(p.onboardLog)
+	p.onboardMu.Unlock()
+	if n != 0 {
+		t.Fatalf("不应有留痕，实际 %d 条", n)
+	}
+}
+
+// TestOnboardOnLoginNilAuth 空凭证兜底：不 panic、不入队。
+func TestOnboardOnLoginNilAuth(t *testing.T) {
+	p := &Panel{}
+	if ok := p.onboardOnLogin(nil, true, "cn"); ok {
+		t.Fatal("nil 凭证不应入队")
+	}
+}
