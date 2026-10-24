@@ -19,10 +19,13 @@ import (
 // TestParseOnboardMode 参数归一化：缺省 auto、假值关闭、真值强制、乱填回落 auto。
 func TestParseOnboardMode(t *testing.T) {
 	cases := map[string]string{
-		"":        onboardModeAuto,
+		// 缺省与非法值一律 off：批量导入按账号拆单请求，缺省 auto 会被拆单绕成"每次都只进 1 个新号"。
+		"":        onboardModeOff,
+		"  ":      onboardModeOff,
+		"garbage": onboardModeOff,
 		"auto":    onboardModeAuto,
 		"AUTO":    onboardModeAuto,
-		"  ":      onboardModeAuto,
+		"default": onboardModeAuto,
 		"1":       onboardModeForce,
 		"true":    onboardModeForce,
 		"on":      onboardModeForce,
@@ -31,7 +34,6 @@ func TestParseOnboardMode(t *testing.T) {
 		"false":   onboardModeOff,
 		"off":     onboardModeOff,
 		"no":      onboardModeOff,
-		"garbage": onboardModeAuto,
 	}
 	for in, want := range cases {
 		if got := parseOnboardMode(in); got != want {
@@ -243,7 +245,7 @@ func cockpitBody(t *testing.T, uids ...string) (*bytes.Buffer, string) {
 }
 
 // TestImportAutoTriggersOnboardForSingleNewAccount 授权链接登录的形态：
-// 单账号导入 → 响应 onboard_queued=1 → 队列跑完留痕。
+// 单账号导入 + 显式 onboard=auto → 响应 onboard_queued=1 → 队列跑完留痕。
 func TestImportAutoTriggersOnboardForSingleNewAccount(t *testing.T) {
 	p := importPanel(t)
 	ran := make(chan string, 4)
@@ -253,7 +255,7 @@ func TestImportAutoTriggersOnboardForSingleNewAccount(t *testing.T) {
 	}
 
 	body, ct := cockpitBody(t, "uid-single")
-	req := httptest.NewRequest(http.MethodPost, "/panel/api/import/cockpit", body)
+	req := httptest.NewRequest(http.MethodPost, "/panel/api/import/cockpit?onboard=auto", body)
 	req.Header.Set("Content-Type", ct)
 	rec := httptest.NewRecorder()
 	p.importCockpit(rec, req)
@@ -282,15 +284,17 @@ func TestImportAutoTriggersOnboardForSingleNewAccount(t *testing.T) {
 	}
 }
 
-// TestImportAutoSkipsBatch 批量导入（多个新号）默认不触发，onboard=0 单号也不触发。
+// TestImportAutoSkipsBatch 不该触发的三种形态：批量（即使显式 auto，多号判据不满足）、
+// 单号但显式关闭、**单号裸请求（缺省 off，安全侧）**。
 func TestImportAutoSkipsBatch(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		query string
 		uids  []string
 	}{
-		{"batch-auto", "", []string{"uid-a", "uid-b"}},
+		{"batch-auto", "?onboard=auto", []string{"uid-a", "uid-b"}},
 		{"single-off", "?onboard=0", []string{"uid-c"}},
+		{"single-no-param", "", []string{"uid-d"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := importPanel(t)

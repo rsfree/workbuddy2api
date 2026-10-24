@@ -16,7 +16,7 @@ import (
 //
 // 触发链路：
 //
-//	POST /panel/api/import/cockpit?onboard=auto|1|0（缺省 auto）
+//	POST /panel/api/import/cockpit?onboard=auto|1|0（缺省 **off**）
 //	  → 导入成功且新账号数满足条件 → p.enqueueOnboard
 //	  → 单 worker 串行：基线余额 → runAutoAll（批量接受 + 全动作表 + 达标补领）
 //	    → 补一轮 accept/claim → 终值余额
@@ -26,6 +26,12 @@ import (
 // → `./login poll`）天然是单账号导入；批量导入（csv/多文件）一次几十个号，每个号的
 // 全量动作都含真实对话，自动跑会成倍消耗上游配额。用户 2026-10-24 明确：只对
 // 「登录授权链接」进来的账号自动做任务，批量导入不跑。批量也要跑时显式传 onboard=1。
+//
+// 为什么缺省是 off 而不是 auto：导入脚本（`import_accounts.py`）为了并发**按账号拆
+// 单请求**，批量 20 个号 = 20 个独立请求，服务端每次都只看到「1 个新账号」——auto
+// 判据会被拆单绕过，一次批量就能把 20 个号的全量动作全跑一遍。所以必须由客户端
+// 显式声明意图：授权登录的单号导入传 `onboard=auto`，批量导入传 `onboard=0`（脚本
+// 已按待导入数量自动选择）。缺省 off 让任何「忘了声明」的调用都退回安全侧。
 //
 // 与既有链路的关系：`auto_all` 负责「把 0 进度任务做出来」，`tasksweep` 只做
 // 「accept 未接受 + claim 已达标未领」。本文件把前者串成导入后的自动步骤，并额外
@@ -38,7 +44,7 @@ const onboardMaxRecords = 100
 const (
 	onboardModeAuto  = "auto"  // 仅本次恰好 1 个新账号时触发（授权链接登录的形态）
 	onboardModeForce = "force" // 无论几个新账号都触发
-	onboardModeOff   = "off"   // 关闭
+	onboardModeOff   = "off"   // 关闭（缺省：防批量拆单请求误触发）
 )
 
 // onboardRecord 单个账号的自动清任务留痕（GET /panel/api/onboard 返回）。
@@ -74,17 +80,16 @@ var (
 	errOnboardGlobal     = errors.New("global 账号无 CN 成长体系")
 )
 
-// parseOnboardMode 归一化 onboard 参数：缺省 auto；0/false/off 关闭；1/true/force 强制。
+// parseOnboardMode 归一化 onboard 参数：auto 走单号判据；1/true/force 强制；
+// 其余（含缺省、非法值、0/false/off）一律关闭——安全默认见文件头「为什么缺省是 off」。
 func parseOnboardMode(raw string) string {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "", "auto", "default":
+	case "auto", "default":
 		return onboardModeAuto
-	case "0", "false", "off", "no", "disable":
-		return onboardModeOff
 	case "1", "true", "on", "yes", "force", "all":
 		return onboardModeForce
 	default:
-		return onboardModeAuto
+		return onboardModeOff
 	}
 }
 

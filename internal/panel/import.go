@@ -41,8 +41,9 @@ type cockpitAccount struct {
 //	Body: file=<json>
 //
 // onboard 控制「新账号导入后是否自动跑完全部成长任务并领奖」（详见 onboard.go）：
-// 缺省 auto = 本次恰好进 1 个新账号时触发（授权链接登录的形态），批量导入不动；
-// 1/true = 新账号全部触发；0/false = 关闭。
+// auto = 本次恰好进 1 个新账号时触发（授权链接登录的形态）；1/true = 新账号全部触发；
+// 缺省及 0/false = 关闭。缺省必须是关闭——导入脚本按账号拆单请求，缺省 auto 会被
+// 批量导入的拆单绕成「每次都只进 1 个新号」，等于批量全跑，白烧上游对话配额。
 //
 // 返回 {ok, total, imported, skipped, errors, onboard_queued}。
 func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {

@@ -939,12 +939,12 @@ http://127.0.0.1:7863/panel/
 | 补偿 | `GET compensation`（逐号查补偿状态，**只读**）；`POST accounts/{uid}/compensation`（单号领）；`POST compensation_all`（全量领，返回 `summary{claimed,skipped,errored,credit}`——**先看 `errored` 再看 `claimed`**，否则会把「全部查询失败」说成「没有待领补偿」） |
 | 任务 | `GET accounts/{uid}/tasks`；`POST accounts/{uid}/tasks/accept` · `accept_all` · `claim` · `auto` · `auto_all`；`POST tasks/scan_all` · `tasks/run_queue` |
 | 自动清任务 | `GET onboard?limit=N`：导入后自动跑完全部成长任务并领奖的留痕（每号 `credits_before`/`credits_after`/`delta`/`claimed`/`status`） |
-| 添加账号 | `POST login/start` · `GET login/poll` · `GET login/regions` · `POST import/cockpit?onboard=auto\|1\|0` |
+| 添加账号 | `POST login/start` · `GET login/poll` · `GET login/regions` · `POST import/cockpit?onboard=auto\|1\|0`（缺省 `0`） |
 | 写入 | `POST config`（校验 → 落盘 → 热应用，返回需重启字段清单）· `POST usage/save`（立即把内存用量落盘） |
 
 账号运维操作均落到池既有入口（`Revive`/`Disable`/`Remove` 等），与 `/status` 观测口径一致。
 
-**导入即自动清任务**：`POST import/cockpit` 的 `onboard` 参数控制「新号进池后是否自动把成长任务做完并领奖」（`internal/panel/onboard.go`）。缺省 `auto` 只在**本次恰好导入 1 个新账号**时触发——这正好是 `login/start` → 浏览器授权 → `login/poll` 那条授权链接登录的形态；批量导入（csv/多文件，一次几十个号）默认不触发，避免每个号的全量动作（含真实对话）成倍消耗配额。需要批量也跑时传 `onboard=1`，要关传 `onboard=0`。触发后由单 worker 串行执行：`余额基线 → 全部任务动作（含批量接受与达标补领）→ 补一轮 accept/claim → 终值余额`，异步执行不阻塞导入响应（`auto_all` 单号实测约 124s），结果通过 `GET onboard` 查询。企业版/绑定租户、global 账号自动跳过（无个人成长体系）。
+**导入即自动清任务**：`POST import/cockpit` 的 `onboard` 参数控制「新号进池后是否自动把成长任务做完并领奖」（`internal/panel/onboard.go`）。取值 `auto` 时只在**本次恰好导入 1 个新账号**时触发——这正好是 `login/start` → 浏览器授权 → `login/poll` 那条授权链接登录的形态；`1` 强制全部新号、`0` 关闭。**缺省是 `0`（关闭）**，原因见下：导入端为并发按账号拆单请求，批量 20 个号会变成 20 个「只含 1 个新号」的请求，服务端无法凭请求形态区分授权登录与批量的某一条，任何 `auto` 缺省都会被拆单绕过，一次批量就把全部号的行为动作（每条含真实对话）跑一遍。因此由客户端显式声明：`import_accounts.py` 在待导入恰好 1 个账号时自动带 `auto`，多个时带 `0`（`--onboard` 可覆盖）。触发后由单 worker 串行执行：`余额基线 → 全部任务动作（含批量接受与达标补领）→ 补一轮 accept/claim → 终值余额`，异步执行不阻塞导入响应（`auto_all` 单号实测约 124s），结果通过 `GET onboard` 查询。企业版/绑定租户、global 账号自动跳过（无个人成长体系）。
 
 **安全响应头**：面板页面与全部 `/panel/api/*` 响应统一带 `Content-Security-Policy`（`default-src 'none'`，脚本仅同源，`frame-ancestors 'none'` 禁嵌套）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer` 等；前端脚本独立为同源 `app.js`，不含内联脚本与内联事件处理器。
 
