@@ -165,11 +165,12 @@ button.xs { padding: 3.5px 9px; font-size: 12.5px; border-radius: 6px; white-spa
    header 里若不收窄会把同行 note 挤到换行——收成内容宽并压小外观，与 button.xs 同款。 */
 select.xs { width: auto; padding: 3.5px 9px; font-size: 12.5px; border-radius: 6px; }
 button.icon { padding: 7px 9px; }
-input, select {
+input, select, textarea {
   font: inherit; color: var(--ink); background: var(--surface-2);
   border: 1px solid var(--line); border-radius: 7px; padding: 7px 11px; width: 100%;
 }
-input:focus, select:focus { outline: none; border-color: var(--accent); }
+textarea { resize: vertical; min-height: 150px; font: 12px/1.55 var(--mono); }
+input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
 input.invalid { border-color: var(--bad); background: var(--bad-soft); }
 input.invalid:focus { border-color: var(--bad); }
 input[type=checkbox] { width: auto; accent-color: var(--accent); }
@@ -817,6 +818,14 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <option value="cn">国内版 CN</option>
             <option value="global">国际版 Global</option>
           </select>
+          <select id="mdType" aria-label="按调用类型筛选">
+            <option value="">全部类型</option>
+            <option value="chat">聊天模型</option>
+            <option value="image">图片生成</option>
+            <option value="video">视频生成</option>
+            <option value="search">联网搜索</option>
+            <option value="fetch">网页抓取</option>
+          </select>
           <select id="mdCap" aria-label="按能力筛选">
             <option value="">全部能力</option>
             <option value="tool">支持工具调用</option>
@@ -852,9 +861,29 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </div>
         <div class="tbl-wrap">
         <table class="acc md">
-          <thead><tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th><th>默认档</th><th>支持的思考档位</th><th>上下文长度</th><th>最大输出</th></tr></thead>
+          <thead><tr><th class="mark" aria-hidden="true"></th><th>模型 / 功能</th><th>积分倍率</th><th>默认档</th><th>支持的思考档位</th><th>上下文长度</th><th>最大输出</th><th>调试</th></tr></thead>
           <tbody id="mdBody"></tbody>
         </table>
+        </div>
+      </div>
+      <div class="box" id="mdDebugBox" hidden>
+        <header>
+          <h3>在线调用调试 <span class="hint" id="mdDebugTitle"></span></h3>
+          <span class="grow"></span>
+          <span class="note" id="mdDebugEndpoint"></span>
+          <button class="xs ghost" id="mdDebugClose">关闭</button>
+        </header>
+        <div class="pad">
+          <div class="hint" style="margin-bottom:10px">请求体可直接修改。点击发送会产生真实上游调用并可能消耗积分；不会自动重试，视频提交后需手动查询任务。</div>
+          <label class="fld"><span class="lb">请求 JSON</span><textarea id="mdDebugPayload" spellcheck="false"></textarea></label>
+          <div style="display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap">
+            <button class="primary" id="mdDebugSend">发送真实请求</button>
+            <button id="mdDebugPoll" hidden>查询视频任务</button>
+            <button class="ghost" id="mdDebugCurl">复制 cURL</button>
+            <span class="note" id="mdDebugStatus"></span>
+          </div>
+          <pre id="mdDebugResult" style="margin-top:12px;max-height:520px;overflow:auto"></pre>
+          <div id="mdDebugMedia"></div>
         </div>
       </div>
     </section>

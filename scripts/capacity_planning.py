@@ -206,6 +206,44 @@ def traffic_summary(events, since, now):
     }
 
 
+def credit_expiry_batches(accounts, now):
+    batches = []
+    for account in accounts:
+        if account.get("disabled") or account.get("paused"):
+            continue
+        buckets = account.get("credits_expiry_buckets", []) or []
+        if not buckets:
+            expires = parse_time(account.get("credits_earliest_expiry"))
+            remain = max(0, int(account.get("credits_earliest_remaining", 0) or 0))
+            if expires is not None and expires > now and remain > 0:
+                batches.append((expires, remain))
+            continue
+        for bucket in buckets:
+            expires = parse_time(bucket.get("expires_at"))
+            remain = max(0, int(bucket.get("remain", 0) or 0))
+            if expires is not None and expires > now and remain > 0:
+                batches.append((expires, remain))
+    return sorted(batches, key=lambda row: row[0])
+
+
+def credits_expiring_within(accounts, now, days):
+    cutoff = now + days * DAY
+    return sum(remain for expires, remain in credit_expiry_batches(accounts, now)
+               if expires <= cutoff)
+
+
+def runway_with_expiry(accounts, now, remaining, net_burn):
+    balance, elapsed = float(remaining), 0.0
+    for expires, remain in credit_expiry_batches(accounts, now):
+        days = max(0, (expires - now).total_seconds() / 86400 - elapsed)
+        if balance / net_burn <= days:
+            return elapsed + balance / net_burn
+        balance -= days * net_burn
+        balance -= min(balance, remain)
+        elapsed += days
+    return elapsed + balance / net_burn
+
+
 def account_state(accounts, now, max_in_flight):
     enabled = []
     for account in accounts:
@@ -224,16 +262,6 @@ def account_state(accounts, now, max_in_flight):
     totals = [int(a.get("credits_total", 0) or 0) for a in enabled
               if int(a.get("credits_total", 0) or 0) > 0]
     unit = percentile(totals, 0.25)
-    expiry = collections.Counter()
-    for account in enabled:
-        for bucket in account.get("credits_expiry_buckets", []) or []:
-            expires = parse_time(bucket.get("expires_at"))
-            remain = max(0, int(bucket.get("remain", 0) or 0))
-            if expires is None or expires <= now:
-                continue
-            for days in (1, 3, 7, 30):
-                if expires <= now + days * DAY:
-                    expiry[str(days)] += remain
     return {
         "accounts_total": len(accounts),
         "accounts_enabled": len(enabled),
@@ -244,7 +272,8 @@ def account_state(accounts, now, max_in_flight):
         "credits_total_observed": sum(totals),
         "new_account_credit_unit_p25": rounded(unit, 0),
         "new_account_credit_unit_median": rounded(statistics.median(totals) if totals else 0, 0),
-        "credits_expiring": {key: expiry[key] for key in ("1", "3", "7", "30")},
+        "credits_expiring": {str(days): credits_expiring_within(accounts, now, days)
+                             for days in (1, 3, 7, 30)},
         "max_in_flight_per_account": max_in_flight,
         "in_flight_pool_limit_estimate": available * max_in_flight if max_in_flight > 0 else None,
     }
@@ -259,6 +288,26 @@ def credit_replenishment(entries, since, now):
     times = [stamp for stamp in times if stamp is not None]
     coverage = min((now - min(times)).total_seconds() / 3600, 24) if times else 0
     return observed, coverage
+
+
+def observed_credit_burn(window):
+    requests = window["account_attempts"]
+    samples = window["credit_samples"]
+    if requests == 0:
+        return 0.0, 100.0, window["credits"] == 0
+    if samples <= 0:
+        return 0.0, 0.0, False
+    coverage = min(100.0, 100 * samples / requests)
+    return window["credits"] * requests / samples, coverage, True
+
+
+def daily_credit_burn(last, previous):
+    last_burn, last_coverage, last_ok = observed_credit_burn(last)
+    previous_burn, previous_coverage, previous_ok = observed_credit_burn(previous)
+    if last["account_attempts"] + previous["account_attempts"] == 0 or not last_ok or not previous_ok:
+        return 0.0, 0.0, False
+    coverage = min(last_coverage, previous_coverage)
+    return max(last_burn, 0.7 * last_burn + 0.3 * previous_burn), coverage, True
 
 
 def scenario(days, daily_burn, remaining, replenishment, unit, expiry, headroom=0.20):
@@ -311,8 +360,7 @@ def analyze(data_dir, forecast_days=7, recent_hours=24, max_in_flight=None, now=
     # A recency-weighted trend is the lower bound; the latest complete rolling day is
     # the capacity-planning baseline. This avoids extrapolating a short-lived spike
     # while refusing to under-provision during rapid growth.
-    weighted_burn = 0.7 * last["credits"] + 0.3 * previous["credits"]
-    daily_burn = max(last["credits"], weighted_burn)
+    daily_burn, credit_sample_coverage, forecast_available = daily_credit_burn(last, previous)
     daily_requests = max(last["account_attempts"],
                          0.7 * last["account_attempts"] + 0.3 * previous["account_attempts"])
     replenishment, credit_coverage = credit_replenishment(entries, now - DAY, now)
@@ -327,10 +375,9 @@ def analyze(data_dir, forecast_days=7, recent_hours=24, max_in_flight=None, now=
         row["recent_6h_requests"] = recent["requests"] if recent else 0
         row["recent_6h_success_rate"] = recent["success_rate"] if recent else None
 
-    expiry_by_days = pool["credits_expiring"]
     horizons = {}
     for days in sorted(set((1, 3, forecast_days))):
-        expiry = expiry_by_days.get(str(days), expiry_by_days["30"] if days > 7 else 0)
+        expiry = credits_expiring_within(accounts, now, days)
         horizons[str(days)] = {
             "planned_50pct_replenishment": scenario(days, daily_burn, pool["credits_remaining"],
                                                     assumed_replenishment, unit, expiry),
@@ -339,8 +386,11 @@ def analyze(data_dir, forecast_days=7, recent_hours=24, max_in_flight=None, now=
             "no_replenishment": scenario(days, daily_burn, pool["credits_remaining"],
                                          0, unit, expiry),
         }
-    net_burn = max(0.01, daily_burn - assumed_replenishment)
-    runway = pool["credits_remaining"] / net_burn
+        if not forecast_available:
+            for row in horizons[str(days)].values():
+                row["additional_accounts"] = None
+    net_burn = daily_burn - assumed_replenishment
+    runway = runway_with_expiry(accounts, now, pool["credits_remaining"], net_burn) if forecast_available and net_burn > 0 else None
 
     event_times = [parse_time(e.get("time")) for e in events]
     event_times = [stamp for stamp in event_times if stamp is not None]
@@ -353,21 +403,31 @@ def analyze(data_dir, forecast_days=7, recent_hours=24, max_in_flight=None, now=
     main = horizons[str(forecast_days)]["planned_50pct_replenishment"]
     low = horizons[str(forecast_days)]["stable_replenishment"]["additional_accounts"]
     high = horizons[str(forecast_days)]["no_replenishment"]["additional_accounts"]
-    if main["additional_accounts"] is None:
+    runway_text = f"{rounded(runway, 1)} 天" if runway is not None else ("当前假设下不耗尽" if forecast_available else "未知")
+    if not forecast_available:
+        recs.append(recommendation("P1", "data", "积分样本不足，暂不给出补号点估计",
+                                   "先恢复 credit 用量观测；缺失字段不能按真实零消耗计算。",
+                                   f"近 24h 积分样本 {last['credit_samples']}/{last['account_attempts']}，"
+                                   f"前一窗口 {previous['credit_samples']}/{previous['account_attempts']}。"))
+    elif main["additional_accounts"] is None:
         recs.append(recommendation("P1", "data", "缺少单号额度基线",
                                    "先刷新账号积分总额度；无法可靠换算补号数。",
                                    "credits_total 没有有效样本。"))
     elif main["additional_accounts"] > 0:
         recs.append(recommendation(
-            "P0" if runway < 3 else "P1", "accounts",
+            "P0" if runway is not None and runway < 3 else "P1", "accounts",
             f"未来 {forecast_days} 天计划补 {main['additional_accounts']} 个号",
             f"分批补充并观察实际额度；补给稳定时约 {low} 个，完全不补给的保守上界约 {high} 个。",
             f"日耗 {rounded(daily_burn)} credits，现有 {pool['credits_remaining']}，"
-            f"单号保守额度 {rounded(unit)}，预计裸续航 {rounded(runway, 1)} 天。"))
+            f"单号保守额度 {rounded(unit)}，预计净续航 {runway_text}。"))
     else:
         recs.append(recommendation("P2", "accounts", "当前窗口无需为积分补号",
                                    "保持每日复核；需求或模型结构变化后重跑。",
-                                   f"{forecast_days} 天计划缺口为 0，裸续航约 {rounded(runway, 1)} 天。"))
+                                   f"{forecast_days} 天计划缺口为 0，预计净续航 {runway_text}。"))
+    if forecast_available and credit_sample_coverage < 95:
+        recs.append(recommendation("P2", "data", "积分样本覆盖率偏低",
+                                   "日耗已按已观测单次尝试均值外推；补齐 credit 字段后再提高预测置信度。",
+                                   f"两个日耗窗口的最低样本覆盖率为 {rounded(credit_sample_coverage)}%，预测置信度已降为 low。"))
 
     statuses = traffic["statuses"]
     requests = traffic["requests"]
@@ -392,6 +452,8 @@ def analyze(data_dir, forecast_days=7, recent_hours=24, max_in_flight=None, now=
             if model == hidden:
                 return True
             if ":" not in hidden and model in ("cn:" + hidden, "global:" + hidden):
+                return True
+            if ":" not in model and hidden.split(":", 1)[-1] == model:
                 return True
         return False
 
@@ -439,6 +501,8 @@ def analyze(data_dir, forecast_days=7, recent_hours=24, max_in_flight=None, now=
     recs.sort(key=lambda row: (priority_order[row["priority"]], row["category"]))
     confidence = "high" if request_coverage >= 24 * 7 and credit_coverage >= 24 else (
         "medium" if request_coverage >= 24 and credit_coverage >= 12 else "low")
+    if not forecast_available or credit_sample_coverage < 95:
+        confidence = "low"
     return {
         "generated_at": now.isoformat(),
         "data_dir": str(data_dir),
@@ -457,6 +521,8 @@ def analyze(data_dir, forecast_days=7, recent_hours=24, max_in_flight=None, now=
             "previous_24h": normalize_usage_window(previous),
             "last_7d": normalize_usage_window(week),
             "daily_credits_forecast": rounded(daily_burn),
+            "credit_forecast_available": forecast_available,
+            "credit_sample_coverage_pct": rounded(credit_sample_coverage),
             "daily_account_attempts_forecast": rounded(daily_requests, 0),
             "credit_growth_vs_previous_24h_pct": rounded((last["credits"] / previous["credits"] - 1) * 100)
             if previous["credits"] > 0 else None,
@@ -466,7 +532,7 @@ def analyze(data_dir, forecast_days=7, recent_hours=24, max_in_flight=None, now=
         "pool": pool,
         "traffic": traffic,
         "forecast": {
-            "runway_days_without_headroom": rounded(runway, 2),
+            "runway_days_without_headroom": rounded(runway, 2) if runway is not None else None,
             "horizons": horizons,
         },
         "recommendations": recs,
@@ -503,7 +569,8 @@ def render_html(report):
     cards = [
         ("补号建议", fmt(main["additional_accounts"]), f"稳定补给 {fmt(stable['additional_accounts'])} · 无补给 {fmt(none['additional_accounts'])}"),
         ("预计日耗", fmt(usage["daily_credits_forecast"]), "credits / day"),
-        ("当前可用余额", fmt(pool["credits_remaining"]), f"预计续航 {fmt(forecast['runway_days_without_headroom'], 1)} 天"),
+        ("当前可用余额", fmt(pool["credits_remaining"]),
+         f"预计净续航 {fmt(forecast['runway_days_without_headroom'], 1)} 天" if forecast["runway_days_without_headroom"] is not None else "预计净续航 —"),
         ("近期成功率", fmt(traffic["success_rate"], 2) + "%", f"{fmt(traffic['requests'])} 个逻辑请求"),
         ("账号可服务", fmt(pool["accounts_available_estimate"]), f"总账号 {pool['accounts_total']} · 有余额 {pool['accounts_credit_positive']}"),
         ("并发峰值估算", fmt(traffic["peak_5m_in_flight_estimate"]), f"池上限估算 {fmt(pool['in_flight_pool_limit_estimate'])}"),

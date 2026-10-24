@@ -485,10 +485,12 @@ func (p *Panel) nicknames() map[string]string {
 func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]any, 0)
 	var fetchErrs []string
+	hasAccounts := false
 
 	// CN 域：有可用 CN 账号才查（此前无条件 Pool.Pick()+FetchModels——选中 global
 	// 账号时打 CN 端点必然失败，混合池表现为偶发 502，纯 global 池必炸）。
 	if uids := p.cfg.Pool.AvailableUIDsForRealm("cn"); len(uids) > 0 {
+		hasAccounts = true
 		if acct := p.cfg.Pool.AuthByUID(uids[0]); acct != nil {
 			infos, err := p.cfg.Upstream.FetchModels(acct)
 			if err != nil {
@@ -499,12 +501,14 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+		out = appendPanelMediaModels(out, "cn", p.cfg.Upstream.MediaModels("cn"), p.cfg.Upstream.HTTP)
 	}
 
 	// global 域：路由开关开且有可用 global 账号才查（独立目录端点，FetchGlobalModelInfos；
 	// Upstream.GlobalEnabled 是探测侧同一道闸，与 main 装配的 config global.enabled 一致）。
 	if p.cfg.Upstream.GlobalEnabled {
 		if uids := p.cfg.Pool.AvailableUIDsForRealm("global"); len(uids) > 0 {
+			hasAccounts = true
 			if acct := p.cfg.Pool.AuthByUID(uids[0]); acct != nil {
 				infos := p.cfg.Upstream.FetchGlobalModelInfos(acct)
 				if len(infos) == 0 {
@@ -516,9 +520,13 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
+			out = appendPanelMediaModels(out, "global", p.cfg.Upstream.MediaModels("global"), p.cfg.Upstream.HTTP)
 		}
 	}
 
+	if hasAccounts {
+		out = append(out, panelToolEntries()...)
+	}
 	if len(out) == 0 {
 		if len(fetchErrs) > 0 {
 			writeErr(w, http.StatusBadGateway, "fetch models: "+strings.Join(fetchErrs, "; "))
@@ -527,7 +535,49 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, "没有可用账号：请先在面板添加账号再查询")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
+	resp := map[string]any{"ok": true, "models": out}
+	if len(fetchErrs) > 0 {
+		resp["warnings"] = fetchErrs
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// appendPanelMediaModels 把与聊天目录同次探测缓存的图像/视频模型附到面板目录。
+// 面板此前只渲染 chat 条目，导致已支持的媒体能力在管理页完全不可见。
+func appendPanelMediaModels(out []map[string]any, realm string, infos []upstream.ModelInfo, httpc *http.Client) []map[string]any {
+	for _, mi := range infos {
+		if mi.ID == "" || (mi.Type != "image" && mi.Type != "video") {
+			continue
+		}
+		entry := panelModelEntry(realm, mi, nil, "", httpc)
+		entry["type"] = mi.Type
+		if mi.Type == "image" {
+			entry["endpoint"] = "/v1/images/generations"
+			entry["edits_endpoint"] = "/v1/images/edits"
+		} else {
+			entry["endpoint"] = "/v1/videos/generations"
+			entry["poll_endpoint"] = "/v1/videos/{id}"
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// panelToolEntries 搜索与网页抓取不是聊天模型，但同样是可调用能力；
+// 用独立 type 透出，前端据此生成正确的调试请求，而不是伪装成 chat model。
+func panelToolEntries() []map[string]any {
+	return []map[string]any{
+		{
+			"id": "workbuddy:web-search", "name": "联网搜索", "type": "search",
+			"description": "调用 WorkBuddy 搜索工具，返回 Anthropic Messages 兼容结果",
+			"tags":        []string{"搜索", "工具"}, "endpoint": "/v1/search/messages",
+		},
+		{
+			"id": "workbuddy:web-fetch", "name": "网页抓取", "type": "fetch",
+			"description": "抓取指定网页并返回标题与 Markdown 正文",
+			"tags":        []string{"网页", "抓取", "工具"}, "endpoint": "/v1/fetch",
+		},
+	}
 }
 
 // panelModelEntry 构造单个模型条目（两域共用）：id 带 realm 前缀（调用值即显示值），
@@ -536,6 +586,8 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 func panelModelEntry(realm string, mi upstream.ModelInfo, remoteEfforts []string, remoteDefault string, httpc *http.Client) map[string]any {
 	entry := map[string]any{
 		"id":                   realm + ":" + mi.ID,
+		"type":                 "chat",
+		"endpoint":             "/v1/chat/completions",
 		"name":                 mi.Name,
 		"default_effort":       mi.DefaultEffort,
 		"supported_efforts":    mi.Efforts,

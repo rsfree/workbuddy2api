@@ -8,6 +8,7 @@ package reqlog
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
@@ -235,7 +236,7 @@ func (r *Recorder) ReadArchive(limit int, filter Filter) ([]Event, error) {
 	if r == nil || r.archive == nil {
 		return nil, nil
 	}
-	return r.archive.read(limit, filter)
+	return r.archive.read(limit, filter, false, context.Background())
 }
 
 // ReadAllArchive 为离线式聚合读取全部匹配事件，不受面板逐页 1000 条上限影响。
@@ -244,7 +245,19 @@ func (r *Recorder) ReadAllArchive(filter Filter) ([]Event, error) {
 	if r == nil || r.archive == nil {
 		return nil, nil
 	}
-	return r.archive.read(-1, filter)
+	return r.ReadAllArchiveContext(context.Background(), filter)
+}
+
+// ReadAllArchiveContext 在读取前排空当前写入队列，并响应管理请求取消。
+// 全量聚合不排序，避免容量分析承担与顺序无关的 O(N log N) 开销。
+func (r *Recorder) ReadAllArchiveContext(ctx context.Context, filter Filter) ([]Event, error) {
+	if r == nil || r.archive == nil {
+		return nil, nil
+	}
+	if err := r.archive.flushSync(ctx); err != nil {
+		return nil, err
+	}
+	return r.archive.read(0, filter, true, ctx)
 }
 
 // Close 刷盘并停止后台归档。
@@ -262,6 +275,7 @@ func round1(v float64) float64 {
 type archiveWriter struct {
 	cfg       Config
 	ch        chan Event
+	flushCh   chan chan struct{}
 	stop      chan struct{}
 	done      chan struct{}
 	closeOnce sync.Once
@@ -293,10 +307,11 @@ func newArchiveWriter(cfg Config) *archiveWriter {
 		cfg.QueueSize = defaultQueue
 	}
 	w := &archiveWriter{
-		cfg:  cfg,
-		ch:   make(chan Event, cfg.QueueSize),
-		stop: make(chan struct{}),
-		done: make(chan struct{}),
+		cfg:     cfg,
+		ch:      make(chan Event, cfg.QueueSize),
+		flushCh: make(chan chan struct{}),
+		stop:    make(chan struct{}),
+		done:    make(chan struct{}),
 	}
 	if err := os.MkdirAll(cfg.Dir, 0o700); err != nil {
 		w.setErr(err)
@@ -331,6 +346,9 @@ func (w *archiveWriter) run() {
 		select {
 		case e := <-w.ch:
 			w.writeEvent(e)
+		case ack := <-w.flushCh:
+			w.drainAndFlush()
+			close(ack)
 		case <-ticker.C:
 			w.flush()
 			w.prune()
@@ -346,6 +364,40 @@ func (w *archiveWriter) run() {
 				}
 			}
 		}
+	}
+}
+
+func (w *archiveWriter) drainAndFlush() {
+	for {
+		select {
+		case e := <-w.ch:
+			w.writeEvent(e)
+		default:
+			w.flush()
+			return
+		}
+	}
+}
+
+func (w *archiveWriter) flushSync(ctx context.Context) error {
+	if !w.enabled() {
+		return nil
+	}
+	ack := make(chan struct{})
+	select {
+	case w.flushCh <- ack:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-w.done:
+		return nil
+	}
+	select {
+	case <-ack:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-w.done:
+		return nil
 	}
 }
 
@@ -529,14 +581,17 @@ func (w *archiveWriter) prune() {
 	}
 }
 
-func (w *archiveWriter) read(limit int, filter Filter) ([]Event, error) {
+func (w *archiveWriter) read(limit int, filter Filter, all bool, ctx context.Context) ([]Event, error) {
 	if !w.enabled() {
 		return nil, nil
 	}
-	if limit == 0 {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !all && limit <= 0 {
 		limit = 200
 	}
-	if limit > defaultReadMax {
+	if !all && limit > defaultReadMax {
 		limit = defaultReadMax
 	}
 	entries, err := os.ReadDir(w.cfg.Dir)
@@ -553,22 +608,31 @@ func (w *archiveWriter) read(limit int, filter Filter) ([]Event, error) {
 		if entry.IsDir() || !strings.HasPrefix(name, "requests-") || !strings.HasSuffix(name, ".jsonl") {
 			continue
 		}
-		rows, err := readFile(filepath.Join(w.cfg.Dir, name), filter)
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
+		rows, err := readFile(ctx, filepath.Join(w.cfg.Dir, name), filter)
 		if err != nil {
 			return out, err
 		}
 		out = append(out, rows...)
 	}
-	// 契约：按事件时间倒序返回最近 limit 条（同一时刻用 Stable 保留落盘先后）。
-	sort.SliceStable(out, func(i, j int) bool { return out[i].Time.After(out[j].Time) })
-	if limit > 0 && len(out) > limit {
-		out = out[:limit]
+	if !all {
+		// 分页契约：按事件时间倒序返回最近 limit 条；全量聚合无需排序。
+		sort.SliceStable(out, func(i, j int) bool { return out[i].Time.After(out[j].Time) })
+		if len(out) > limit {
+			out = out[:limit]
+		}
 	}
 	return out, nil
 }
 
-func readFile(path string, filter Filter) ([]Event, error) {
+func readFile(ctx context.Context, path string, filter Filter) ([]Event, error) {
 	f, err := os.Open(path)
+	if os.IsNotExist(err) {
+		// ReadDir 与 Open 之间 prune 可能删除文件；跳过消失文件而非让管理请求 500。
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -577,6 +641,9 @@ func readFile(path string, filter Filter) ([]Event, error) {
 	scanner.Buffer(make([]byte, 64<<10), 1<<20)
 	var out []Event
 	for scanner.Scan() {
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
 		var e Event
 		if json.Unmarshal(scanner.Bytes(), &e) != nil || !filter.match(e) {
 			continue

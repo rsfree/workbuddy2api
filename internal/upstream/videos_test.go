@@ -150,3 +150,33 @@ func TestNormalizeVideoInput(t *testing.T) {
 		t.Errorf("model=%q want default %q", in.Model, VideoDefaultModel)
 	}
 }
+
+func TestSubmitVideoBodyWatermarkOverride(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		watermark *bool
+		want      bool
+	}{{"default_off", nil, false}, {"explicit_on", boolPointer(true), true}, {"explicit_off", boolPointer(false), false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			var body map[string]any
+			c := testClient(func(r *http.Request) (*http.Response, error) {
+				raw, _ := io.ReadAll(r.Body)
+				if err := json.Unmarshal(raw, &body); err != nil {
+					t.Fatal(err)
+				}
+				return jsonResp(200, `{"code":0,"data":{"id":"task-watermark"}}`), nil
+			})
+			_, err := c.SubmitVideo(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"}, VideoSubmitInput{
+				Model: "minimax-video-h3", Prompt: "test", Seconds: 5, Watermark: tc.watermark,
+			}, ChatMeta{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if body["watermark"] != tc.want {
+				t.Fatalf("watermark=%v want %v", body["watermark"], tc.want)
+			}
+		})
+	}
+}
+
+func boolPointer(v bool) *bool { return &v }

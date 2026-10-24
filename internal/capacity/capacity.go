@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
@@ -52,6 +53,8 @@ type UsageReport struct {
 	Last7d                             UsageWindow `json:"last_7d"`
 	DailyCreditsForecast               float64     `json:"daily_credits_forecast"`
 	DailyAccountAttemptsForecast       float64     `json:"daily_account_attempts_forecast"`
+	CreditForecastAvailable            bool        `json:"credit_forecast_available"`
+	CreditSampleCoveragePct            *float64    `json:"credit_sample_coverage_pct"`
 	CreditGrowthVsPrevious24hPct       *float64    `json:"credit_growth_vs_previous_24h_pct"`
 	PositiveReplenishmentObserved24h   int64       `json:"positive_replenishment_observed_24h"`
 	PositiveReplenishmentAssumedPerDay float64     `json:"positive_replenishment_assumed_per_day"`
@@ -131,7 +134,7 @@ type Report struct {
 	Pool          PoolReport          `json:"pool"`
 	Traffic       TrafficReport       `json:"traffic"`
 	Forecast      struct {
-		RunwayDays float64            `json:"runway_days_without_headroom"`
+		RunwayDays *float64           `json:"runway_days_without_headroom"`
 		Horizons   map[string]Horizon `json:"horizons"`
 	} `json:"forecast"`
 	Recommendations []Recommendation `json:"recommendations"`
@@ -161,9 +164,9 @@ func Analyze(in Input) Report {
 		in.RecentHours = 24
 	}
 	last, prev := in.Last24h.Totals, in.Previous24h.Totals
-	dailyBurn := math.Max(last.Credits, .7*last.Credits+.3*prev.Credits)
+	dailyBurn, creditCoverage, forecastAvailable := dailyCreditBurn(last, prev)
 	dailyRequests := math.Max(float64(last.Requests), .7*float64(last.Requests)+.3*float64(prev.Requests))
-	replenishment, creditCoverage := replenishment(in.CreditEntries, in.Now)
+	replenishment, creditHistoryCoverage := replenishment(in.CreditEntries, in.Now)
 	poolReport := accountState(in)
 	unit := poolReport.NewAccountCreditUnitP25
 	traffic := trafficSummary(in.Events, in.Now.Add(-time.Duration(in.RecentHours)*time.Hour), in.Now)
@@ -180,7 +183,7 @@ func Analyze(in Input) Report {
 	}
 	r := Report{GeneratedAt: in.Now, Confidence: "low", Pool: poolReport, Traffic: traffic,
 		Method: Method{
-			DailyBurn:            "max(last_24h, 0.7*last_24h + 0.3*previous_24h)",
+			DailyBurn:            "max(last_24h, 0.7*last_24h + 0.3*previous_24h); partial credit samples extrapolated by observed per-attempt average",
 			PlannedReplenishment: "50% of positive credit deltas observed in the last 24h",
 			Headroom:             .20, AccountUnit: "p25 of positive credits_total across enabled accounts",
 			Concurrency:    "5-minute completed-request work / 300s; estimate, not exact lease occupancy",
@@ -188,6 +191,7 @@ func Analyze(in Input) Report {
 		}, RuntimePolicy: map[string][]string{"hidden_models": hiddenNames(in.HiddenModels)}}
 	r.Usage = UsageReport{Last24h: window(last), Previous24h: window(prev), Last7d: window(in.Last7d.Totals),
 		DailyCreditsForecast: rounded(dailyBurn, 2), DailyAccountAttemptsForecast: rounded(dailyRequests, 0),
+		CreditForecastAvailable: forecastAvailable, CreditSampleCoveragePct: creditCoverage,
 		PositiveReplenishmentObserved24h: replenishment, PositiveReplenishmentAssumedPerDay: rounded(float64(replenishment)*.5, 2)}
 	if prev.Credits > 0 {
 		growth := rounded((last.Credits/prev.Credits-1)*100, 2)
@@ -199,18 +203,22 @@ func Analyze(in Input) Report {
 		if _, exists := r.Forecast.Horizons[fmt.Sprint(d)]; exists {
 			continue
 		}
-		expiry := poolReport.CreditsExpiring[fmt.Sprint(d)]
-		if d > 7 {
-			expiry = poolReport.CreditsExpiring["30"]
-		}
-		r.Forecast.Horizons[fmt.Sprint(d)] = Horizon{
+		expiry := creditsExpiringWithin(in.Accounts, in.Now, d)
+		h := Horizon{
 			Planned: scenario(d, dailyBurn, poolReport.CreditsRemaining, float64(replenishment)*.5, unit, expiry),
 			Stable:  scenario(d, dailyBurn, poolReport.CreditsRemaining, float64(replenishment), unit, expiry),
 			None:    scenario(d, dailyBurn, poolReport.CreditsRemaining, 0, unit, expiry),
 		}
+		if !forecastAvailable {
+			h.Planned.AdditionalAccounts, h.Stable.AdditionalAccounts, h.None.AdditionalAccounts = nil, nil, nil
+		}
+		r.Forecast.Horizons[fmt.Sprint(d)] = h
 	}
-	netBurn := math.Max(.01, dailyBurn-float64(replenishment)*.5)
-	r.Forecast.RunwayDays = rounded(float64(poolReport.CreditsRemaining)/netBurn, 2)
+	netBurn := dailyBurn - float64(replenishment)*.5
+	if forecastAvailable && netBurn > 0 {
+		runway := rounded(runwayWithExpiry(in.Accounts, in.Now, poolReport.CreditsRemaining, netBurn), 2)
+		r.Forecast.RunwayDays = &runway
+	}
 	var earliestEvent, earliestCredit time.Time
 	for _, e := range in.Events {
 		if earliestEvent.IsZero() || e.Time.Before(earliestEvent) {
@@ -226,10 +234,13 @@ func Analyze(in Input) Report {
 	r.Coverage.RequestEvents, r.Coverage.RequestHours, r.Coverage.RequestBytes = len(in.Events), rounded(requestHours, 2), in.ArchiveBytes
 	r.Coverage.CreditHistoryHours, r.Coverage.CreditHistoryEntries = rounded(math.Min(durationHours(in.Now, earliestCredit), 24), 2), len(in.CreditEntries)
 	r.Coverage.UsageBuckets = in.Last7d.Buckets
-	if requestHours >= 168 && creditCoverage >= 24 {
+	if requestHours >= 168 && creditHistoryCoverage >= 24 {
 		r.Confidence = "high"
-	} else if requestHours >= 24 && creditCoverage >= 12 {
+	} else if requestHours >= 24 && creditHistoryCoverage >= 12 {
 		r.Confidence = "medium"
+	}
+	if !forecastAvailable || creditCoverage == nil || *creditCoverage < 95 {
+		r.Confidence = "low"
 	}
 	r.Recommendations = recommendations(in, r)
 	r.Parameters.ForecastDays, r.Parameters.RecentHours = in.ForecastDays, in.RecentHours
@@ -238,6 +249,36 @@ func Analyze(in Input) Report {
 
 func window(a usage.Agg) UsageWindow {
 	return UsageWindow{a.Requests, a.Errors, rounded(a.Credits, 2), a.TotalTokens, a.CreditSamples}
+}
+
+// dailyCreditBurn 不把缺失 credit 字段当成真实零消耗。部分样本按已观测单次
+// 尝试均值外推，并返回两个窗口中较低的样本覆盖率；完全无样本时禁止确定性预测。
+func dailyCreditBurn(last, previous usage.Agg) (float64, *float64, bool) {
+	lastBurn, lastCoverage, lastOK := observedCreditBurn(last)
+	previousBurn, previousCoverage, previousOK := observedCreditBurn(previous)
+	if last.Requests+previous.Requests == 0 || !lastOK || !previousOK {
+		return 0, coveragePointer(0), false
+	}
+	coverage := math.Min(lastCoverage, previousCoverage)
+	burn := math.Max(lastBurn, .7*lastBurn+.3*previousBurn)
+	return burn, coveragePointer(coverage), true
+}
+
+func observedCreditBurn(a usage.Agg) (burn, coverage float64, ok bool) {
+	if a.Requests == 0 {
+		return 0, 100, a.Credits == 0
+	}
+	if a.CreditSamples <= 0 {
+		return 0, 0, false
+	}
+	coverage = math.Min(100, 100*float64(a.CreditSamples)/float64(a.Requests))
+	burn = a.Credits * float64(a.Requests) / float64(a.CreditSamples)
+	return burn, coverage, true
+}
+
+func coveragePointer(v float64) *float64 {
+	rounded := rounded(v, 2)
+	return &rounded
 }
 
 func accountState(in Input) PoolReport {
@@ -274,22 +315,72 @@ func accountState(in Input) PoolReport {
 				unlimited = true
 			}
 		}
-		for _, b := range a.CreditsExpiryBuckets {
-			if b.Remain <= 0 || !b.ExpireAt.After(in.Now) {
-				continue
-			}
-			for _, d := range []int{1, 3, 7, 30} {
-				if !b.ExpireAt.After(in.Now.Add(time.Duration(d) * 24 * time.Hour)) {
-					r.CreditsExpiring[fmt.Sprint(d)] += b.Remain
-				}
-			}
-		}
+	}
+	for _, d := range []int{1, 3, 7, 30} {
+		r.CreditsExpiring[fmt.Sprint(d)] = creditsExpiringWithin(in.Accounts, in.Now, d)
 	}
 	r.NewAccountCreditUnitP25, r.NewAccountCreditUnitMedian = rounded(percentile(totals, .25), 0), rounded(percentile(totals, .5), 0)
 	if !unlimited {
 		r.InFlightPoolLimitEstimate = &limit
 	}
 	return r
+}
+
+type expiryBatch struct {
+	at     time.Time
+	remain int64
+}
+
+func creditExpiryBatches(accounts []pool.Status, now time.Time) []expiryBatch {
+	var out []expiryBatch
+	for _, a := range accounts {
+		if a.Disabled || a.Paused {
+			continue
+		}
+		if len(a.CreditsExpiryBuckets) == 0 {
+			if a.CreditsEarliestRemaining > 0 && a.CreditsEarliestExpiry.After(now) {
+				out = append(out, expiryBatch{a.CreditsEarliestExpiry, a.CreditsEarliestRemaining})
+			}
+			continue
+		}
+		for _, b := range a.CreditsExpiryBuckets {
+			if b.Remain > 0 && b.ExpireAt.After(now) {
+				out = append(out, expiryBatch{b.ExpireAt, b.Remain})
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].at.Before(out[j].at) })
+	return out
+}
+
+func creditsExpiringWithin(accounts []pool.Status, now time.Time, days int) int64 {
+	cutoff := now.Add(time.Duration(days) * 24 * time.Hour)
+	var total int64
+	for _, b := range creditExpiryBatches(accounts, now) {
+		if !b.at.After(cutoff) {
+			total += b.remain
+		}
+	}
+	return total
+}
+
+// runwayWithExpiry 按到期时间分段扣减。已经被消耗的积分不能再次按到期扣除，
+// 因此不能简单用 remaining-expiry 计算长窗口续航。
+func runwayWithExpiry(accounts []pool.Status, now time.Time, remaining int64, netBurn float64) float64 {
+	balance, elapsed := float64(remaining), 0.0
+	for _, batch := range creditExpiryBatches(accounts, now) {
+		days := batch.at.Sub(now).Hours()/24 - elapsed
+		if days < 0 {
+			days = 0
+		}
+		if balance/netBurn <= days {
+			return elapsed + balance/netBurn
+		}
+		balance -= days * netBurn
+		balance -= math.Min(balance, float64(batch.remain))
+		elapsed += days
+	}
+	return elapsed + balance/netBurn
 }
 
 func replenishment(entries []credithist.Entry, now time.Time) (int64, float64) {
@@ -415,16 +506,22 @@ func recommendations(in Input, r Report) []Recommendation {
 	add := func(p, c, t, a, e string) { out = append(out, Recommendation{p, c, t, a, e}) }
 	h := r.Forecast.Horizons[fmt.Sprint(in.ForecastDays)]
 	main, low, high := h.Planned.AdditionalAccounts, h.Stable.AdditionalAccounts, h.None.AdditionalAccounts
-	if main == nil {
+	runway := runwayText(r)
+	if !r.Usage.CreditForecastAvailable {
+		add("P1", "data", "积分样本不足，暂不给出补号点估计", "先恢复 credit 用量观测；缺失字段不能按真实零消耗计算。", fmt.Sprintf("近 24h 积分样本 %d/%d，前一窗口 %d/%d。", r.Usage.Last24h.CreditSamples, r.Usage.Last24h.AccountAttempts, r.Usage.Previous24h.CreditSamples, r.Usage.Previous24h.AccountAttempts))
+	} else if main == nil {
 		add("P1", "data", "缺少单号额度基线", "先刷新账号积分总额度；无法可靠换算补号数。", "credits_total 没有有效样本。")
 	} else if *main > 0 {
 		priority := "P1"
-		if r.Forecast.RunwayDays < 3 {
+		if r.Forecast.RunwayDays != nil && *r.Forecast.RunwayDays < 3 {
 			priority = "P0"
 		}
-		add(priority, "accounts", fmt.Sprintf("未来 %d 天计划补 %d 个号", in.ForecastDays, *main), fmt.Sprintf("分批补充并观察实际额度；补给稳定时约 %s 个，完全不补给的保守上界约 %s 个。", accountCount(low), accountCount(high)), fmt.Sprintf("日耗 %.2f credits，现有 %d，单号保守额度 %.0f，预计裸续航 %.1f 天。", r.Usage.DailyCreditsForecast, r.Pool.CreditsRemaining, r.Pool.NewAccountCreditUnitP25, r.Forecast.RunwayDays))
+		add(priority, "accounts", fmt.Sprintf("未来 %d 天计划补 %d 个号", in.ForecastDays, *main), fmt.Sprintf("分批补充并观察实际额度；补给稳定时约 %s 个，完全不补给的保守上界约 %s 个。", accountCount(low), accountCount(high)), fmt.Sprintf("日耗 %.2f credits，现有 %d，单号保守额度 %.0f，预计净续航 %s。", r.Usage.DailyCreditsForecast, r.Pool.CreditsRemaining, r.Pool.NewAccountCreditUnitP25, runway))
 	} else {
-		add("P2", "accounts", "当前窗口无需为积分补号", "保持每日复核；需求或模型结构变化后重跑。", fmt.Sprintf("%d 天计划缺口为 0，裸续航约 %.1f 天。", in.ForecastDays, r.Forecast.RunwayDays))
+		add("P2", "accounts", "当前窗口无需为积分补号", "保持每日复核；需求或模型结构变化后重跑。", fmt.Sprintf("%d 天计划缺口为 0，预计净续航 %s。", in.ForecastDays, runway))
+	}
+	if r.Usage.CreditForecastAvailable && r.Usage.CreditSampleCoveragePct != nil && *r.Usage.CreditSampleCoveragePct < 95 {
+		add("P2", "data", "积分样本覆盖率偏低", "日耗已按已观测单次尝试均值外推；补齐 credit 字段后再提高预测置信度。", fmt.Sprintf("两个日耗窗口的最低样本覆盖率为 %.2f%%，预测置信度已降为 low。", *r.Usage.CreditSampleCoveragePct))
 	}
 	requests := r.Traffic.Requests
 	rate429 := 0.0
@@ -442,7 +539,7 @@ func recommendations(in Input, r Report) []Recommendation {
 		add("P1", "concurrency", "限流仍明显，优先降并发而非加号", fmt.Sprintf("把 max_in_flight 从 %d 试降到 %d，观察 429、软冷却和成功率后再回调。", in.MaxInFlight, maxInt(1, int(float64(in.MaxInFlight)*.75))), fmt.Sprintf("近 %dh 429 占比 %.2f%%。", in.RecentHours, rate429))
 	}
 	for _, m := range r.Traffic.Models {
-		if _, hidden := in.HiddenModels[m.Model]; hidden {
+		if isHiddenModel(m.Model, in.HiddenModels) {
 			add("P2", "model", fmt.Sprintf("模型 %s 已按配置隐藏", m.Model), "相关 400 属于预期的网关拒绝，不按模型故障处理，也不需要补号或改超时。", fmt.Sprintf("models.hidden 包含该模型；近 %dh 仍有 %d 次点名调用，应从客户端模型列表移除。", in.RecentHours, m.Requests))
 			continue
 		}
@@ -477,6 +574,30 @@ func recommendations(in Input, r Report) []Recommendation {
 		return priority[out[i].Priority] < priority[out[j].Priority]
 	})
 	return out
+}
+
+func runwayText(r Report) string {
+	if r.Forecast.RunwayDays != nil {
+		return fmt.Sprintf("%.1f 天", *r.Forecast.RunwayDays)
+	}
+	if r.Usage.CreditForecastAvailable {
+		return "当前假设下不耗尽"
+	}
+	return "未知"
+}
+
+func isHiddenModel(model string, hidden map[string]struct{}) bool {
+	if _, ok := hidden[model]; ok {
+		return true
+	}
+	if prefix, _, ok := strings.Cut(model, ":"); ok && (prefix == "cn" || prefix == "global") {
+		return false
+	}
+	if _, ok := hidden["cn:"+model]; ok {
+		return true
+	}
+	_, ok := hidden["global:"+model]
+	return ok
 }
 
 func hiddenNames(hidden map[string]struct{}) []string {

@@ -37,15 +37,18 @@ func (p *Panel) capacityReport(w http.ResponseWriter, r *http.Request) {
 	}
 	key := fmt.Sprintf("%d/%d", days, hours)
 	force := r.URL.Query().Get("refresh") == "1"
-	now := time.Now()
+	requestedAt := time.Now()
 
 	p.capacityMu.Lock()
 	defer p.capacityMu.Unlock()
+	now := time.Now()
 	if p.capacityCache == nil {
 		p.capacityCache = map[string]capacityCacheEntry{}
 	}
-	if !force {
-		if cached, ok := p.capacityCache[key]; ok && now.Sub(cached.createdAt) < capacityCacheTTL {
+	if cached, ok := p.capacityCache[key]; ok && now.Sub(cached.createdAt) < capacityCacheTTL {
+		// 普通请求命中 TTL；排队期间已由另一请求完成强制刷新时直接复用，
+		// 避免 N 个 refresh=1 串行执行 N 次全归档扫描。
+		if !force || cached.createdAt.After(requestedAt) {
 			report := cached.report
 			report.Parameters.Cached = true
 			writeJSON(w, http.StatusOK, report)
@@ -57,7 +60,7 @@ func (p *Panel) capacityReport(w http.ResponseWriter, r *http.Request) {
 	last := p.cfg.Usage.SnapshotWindow(usage.Window{From: now.Add(-24 * time.Hour), To: now}, nil, nil)
 	previous := p.cfg.Usage.SnapshotWindow(usage.Window{From: now.Add(-48 * time.Hour), To: now.Add(-24 * time.Hour)}, nil, nil)
 	week := p.cfg.Usage.SnapshotWindow(usage.Window{From: now.Add(-7 * 24 * time.Hour), To: now}, nil, nil)
-	events, err := p.cfg.RequestLog.ReadAllArchive(reqlog.Filter{})
+	events, err := p.cfg.RequestLog.ReadAllArchiveContext(r.Context(), reqlog.Filter{})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "read request archive: "+err.Error())
 		return
@@ -75,7 +78,7 @@ func (p *Panel) capacityReport(w http.ResponseWriter, r *http.Request) {
 		HiddenModels: hidden, MaxInFlight: cnLimit, MaxInFlightGlobal: globalLimit,
 		ArchiveBytes: archive.Bytes,
 	})
-	p.capacityCache[key] = capacityCacheEntry{report: report, createdAt: now}
+	p.capacityCache[key] = capacityCacheEntry{report: report, createdAt: time.Now()}
 	writeJSON(w, http.StatusOK, report)
 }
 

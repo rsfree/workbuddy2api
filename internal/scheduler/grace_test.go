@@ -1,10 +1,15 @@
 package scheduler
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 // taskMutedAt 是新号任务静默期的唯一判定口径，这里把每条边界都钉住：
@@ -125,5 +130,53 @@ func TestNoteTaskGraceSkipThrottle(t *testing.T) {
 	s.mu.Unlock()
 	if got != now.Format("2006-01-02") {
 		t.Fatalf("跨天后日期 = %q, want 今天", got)
+	}
+}
+
+func TestTravelEntrySkipsNewAccountWithoutUpstreamCalls(t *testing.T) {
+	fastTravel(t)
+	stub := &travelStub{buddy: "null"}
+	srv := stub.server()
+	defer srv.Close()
+	s, p := newTravelScheduler(t, srv, "u1")
+	s.SetNewAccountGraceDays(3)
+	p.AuthByUID("u1").EnsureImportedAt(time.Now().Add(-time.Hour))
+	p.SetCredits("u1", 2200, 2200)
+	s.RunTravelNow()
+	if got := stub.infoCalls.Load(); got != 0 {
+		t.Fatalf("new account grace leaked %d upstream travel calls", got)
+	}
+	p.SetCredits("u1", 0, 2200) // 积分清光是明确的提前放行条件。
+	s.RunTravelNow()
+	if got := stub.infoCalls.Load(); got != 1 {
+		t.Fatalf("zero-credit account should resume travel, calls=%d", got)
+	}
+}
+
+func TestBlackcatEntrySkipsNewAccountWithoutUpstreamCalls(t *testing.T) {
+	oldNow := nowForNightWindow
+	nowForNightWindow = func() time.Time { return time.Date(2026, 10, 24, 23, 30, 0, 0, time.UTC) }
+	t.Cleanup(func() { nowForNightWindow = oldNow })
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(`{"code":0,"data":[]}`))
+	}))
+	defer srv.Close()
+	p := pool.New("")
+	a := &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}
+	a.EnsureImportedAt(time.Now().Add(-time.Hour))
+	p.Add(a)
+	p.SetCredits("u1", 2200, 2200)
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up, NewAccountGraceDays: 3})
+	s.RunBlackcatNow()
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("new account grace leaked %d blackcat upstream calls", got)
+	}
+	p.SetCredits("u1", 0, 2200)
+	s.RunBlackcatNow()
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("zero-credit account should query blackcat tasks once, calls=%d", got)
 	}
 }

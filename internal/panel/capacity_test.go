@@ -19,7 +19,7 @@ func TestCapacityEndpointAndCache(t *testing.T) {
 	u.Add(time.Now(), "cn", "u1", "glm", usage.Delta{Credit: 10, HasCredit: true}, true)
 	r := reqlog.New(reqlog.Config{Enabled: true, Dir: t.TempDir(), RetentionDays: 7, MaxBytes: 1 << 20})
 	r.Record(reqlog.Event{Time: time.Now(), Model: "glm", Status: 200, OK: true, Outcome: reqlog.OutcomeSuccess, DurationMs: 100})
-	r.Close() // 测试里先刷盘，验证接口确实读取归档而非只读内存最近 100 条。
+	t.Cleanup(r.Close) // 不预先 Close：接口必须先刷盘，覆盖生产中的实时归档读取。
 	p := New(Config{Pool: pool.New(""), Usage: u, RequestLog: r, CreditHistory: credithist.New("", 10)})
 
 	get := func(path string) (int, capacity.Report) {

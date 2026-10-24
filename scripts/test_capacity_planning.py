@@ -26,7 +26,7 @@ class CapacityPlanningTest(unittest.TestCase):
             stamp = self.now - dt.timedelta(hours=offset)
             buckets.append({"s": "h:" + stamp.strftime("%Y-%m-%dT%H"),
                             "q": 10, "e": 0, "t": 100,
-                            "cr": 40 if offset < 24 else 20, "cn": 1})
+                            "cr": 40 if offset < 24 else 20, "cn": 10})
         self.write("usage.json", {"saved": self.now.isoformat(), "buckets": buckets})
         self.write("state.json", {"accounts": {
             "a": {"credits": 100, "credits_total": 2500},
@@ -45,6 +45,50 @@ class CapacityPlanningTest(unittest.TestCase):
         self.assertEqual(report["pool"]["new_account_credit_unit_p25"], 3750)
         self.assertEqual(report["coverage"]["credit_history_entries"], 2)
         self.assertIsNotNone(report["forecast"]["horizons"]["7"]["planned_50pct_replenishment"]["additional_accounts"])
+
+
+    def test_custom_horizon_expiry_and_runway(self):
+        buckets = []
+        for offset in (0, 25):
+            stamp = self.now - dt.timedelta(hours=offset)
+            buckets.append({"s": "h:" + stamp.strftime("%Y-%m-%dT%H"),
+                            "q": 10, "e": 0, "t": 100, "cr": 100, "cn": 10})
+        self.write("usage.json", {"saved": self.now.isoformat(), "buckets": buckets})
+        self.write("state.json", {"accounts": [{
+            "credits": 1000, "credits_total": 1000,
+            "credits_expiry_buckets": [
+                {"expires_at": (self.now + dt.timedelta(hours=48)).isoformat(), "remain": 400},
+                {"expires_at": (self.now + dt.timedelta(days=20)).isoformat(), "remain": 300},
+            ],
+        }]})
+        self.write("credit-history.json", {"entries": []})
+        report = analyze(self.data, forecast_days=14, now=self.now)
+        self.assertEqual(report["forecast"]["horizons"]["14"]["planned_50pct_replenishment"]["credits_usable_after_expiry"], 600)
+        self.assertEqual(report["forecast"]["runway_days_without_headroom"], 6)
+        report = analyze(self.data, forecast_days=29, now=self.now)
+        self.assertEqual(report["forecast"]["horizons"]["29"]["planned_50pct_replenishment"]["credits_usable_after_expiry"], 300)
+        self.write("state.json", {"accounts": [{
+            "credits": 1000, "credits_total": 1000,
+            "credits_expiry_buckets": [{"expires_at": (self.now + dt.timedelta(days=6)).isoformat(), "remain": 900}],
+        }]})
+        report = analyze(self.data, forecast_days=14, now=self.now)
+        self.assertEqual(report["forecast"]["runway_days_without_headroom"], 6)
+
+    def test_missing_credit_samples_do_not_mean_zero_burn(self):
+        buckets = []
+        for offset in (0, 25):
+            stamp = self.now - dt.timedelta(hours=offset)
+            buckets.append({"s": "h:" + stamp.strftime("%Y-%m-%dT%H"),
+                            "q": 10, "e": 0, "t": 100, "cr": 0, "cn": 0})
+        self.write("usage.json", {"saved": self.now.isoformat(), "buckets": buckets})
+        self.write("state.json", {"accounts": [{"credits": 1000, "credits_total": 1000}]})
+        self.write("credit-history.json", {"entries": []})
+        report = analyze(self.data, forecast_days=7, now=self.now)
+        self.assertFalse(report["usage"]["credit_forecast_available"])
+        self.assertIsNone(report["forecast"]["runway_days_without_headroom"])
+        self.assertIsNone(report["forecast"]["horizons"]["7"]["planned_50pct_replenishment"]["additional_accounts"])
+        self.assertTrue(any(row["category"] == "data" and row["priority"] == "P1"
+                            for row in report["recommendations"]))
 
     def test_expiry_reduces_usable_balance_and_scenarios_bound_plan(self):
         base = scenario(7, 1000, 150, 100, 2500, 0)

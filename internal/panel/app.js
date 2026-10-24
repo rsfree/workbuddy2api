@@ -10,7 +10,7 @@ let overviewData = null, cfgLoaded = null;
 let logPin = true, loginState = null, loginTimer = null;
 let refTimer = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
-let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
+let mdFilter = { q: '', realm: '', type: '', cap: '', effort: '', promo: '', sort: 'default' };
 // 会拦成长任务的只有「真绑定租户 / 企业版」这一种（概览接口的 enterprise_session）。
 // 注意 token_source=enterprise_switch（未绑定租户）**不等于企业号**：实测仍正常计分。
 // 2026-10-23 实测：50 个号里 22 个带这个标记、全是个人号，差别只在登录入口。
@@ -22,11 +22,13 @@ let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'defaul
 let entSession = new Set();
 let mdAll = [], mdProbes = {}, mdProbeOf = () => undefined;
 let mdLocks = [], mdRecent = [];
+let mdDebug = null, mdDebugSeq = 0, mdVideoTaskID = '', mdDebugBusy = false;
 let reqFilter = { q: '', outcome: '' };
 let reqEntries = [];
 let usDim = 'account', usCreditDim = 'account', usSort = 'total';
 let usageData = null;
 let capacityData = null;
+let capacityRequestSeq = 0;
 let reqRangeState = null; // 请求记录的时间范围（用量页的见 trangeState）
 
 const $ = id => document.getElementById(id);
@@ -713,7 +715,7 @@ function rateCell(m) {
 
 async function loadModels() {
   const tb = $('mdBody');
-  tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
+  tb.innerHTML = '<tr><td colspan="8"><div class="empty">正在向上游查询…</div></td></tr>';
   try {
     // 探测、模型锁与最近请求都是本地可选增强：任一失败不影响模型目录本身。
     // 可用性标签不额外发推理请求，只用模型锁和最近真实请求结果合成。
@@ -728,7 +730,7 @@ async function loadModels() {
     mdLocks = Array.isArray(st.model_locks) ? st.model_locks : [];
     mdRecent = Array.isArray(rm.recent) ? rm.recent : [];
     if (!mdAll.length) {
-      tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>';
+      tb.innerHTML = '<tr><td colspan="8"><div class="empty">上游未返回模型</div></td></tr>';
       $('mdCount').textContent = '';
       $('mdNote').textContent = '上游未返回模型';
       return;
@@ -737,11 +739,15 @@ async function loadModels() {
     const probeKeys = Object.keys(mdProbes);
     mdProbeOf = id => mdProbes[id] || mdProbes[probeKeys.find(k => k.endsWith(':' + id))];
     const hit = mdAll.filter(m => mdProbeOf(m.id)).length;
-    $('mdNote').textContent = mdAll.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
+    const warnings = Array.isArray(d.warnings) ? d.warnings : [];
+    $('mdNote').textContent = mdAll.length + ' 个模型/功能 · 已刷新降级缓存' +
+      (hit ? ' · ' + hit + ' 个有实测上限' : '') +
+      (warnings.length ? ' · 部分目录失败：' + warnings.join('；') : '');
+    $('mdNote').title = warnings.join('\n');
     renderModels();
   } catch (e) {
     mdAll = [];
-    tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="8"><div class="empty">' + esc(e.message) + '</div></td></tr>';
     $('mdCount').textContent = '';
   }
 }
@@ -775,6 +781,7 @@ function mdMatch(m, f) {
     }
   }
   if (f.realm && !String(m.id || '').startsWith(f.realm + ':')) return false;
+  if (f.type && String(m.type || 'chat') !== f.type) return false;
   if (f.cap === 'tool' && !m.supports_tool_call) return false;
   if (f.cap === 'vision' && !m.supports_images) return false;
   if (f.cap === 'reasoning' && !m.supports_reasoning) return false;
@@ -866,31 +873,34 @@ function mdAvailabilityTag(m) {
 
 // mdRowHtml 单个模型行（纯渲染，便于独立测试）。
 function mdRowHtml(m, pr) {
+  const type = m.type || 'chat';
   const eff = (m.supported_efforts || []).slice();
   if (m.can_disable_thinking && eff.length && !eff.includes('off')) eff.push('off（可关）');
   const effs = eff.length ? eff.map(e => '<span class="tag warn">' + esc(e) + '</span>').join(' ')
     : '<span style="color:var(--ink-3);font-size:12.5px">' + (m.supports_reasoning ? '固定档 · 默认 ' + esc(m.default_effort || '?') : '不支持思考') + '</span>';
-  // 能力徽标：默认模型 / 工具调用 / 视觉 / 纯推理（上游目录全字段透出，缺失不显示）
+  // 类型与能力徽标：聊天、图片、视频和独立工具都能直接进入对应调试表单。
   const caps = [];
+  const typeNames = { chat: '聊天', image: '图片', video: '视频', search: '搜索', fetch: '抓取' };
+  caps.push('<span class="tag ok">' + esc(typeNames[type] || type) + '</span>');
   if (m.is_default) caps.push('<span class="tag ok">默认</span>');
   if (m.supports_tool_call) caps.push('<span class="tag warn">工具</span>');
-  if (m.supports_images) caps.push('<span class="tag warn">视觉</span>');
+  if (m.supports_images && type === 'chat') caps.push('<span class="tag warn">视觉</span>');
   if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag warn">思考常开</span>');
-  const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
+  const capHtml = '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>';
   const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
   return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm"><span class="mid">' + esc(m.id) + '</span>' + mdAvailabilityTag(m) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
     '<td class="num">' + rateCell(m) + '</td>' +
     '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
     '<td class="efs" style="white-space:normal">' + effs + '</td>' +
     '<td class="num">' + (m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—') + '</td>' +
-    outCell(m, pr) + '</tr>';
+    outCell(m, pr) + '<td><button class="xs" data-md-debug="' + esc(m.id) + '">调试</button></td></tr>';
 }
 
 function renderModels() {
   const tb = $('mdBody');
   const list = mdSortList(mdAll.filter(m => mdMatch(m)));
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="7"><div class="empty">没有符合当前筛选条件的模型</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="8"><div class="empty">没有符合当前筛选条件的模型</div></td></tr>';
   } else {
     tb.innerHTML = list.map(m => mdRowHtml(m, mdProbeOf(m.id))).join('');
   }
@@ -902,8 +912,8 @@ function renderModels() {
 }
 
 function resetModelFilter() {
-  mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
-  $('mdQ').value = ''; $('mdRealm').value = ''; $('mdCap').value = '';
+  mdFilter = { q: '', realm: '', type: '', cap: '', effort: '', promo: '', sort: 'default' };
+  $('mdQ').value = ''; $('mdRealm').value = ''; $('mdType').value = ''; $('mdCap').value = '';
   $('mdEffort').value = ''; $('mdPromo').value = ''; $('mdSort').value = 'default';
   renderModels();
 }
@@ -914,13 +924,161 @@ $('mdQ').oninput = () => {
   clearTimeout(mdQTimer);
   mdQTimer = setTimeout(() => { mdFilter.q = $('mdQ').value.trim(); renderModels(); }, 120);
 };
-for (const [id, key] of [['mdRealm', 'realm'], ['mdCap', 'cap'], ['mdEffort', 'effort'], ['mdPromo', 'promo'], ['mdSort', 'sort']]) {
+for (const [id, key] of [['mdRealm', 'realm'], ['mdType', 'type'], ['mdCap', 'cap'], ['mdEffort', 'effort'], ['mdPromo', 'promo'], ['mdSort', 'sort']]) {
   const el = $(id);
   if (!el) continue;
   el.onchange = () => { mdFilter[key] = el.value; renderModels(); };
 }
 $('mdReset').onclick = resetModelFilter;
 $('btnModels').onclick = loadModels;
+
+/* ── 模型 / 工具在线调试 ─────────────────────────────────────────────
+   浏览器直接请求同源正式 API，不另造一条绕过选号、计费和日志的调试管线。
+   只有点击发送才调用上游；不自动重试，视频任务也只在你点击后查询。 */
+function mdDebugTemplate(m) {
+  const type = (m && m.type) || 'chat';
+  const id = String((m && m.id) || '');
+  const bare = id.replace(/^(cn|global):/, '');
+  if (type === 'image') {
+    const tags = Array.isArray(m.tags) ? m.tags : [];
+    const editOnly = tags.includes('image-to-image') && !tags.includes('text-to-image');
+    return { method: 'POST', endpoint: editOnly ? (m.edits_endpoint || '/v1/images/edits') : (m.endpoint || '/v1/images/generations'), payload: editOnly ? {
+      model: id, prompt: '把参考图改成水彩插画风格', image: ['https://dummyimage.com/1024x1024/eeeeee/333333.png?text=cat'], n: 1, size: '1024x1024', response_format: 'url'
+    } : {
+      model: id, prompt: '一只橘猫，简洁插画', n: 1, size: '1024x1024', response_format: 'url'
+    } };
+  }
+  if (type === 'video') return { method: 'POST', endpoint: m.endpoint || '/v1/videos/generations', payload: {
+    model: bare, prompt: '一只橘猫在阳光下伸懒腰', seconds: 6, watermark: false
+  } };
+  if (type === 'search') return { method: 'POST', endpoint: m.endpoint || '/v1/search/messages', payload: {
+    model: 'web-search', max_tokens: 256,
+    tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 3 }],
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'WorkBuddy' }] }]
+  } };
+  if (type === 'fetch') return { method: 'POST', endpoint: m.endpoint || '/v1/fetch', payload: {
+    url: 'https://example.com', prompt: '提取页面标题与正文要点'
+  } };
+  return { method: 'POST', endpoint: (m && m.endpoint) || '/v1/chat/completions', payload: {
+    model: id, messages: [{ role: 'user', content: '请只回复 OK' }], stream: false, max_tokens: 32
+  } };
+}
+function openModelDebug(id) {
+  if (mdDebugBusy) { toast('上一请求仍在进行，请等待完成后再切换调试对象', 'err'); return; }
+  const model = mdAll.find(m => m && m.id === id);
+  if (!model) return;
+  mdDebugSeq++;
+  mdDebug = mdDebugTemplate(model);
+  mdVideoTaskID = '';
+  $('mdDebugTitle').textContent = model.id + ' · ' + (model.name || model.type || 'chat');
+  $('mdDebugEndpoint').textContent = mdDebug.method + ' ' + mdDebug.endpoint;
+  $('mdDebugPayload').value = JSON.stringify(mdDebug.payload, null, 2);
+  $('mdDebugResult').textContent = '';
+  $('mdDebugMedia').innerHTML = '';
+  $('mdDebugStatus').textContent = '尚未发送';
+  $('mdDebugPoll').hidden = true;
+  $('mdDebugSend').disabled = false;
+  $('mdDebugPoll').disabled = false;
+  $('mdDebugBox').hidden = false;
+  $('mdDebugBox').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+function closeModelDebug() {
+  if (mdDebugBusy) { toast('请求仍在进行，请等待完成后再关闭', 'err'); return; }
+  mdDebugSeq++;
+  mdDebug = null;
+  mdVideoTaskID = '';
+  $('mdDebugBox').hidden = true;
+  $('mdDebugSend').disabled = false;
+  $('mdDebugPoll').disabled = false;
+}
+function mdCurlCommand(debug, payload, origin) {
+  const body = JSON.stringify(payload).replace(/'/g, "'\"'\"'");
+  return 'curl --request ' + debug.method + ' "' + origin + debug.endpoint + '" \\\n' +
+    '  --header "Authorization: Bearer ${WB2API_KEY}" \\\n' +
+    '  --header "Content-Type: application/json" \\\n' +
+    "  --data-raw '" + body + "'";
+}
+function mdMediaHtml(d) {
+  if (!d || typeof d !== 'object') return '';
+  const out = [];
+  for (const item of (Array.isArray(d.data) ? d.data : [])) {
+    if (item && typeof item.b64_json === 'string' && item.b64_json) {
+      out.push('<img alt="生成图片" style="max-width:100%;margin-top:10px" src="data:image/png;base64,' + esc(item.b64_json) + '">');
+    } else if (item && /^https?:\/\//.test(String(item.url || ''))) {
+      out.push('<div><a href="' + esc(item.url) + '" target="_blank" rel="noopener noreferrer">打开生成图片</a></div>');
+    }
+  }
+  if (/^https?:\/\//.test(String(d.url || ''))) {
+    out.push('<div><a href="' + esc(d.url) + '" target="_blank" rel="noopener noreferrer">打开生成视频</a></div>');
+  }
+  return out.join('');
+}
+async function sendModelDebug(poll) {
+  if (mdDebugBusy || !mdDebug || (poll && !mdVideoTaskID)) return;
+  let payload = null;
+  if (!poll) {
+    try {
+      payload = JSON.parse($('mdDebugPayload').value);
+      if (!payload || Array.isArray(payload) || typeof payload !== 'object') throw new Error('请求体必须是 JSON 对象');
+    } catch (e) { toast('JSON 无效：' + e.message, 'err'); return; }
+    if (!window.confirm('将向 ' + mdDebug.endpoint + ' 发送真实请求，可能消耗积分。确认继续？')) return;
+  }
+  const seq = ++mdDebugSeq;
+  const endpoint = poll ? '/v1/videos/' + encodeURIComponent(mdVideoTaskID) : mdDebug.endpoint;
+  const method = poll ? 'GET' : mdDebug.method;
+  const headers = {};
+  const key = localStorage.getItem(LS_KEY);
+  if (key) headers.Authorization = 'Bearer ' + key;
+  if (!poll) headers['Content-Type'] = 'application/json';
+  mdDebugBusy = true;
+  $('mdDebugSend').disabled = true;
+  $('mdDebugPoll').disabled = true;
+  $('mdDebugStatus').textContent = method + ' ' + endpoint + ' · 请求中…';
+  const started = Date.now();
+  try {
+    const resp = await fetch(endpoint, { method, headers, body: poll ? undefined : JSON.stringify(payload) });
+    const text = await resp.text();
+    if (seq !== mdDebugSeq) return;
+    let data = null, pretty = text;
+    try { data = JSON.parse(text); pretty = JSON.stringify(data, null, 2); } catch (_) { /* SSE/纯文本原样展示 */ }
+    if (pretty.length > 200000) pretty = pretty.slice(0, 200000) + '\n… 响应过长，已截断展示';
+    $('mdDebugResult').textContent = pretty;
+    $('mdDebugMedia').innerHTML = mdMediaHtml(data);
+    const rid = resp.headers.get('x-request-id') || resp.headers.get('x-wb2a-upstream-request-id') || '';
+    $('mdDebugStatus').textContent = 'HTTP ' + resp.status + ' · ' + (Date.now() - started) + ' ms' + (rid ? ' · ' + rid : '');
+    if (!poll && data && data.id && mdDebug.endpoint === '/v1/videos/generations') {
+      mdVideoTaskID = String(data.id);
+      $('mdDebugPoll').hidden = false;
+      $('mdDebugPoll').textContent = '查询视频任务 ' + mdVideoTaskID;
+    }
+    if (resp.status === 401) openKey();
+  } catch (e) {
+    if (seq !== mdDebugSeq) return;
+    $('mdDebugStatus').textContent = '请求失败 · ' + (Date.now() - started) + ' ms';
+    $('mdDebugResult').textContent = e.message;
+  } finally {
+    if (seq === mdDebugSeq) {
+      mdDebugBusy = false;
+      $('mdDebugSend').disabled = false;
+      $('mdDebugPoll').disabled = false;
+    }
+  }
+}
+$('mdBody').addEventListener('click', ev => {
+  const btn = ev.target.closest('[data-md-debug]');
+  if (btn) openModelDebug(btn.dataset.mdDebug);
+});
+$('mdDebugSend').onclick = () => sendModelDebug(false);
+$('mdDebugPoll').onclick = () => sendModelDebug(true);
+$('mdDebugClose').onclick = closeModelDebug;
+$('mdDebugCurl').onclick = () => {
+  if (!mdDebug) return;
+  try {
+    const payload = JSON.parse($('mdDebugPayload').value);
+    navigator.clipboard.writeText(mdCurlCommand(mdDebug, payload, location.origin))
+      .then(() => toast('cURL 已复制；密钥使用 ${WB2API_KEY} 环境变量', 'ok'), e => toast('复制失败：' + e.message, 'err'));
+  } catch (e) { toast('JSON 无效：' + e.message, 'err'); }
+};
 
 /* ── 日志（频道：全部/任务/对话/系统） ─────────────────────────────── */
 let logCh = 'all';
@@ -3539,6 +3697,7 @@ function capKpi(label, value, sub, cls = '') {
     esc(value) + '</div><div class="sub">' + esc(sub) + '</div></div>';
 }
 async function loadCapacity(force = false) {
+  const seq = ++capacityRequestSeq;
   const btn = $('btnCapacity');
   btn.disabled = true;
   $('capNote').textContent = '正在读取服务数据并分析…';
@@ -3546,12 +3705,16 @@ async function loadCapacity(force = false) {
     const q = new URLSearchParams({ days: $('capDays').value, hours: $('capHours').value });
     if (force) q.set('refresh', '1');
     const d = await api('capacity?' + q.toString());
+    if (seq !== capacityRequestSeq) return; // 旧响应不得覆盖较新的筛选条件。
     capacityData = d;
     renderCapacity(d);
   } catch (e) {
+    if (seq !== capacityRequestSeq) return;
     $('capNote').textContent = '分析失败：' + e.message;
     toast('容量分析失败：' + e.message, 'err');
-  } finally { btn.disabled = false; }
+  } finally {
+    if (seq === capacityRequestSeq) btn.disabled = false;
+  }
 }
 function renderCapacity(d) {
   const days = d.parameters && d.parameters.forecast_days || 7;
@@ -3561,11 +3724,13 @@ function renderCapacity(d) {
   const stable = h.stable_replenishment;
   const none = h.no_replenishment;
   const n = main.additional_accounts;
-  $('capHero').textContent = n === null ? '缺少单号额度基线，暂时无法换算补号数' :
+  $('capHero').textContent = n === null ? '积分样本或单号额度不足，无法可靠换算补号数' :
     (n > 0 ? '未来 ' + days + ' 天建议补 ' + n + ' 个号' : '未来 ' + days + ' 天无需为积分补号');
   $('capStats').innerHTML =
-    capKpi('预计日耗', capNumber(d.usage.daily_credits_forecast), 'credits / day', 'c-accent') +
-    capKpi('当前可用余额', capNumber(d.pool.credits_remaining), '预计续航 ' + capNumber(d.forecast.runway_days_without_headroom, 1) + ' 天') +
+    capKpi('预计日耗', capNumber(d.usage.daily_credits_forecast), 'credits / day · 积分样本 ' + capNumber(d.usage.credit_sample_coverage_pct, 1) + '%', 'c-accent') +
+    capKpi('当前可用余额', capNumber(d.pool.credits_remaining), d.forecast.runway_days_without_headroom === null ?
+      (d.usage.credit_forecast_available ? '当前假设下不耗尽' : '暂无可靠续航') :
+      '预计净续航 ' + capNumber(d.forecast.runway_days_without_headroom, 1) + ' 天') +
     capKpi('近期成功率', capNumber(d.traffic.success_rate, 2) + '%', capNumber(d.traffic.requests) + ' 个逻辑请求 / 近 ' + hours + 'h') +
     capKpi('可服务账号', capNumber(d.pool.accounts_available_estimate), '总账号 ' + d.pool.accounts_total + ' · 有余额 ' + d.pool.accounts_credit_positive) +
     capKpi('单号容量基线', capNumber(d.pool.new_account_credit_unit_p25), '启用账号总额度 P25') +
@@ -3590,11 +3755,13 @@ function renderCapacity(d) {
     capNumber(m.success_rate, 1) + '%</td><td class="num">' + (m.recent_6h_success_rate === null ? '—' : capNumber(m.recent_6h_success_rate, 1) + '%') +
     '</td><td class="num">' + capNumber(m.credits) + '</td><td class="num">' + m.http_400 + ' / ' + m.http_429 + ' / ' + m.http_503 + '</td></tr>'
   ).join('') || '<tr><td colspan="6"><div class="empty">所选窗口没有请求归档</div></td></tr>';
-  const generated = String(d.generated_at || '').replace('T', ' ').slice(0, 19);
+  const cutoff = new Date(d.generated_at);
+  const generated = Number.isNaN(cutoff.getTime()) ? String(d.generated_at || '') : cutoff.toLocaleString('zh-CN', { hour12: false });
   $('capNote').textContent = '数据截止 ' + generated + ' · 可信度 ' + d.confidence +
     (d.parameters.cached ? ' · 5 分钟缓存' : ' · 实时重算') + ' · 只读分析，无上游调用';
   $('capMethod').textContent = '日耗：' + d.method.daily_burn + '\n' +
     '计划补给：最近 24h 正向积分变动的 50%；单号额度：有效账号 credits_total 的 P25；所有情景含 20% 安全余量。\n' +
+    '积分样本不全时按已观测单次尝试均值外推；净续航按各批次实际到期时间分段计算，null 表示当前假设下不耗尽或数据不足。\n' +
     '用量 q/e 是账号尝试口径；请求归档才是客户端逻辑请求与严格成功率。并发为基于已完成请求时长的 5 分钟估算，不等于实时租约峰值。\n' +
     '本次预测窗口：稳定补给 ' + capNumber(stable.additional_accounts) + ' 个；不计补给 ' + capNumber(none.additional_accounts) +
     ' 个。归档覆盖 ' + capNumber(d.coverage.request_hours / 24, 1) + ' 天；历史较短时请每日复核，不把点估计当承诺。';

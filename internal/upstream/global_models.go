@@ -57,6 +57,7 @@ type fetchGlobalModelsCache struct {
 	sync.Mutex
 	names    []string    // 成功缓存：并集模型名（已去重）；nil = 未探测/失败
 	infos    []ModelInfo // 成功缓存：对象形态的全字段条目（窄表/失败形态为 nil）
+	valid    bool        // 媒体-only 也是成功目录；不能再用 len(names)>0 充当成功标记
 	fetched  time.Time
 	lastFail time.Time
 }
@@ -108,7 +109,7 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 	}
 
 	c.globalModels.Lock()
-	if len(c.globalModels.names) > 0 && time.Since(c.globalModels.fetched) < globalModelsTTL {
+	if c.globalModels.valid && time.Since(c.globalModels.fetched) < globalModelsTTL {
 		names, infos := c.globalModels.names, c.globalModels.infos
 		c.globalModels.Unlock()
 		return names, infos
@@ -120,13 +121,14 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 	}
 	c.globalModels.Unlock()
 
-	names, infos, efforts, defaults, err := c.probeGlobalModels(a)
-	if err != nil || len(names) == 0 {
+	names, infos, efforts, defaults, media, mediaComplete, err := c.probeGlobalModels(a)
+	if err != nil || (len(names) == 0 && len(media) == 0) {
 		// 探测失败：负缓存 + 返回 nil（effort 桶不写，prepareBody 走 globalEffortMap 静态兜底）。
 		c.globalModels.Lock()
 		c.globalModels.lastFail = time.Now()
 		c.globalModels.names = nil
 		c.globalModels.infos = nil
+		c.globalModels.valid = false
 		c.globalModels.Unlock()
 		return nil, nil
 	}
@@ -137,6 +139,12 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 		c.storeEfforts("global", efforts, defaults)
 	}
 	c.storeModelRates("global", infos)
+	switch {
+	case mediaComplete:
+		c.storeMediaModels("global", media) // 全路成功，允许确认并清空已下线的媒体
+	case len(media) > 0:
+		c.storeMediaModels("global", mergeModelInfos(c.MediaModels("global"), media))
+	}
 
 	// 成功：探测结果去重。names/infos 均落缓存；倍率等选号敏感字段只透出展示，
 	// 不注入 costTier。
@@ -153,6 +161,7 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 	c.globalModels.Lock()
 	c.globalModels.names = merged
 	c.globalModels.infos = infos
+	c.globalModels.valid = true
 	c.globalModels.fetched = time.Now()
 	c.globalModels.lastFail = time.Time{}
 	c.globalModels.Unlock()
@@ -175,7 +184,7 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 // 合并口径：桌面端条目字段权威，IDE/CLI 只补桌面端缺失的模型 id；去重 key =
 // 模型 id，输出顺序稳定。全部 v3 路失败且企业端点也失败才返回错误；单路失败
 // 降级为其余路结果 + warn 日志，互不拖累。
-func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, err error) {
+func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, media []ModelInfo, mediaComplete bool, err error) {
 	// probeV3 单次 /v3/config 探测（UA 参数化）。该端点对不同 UA 下发**不同模型集合**：
 	// 桌面端 / IDE / CLI 三路各有独有模型（见 probeGlobalModels 注释），故并发三路取并集。
 	probeV3 := func(ua string) chan probeResult {
@@ -189,15 +198,19 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 			}
 			ids := make([]string, 0, len(byID))
 			outInfos := make([]ModelInfo, 0, len(byID))
+			outMedia := make([]ModelInfo, 0)
 			for _, mi := range byID {
 				if nonChatModel(mi.ID, mi.MaxTokens, mi.Tags) {
+					if mi.Type == "image" || mi.Type == "video" {
+						outMedia = append(outMedia, mi)
+					}
 					continue
 				}
 				ids = append(ids, mi.ID)
 				outInfos = append(outInfos, mi)
 			}
 			sort.Strings(ids) // map 迭代序随机，排序保输出稳定
-			ch <- probeResult{names: ids, infos: outInfos}
+			ch <- probeResult{names: ids, infos: outInfos, media: outMedia}
 		}()
 		return ch
 	}
@@ -216,7 +229,7 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 				lastErr = perr
 				continue
 			}
-			enterpriseCh <- probeResult{names: names, infos: infos}
+			enterpriseCh <- splitGlobalProbeMedia(probeResult{names: names, infos: infos})
 			return
 		}
 		enterpriseCh <- probeResult{err: lastErr}
@@ -239,18 +252,20 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 
 	if v3.err != nil && enterprise.err != nil {
 		// 两路全失败 → 负缓存语义（等价原家族端点全非 2xx）。
-		return nil, nil, nil, nil, v3.err
+		return nil, nil, nil, nil, nil, false, v3.err
 	}
 	if v3.err != nil {
 		// /v3 失败降级：不拖累企业端点结果（降级仅企业端点 + warn）。
 		log.Printf("WARN: [upstream] global models: v3/config probe failed (degraded to enterprise endpoint): %v", v3.err)
 		names, infos, efforts, defaults = extractEfforts(enterprise.infos)
-		return names, infos, efforts, defaults, nil
+		media = enterprise.media
+		return names, infos, efforts, defaults, media, false, nil
 	}
 	if enterprise.err != nil {
 		log.Printf("WARN: [upstream] global models: enterprise endpoint failed (v3/config only): %v", enterprise.err)
 		names, infos, efforts, defaults = extractEfforts(v3.infos)
-		return names, infos, efforts, defaults, nil
+		media = v3.media
+		return names, infos, efforts, defaults, media, false, nil
 	}
 	// 两路皆成功：v3 为主、企业端点补缺合并（含 effort 桶合并，v3 权威）。
 	v3Names, v3Infos, v3Efforts, v3Defaults := extractEfforts(v3.infos)
@@ -264,7 +279,8 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 	names, infos = mergeGlobalCatalog(v3Names, v3Infos, entNames, entInfos)
 	efforts = mergeEffortBuckets(v3Efforts, entEfforts)
 	defaults = mergeEffortDefaults(v3Defaults, entDefaults)
-	return names, infos, efforts, defaults, nil
+	media = mergeModelInfos(v3.media, enterprise.media)
+	return names, infos, efforts, defaults, media, true, nil
 }
 
 // probeResult 单路模型目录探测结果（/v3/config 某 UA 路，或企业端点家族）。
@@ -272,7 +288,36 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 type probeResult struct {
 	names []string
 	infos []ModelInfo
+	media []ModelInfo // 同次探测的图像/视频模型，独立进入媒体目录
 	err   error
+}
+
+// splitGlobalProbeMedia 将企业目录中的媒体条目从聊天目录剥离。
+// v3 路在解析时已分流；企业路共用此函数，避免媒体以 chat 身份混入或彻底丢失。
+func splitGlobalProbeMedia(in probeResult) probeResult {
+	nonChatIDs := make(map[string]struct{})
+	chatInfos := make([]ModelInfo, 0, len(in.infos))
+	for _, mi := range in.infos {
+		if nonChatModel(mi.ID, mi.MaxTokens, mi.Tags) {
+			nonChatIDs[mi.ID] = struct{}{}
+			if mi.Type == "image" || mi.Type == "video" {
+				in.media = append(in.media, mi)
+			}
+			continue
+		}
+		chatInfos = append(chatInfos, mi)
+	}
+	in.infos = chatInfos
+	if len(nonChatIDs) > 0 {
+		names := make([]string, 0, len(in.names))
+		for _, id := range in.names {
+			if _, blocked := nonChatIDs[id]; !blocked {
+				names = append(names, id)
+			}
+		}
+		in.names = names
+	}
+	return in
 }
 
 // mergeV3Routes 按优先级合并 /v3/config 多路 UA 探测结果：routes 必须**按权威
@@ -298,7 +343,7 @@ func mergeV3Routes(routes []struct {
 			continue
 		}
 		nOK++
-		if out.err != nil || (len(out.names) == 0 && len(out.infos) == 0) {
+		if out.err != nil || (len(out.names) == 0 && len(out.infos) == 0 && len(out.media) == 0) {
 			// 首个成功路：整体作为基底（字段权威）。
 			out = r.res
 			continue
@@ -306,6 +351,7 @@ func mergeV3Routes(routes []struct {
 		// 后续成功路：只补缺失的 id。
 		mergedNames, mergedInfos := mergeGlobalCatalog(out.names, out.infos, r.res.names, r.res.infos)
 		out.names, out.infos = mergedNames, mergedInfos
+		out.media = mergeModelInfos(out.media, r.res.media)
 	}
 	if nOK == 0 {
 		return probeResult{err: firstErr}

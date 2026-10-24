@@ -262,14 +262,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // 不记账等于在面板「请求记录」里完全看不见搜索流量（此前正是如此——只挂
 // /v1/chat/completions 一个硬编码路径）。
 func (h *Handler) tracedRequest(r *http.Request) bool {
-	if r.Method != http.MethodPost {
-		return false
-	}
 	if r.Method == http.MethodGet && isVideoPollPath(r.URL.Path) {
 		return true // 轮询也是真实上游调用，面板要能看见任务查询
 	}
+	if r.Method != http.MethodPost {
+		return false
+	}
 	return r.URL.Path == "/v1/chat/completions" || isSearchPath(r.URL.Path) ||
-		isFetchPath(r.URL.Path) || isImagePath(r.URL.Path)
+		isFetchPath(r.URL.Path) || isImagePath(r.URL.Path) || isVideoPath(r.URL.Path)
 }
 
 // isSearchPath 判断是否为搜索端点。

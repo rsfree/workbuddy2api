@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 )
 
 // TestVideoSubmitAndPoll 提交流程：返回 task id；轮询用提交时的账号拿成片。
@@ -31,8 +32,9 @@ func TestVideoSubmitAndPoll(t *testing.T) {
 			t.Errorf("unexpected upstream path %s", r.URL.Path)
 		}
 	})
+	reqLog := reqlog.New(reqlog.Config{})
 	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
-		Upstream: up})
+		Upstream: up, RequestLog: reqLog})
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/videos/generations",
@@ -50,6 +52,13 @@ func TestVideoSubmitAndPoll(t *testing.T) {
 	}
 	if submitted["model"] != "minimax-video-h3" {
 		t.Errorf("默认模型=%v want minimax-video-h3", submitted["model"])
+	}
+	if rec.Header().Get("X-Request-Id") == "" {
+		t.Error("视频提交缺少 X-Request-Id")
+	}
+	if snap := reqLog.Snapshot(); snap.Completed != 1 || len(snap.Recent) != 1 ||
+		snap.Recent[0].Path != "/v1/videos/generations" || snap.Recent[0].Model != "minimax-video-h3" {
+		t.Fatalf("视频提交未正确进入请求日志：%+v", snap)
 	}
 	if got := rec.Header().Get("X-WB2A-Video-Task"); got != "task-1" {
 		t.Errorf("X-WB2A-Video-Task=%q", got)
@@ -79,6 +88,13 @@ func TestVideoSubmitAndPoll(t *testing.T) {
 	}
 	if queryBody != `{"task_id":"task-1"}` {
 		t.Errorf("query body=%s", queryBody)
+	}
+	if rec.Header().Get("X-Request-Id") == "" {
+		t.Error("视频轮询缺少 X-Request-Id")
+	}
+	if snap := reqLog.Snapshot(); snap.Completed != 2 || len(snap.Recent) != 2 ||
+		snap.Recent[0].Path != "/v1/videos/task-1" || snap.Recent[0].Status != http.StatusOK {
+		t.Fatalf("视频轮询未正确进入请求日志：%+v", snap)
 	}
 }
 
