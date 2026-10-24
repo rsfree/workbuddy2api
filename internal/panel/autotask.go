@@ -177,7 +177,7 @@ var autoActions = []autoAction{
 	},
 	{
 		TaskCode: "Sequential_Tasks_7",
-		Desc:     "体验灵感功能（预留，疑 PC 口径 +500c+5e）：accept → 灵感事件组（PC+mp 双形态）→ 领奖（判据待解锁验证）",
+		Desc:     "体验灵感功能（PC 限定）：accept → 桌面灵感事件 → 回读确认 → 领取 +500 分 +5 能",
 		run:      runSequentialPlaybook,
 	},
 }
@@ -557,13 +557,11 @@ var mpTaskCodes = map[string]bool{
 	"Sequential_Tasks_1": true, // 小程序首对话（mini chat，无 activityId）
 	"Sequential_Tasks_2": true, // 小程序选中专家并完成有效对话（mp 指纹 expert_actual_use）
 	"Sequential_Tasks_3": true, // 小程序完成 5 次对话（与 Tasks_1 同形状，target=5 逐条累加）
-	// Tasks_4..7 存在性已实测（accept 返回 prerequisite not met 链式依赖；Tasks_8 not
-	// found 封顶）。链条每日零点解锁一环（task locked until 次日），判据为 issue #42
-	// 描述 + mpsrc 事件形状预置，解锁后逐个实测校正。
+	// Tasks_4..6 存在性已实测（accept 返回 prerequisite not met 链式依赖；Tasks_8 not
+	// found 封顶）。Tasks_7 上游实际标记为「PC 限定」，不属于这个 mp 集合。
 	"Sequential_Tasks_4": true,
 	"Sequential_Tasks_5": true,
 	"Sequential_Tasks_6": true,
-	"Sequential_Tasks_7": true,
 }
 
 // isMPTaskCode 报告任务是否小程序口径专属（决定回读/接受/领奖走 mp 变体）。
@@ -886,21 +884,65 @@ func runSequentialModelChat(p *Panel, a *auth.Auth) (string, error) {
 		})
 }
 
-// runSequentialPlaybook 完成 Sequential_Tasks_7「体验灵感功能」（预留，疑 PC 口径）。
-// primary：PC 灵感事件组（DesktopPlaybookPromptSequence，playbook_prompt 三账号
-// 实测点亮）；fallback：mp 指纹灵感事件组（MiniPlaybookEvents，mpsrc 形状）。
+// runSequentialPlaybook 完成 Sequential_Tasks_7「体验灵感功能」。
+// 2026-10-24 线上任务实际下发 tag=「PC 限定」、jump_url=workbuddy://playbook，
+// 因此不能复用 Sequential 的 mp 通用骨架：默认列表/accept、桌面事件、默认列表回读、
+// Web 领奖必须同属 PC 口径。整个动作只做任务事件上报，不发起模型生成请求。
 func runSequentialPlaybook(p *Panel, a *auth.Auth) (string, error) {
+	const code = "Sequential_Tasks_7"
+	t, err := p.taskByCode(a, code)
+	if err != nil {
+		return "", err
+	}
+	if t == nil {
+		return "PC 口径未下发体验灵感任务（前置任务未完成或活动未开始）", nil
+	}
+	if t.Claimed {
+		return "已领取", nil
+	}
+	target := t.Target
+	if target <= 0 {
+		target = 1
+	}
+	if t.Current >= target {
+		credit, energy, err := p.cfg.Upstream.ClaimReward(a, code)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("已领取奖励（+%d 分 +%d 能）", credit, energy), nil
+	}
+	if t.AcceptStatus == "not_accepted" || t.AcceptStatus == "" {
+		if err := p.cfg.Upstream.AcceptTasks(a, []string{code}); err != nil {
+			return "", fmt.Errorf("接受体验灵感任务: %w", err)
+		}
+		time.Sleep(reportGap)
+	}
+
 	ms := time.Now().UnixMilli()
-	return p.runSequentialEventTask(a, "Sequential_Tasks_7",
-		func() error {
-			conv := fmt.Sprintf("wb2api-pb-%d", ms)
-			req := fmt.Sprintf("wb2api-pb-req-%d", ms)
-			return p.cfg.Upstream.ReportDesktopEvent(a,
-				upstream.DesktopPlaybookPromptSequence(conv, req, "pm-gtm-launch-plan", "新产品上市 GTM 发布计划一页纸")...)
-		},
-		func() error {
-			return p.cfg.Upstream.ReportMPEvent(a, upstream.MiniPlaybookEvents("pm-gtm-launch-plan", "新产品上市 GTM 发布计划一页纸")...)
-		})
+	conv := fmt.Sprintf("wb2api-pb-%d", ms)
+	req := fmt.Sprintf("wb2api-pb-req-%d", ms)
+	if err := p.cfg.Upstream.ReportDesktopEvent(a,
+		upstream.DesktopPlaybookPromptSequence(conv, req, "pm-gtm-launch-plan", "新产品上市 GTM 发布计划一页纸")...); err != nil {
+		return "", fmt.Errorf("上报 PC 灵感事件: %w", err)
+	}
+	after, err := p.taskByCodeWaiting(a, code)
+	if err != nil {
+		return "", fmt.Errorf("回读体验灵感任务: %w", err)
+	}
+	if after == nil {
+		return "", fmt.Errorf("已上报 PC 灵感事件，但默认任务列表未返回 %s", code)
+	}
+	if after.Claimed {
+		return "本轮已入账（claimed）", nil
+	}
+	if !after.Claimable {
+		return "", fmt.Errorf("已上报 PC 灵感事件，但进度仍为 %s，未领奖", taskProgressText(after))
+	}
+	credit, energy, err := p.cfg.Upstream.ClaimReward(a, code)
+	if err != nil {
+		return "", fmt.Errorf("体验灵感任务已达标但领奖失败: %w", err)
+	}
+	return fmt.Sprintf("体验灵感完成并领取奖励（+%d 分 +%d 能）", credit, energy), nil
 }
 
 // runMiniExpert 完成 Sequential_Tasks_2「在小程序内选中专家并完成有效对话」。

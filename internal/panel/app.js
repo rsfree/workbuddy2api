@@ -1840,7 +1840,7 @@ const AUTO_TASKS = {
   'Sequential_Tasks_4': '小程序定时任务（预留，每日零点解锁一环）：accept → 定时任务创建事件 → 领奖（判据待解锁验证）',
   'Sequential_Tasks_5': '小程序使用 GLM5.2（预留）：accept → 带模型字段的 mini 对话上报 → 领奖（判据待解锁验证）',
   'Sequential_Tasks_6': '小程序十次对话（预留）：accept → mini 对话上报 ×target（自动补差额）→ 领奖',
-  'Sequential_Tasks_7': '体验灵感功能（预留，疑 PC 口径）：accept → 灵感事件组（PC+mp 双形态）→ 领奖（判据待解锁验证）'
+  'Sequential_Tasks_7': '体验灵感功能（PC 限定）：accept → 桌面灵感事件 → 回读确认 → 领取 +500 分 +5 能；零积分账号由周期清扫单独补跑'
 };
 
 function openTasks(uid) {

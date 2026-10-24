@@ -1,7 +1,8 @@
 // tasksweep.go 周期幂等「补领清扫 + 新任务发现」。
 //
-// 主职责——只 accept 尚未接受的任务、只 claim 已达标未领的任务，**不跑任何
-// 行为链路**（不真实对话、不上报事件）。来源见 issue #174：
+// 主职责——accept 尚未接受的任务、claim 已达标未领的任务；另有一个窄口径
+// 例外：零积分账号的 Sequential_Tasks_7 会补跑纯事件动作（无模型生成），
+// 让耗尽账号分钟级回血，不必干等次日 01:00 的全量成长队列。来源见 issue #174：
 //
 //   - 队列只收「有自动动作」的任务（精确表或族模式），其余任务即使达标也永远
 //     扫不进队列、永远不领奖；
@@ -48,6 +49,7 @@ type TaskSweepStats struct {
 	Errors     int   `json:"errors"`     // 本轮出错（不中断）的次数
 	Discovered int   `json:"discovered"` // 本轮首次发现的新任务数（任务目录 diff）
 	NewAuto    int   `json:"new_auto"`   // 新任务中具备自动动作的个数
+	Rescued    int   `json:"rescued"`    // 零积分账号体验灵感补跑并成功领取的数量
 
 	// newCodes 新发现且可自动的任务码（不导出：只在本轮调度内部流转）。
 	newCodes []string
@@ -73,9 +75,10 @@ func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 			continue // 无个人成长体系：零上游请求
 		}
 		wg.Add(1)
-		go func(a *auth.Auth, uid string) {
+		go func(a *auth.Auth, uid string, credits, creditsTotal int64) {
 			defer wg.Done()
-			r := p.sweepAccount(a, uid)
+			rescue := credits <= 0 && creditsTotal > 0 && p.shouldRunDiscovered()
+			r := p.sweepAccountWithRescue(a, uid, rescue)
 			mu.Lock()
 			defer mu.Unlock()
 			st.Accounts += r.accounts
@@ -87,8 +90,9 @@ func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 			st.Errors += r.errors
 			st.Discovered += r.discovered
 			st.NewAuto += r.newAuto
+			st.Rescued += r.rescued
 			st.newCodes = append(st.newCodes, r.newCodes...)
-		}(a, ps.UID)
+		}(a, ps.UID, ps.Credits, ps.CreditsTotal)
 	}
 	wg.Wait()
 
@@ -113,9 +117,9 @@ func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 		go p.runDiscoveredTasks(codes)
 	}
 
-	if st.Claims() > 0 || st.Errors > 0 || st.Accepted > 0 || st.Discovered > 0 {
-		log.Printf("panel: 任务补领清扫：%d 个账号（跳过 %d）· 新任务 %d（可自动 %d）· 接受 %d · 领奖 %d · +%d 分 +%d 能 · 出错 %d",
-			st.Accounts, st.Skipped, st.Discovered, st.NewAuto, st.Accepted, st.Claimed, st.Credits, st.Energy, st.Errors)
+	if st.Claims() > 0 || st.Errors > 0 || st.Accepted > 0 || st.Discovered > 0 || st.Rescued > 0 {
+		log.Printf("panel: 任务补领清扫：%d 个账号（跳过 %d）· 新任务 %d（可自动 %d）· 接受 %d · 领奖 %d · 零积分补给 %d · +%d 分 +%d 能 · 出错 %d",
+			st.Accounts, st.Skipped, st.Discovered, st.NewAuto, st.Accepted, st.Claimed, st.Rescued, st.Credits, st.Energy, st.Errors)
 	}
 	return st
 }
@@ -154,13 +158,21 @@ func (s TaskSweepStats) Claims() int { return s.Claimed }
 type sweepResult struct {
 	accounts, skipped, accepted, claimed, errors int
 	discovered, newAuto                          int
+	rescued                                      int
 	newCodes                                     []string // 新发现且具备自动动作的码
 	credit, energy                               int64
 }
 
 // sweepAccount 单账号一轮清扫。命中账号锁（正在跑任务动作）时整账号跳过：
 // 不打断进行中的链路，下一轮自然补上。
-func (p *Panel) sweepAccount(a *auth.Auth, uid string) (res sweepResult) {
+func (p *Panel) sweepAccount(a *auth.Auth, uid string) sweepResult {
+	return p.sweepAccountWithRescue(a, uid, false)
+}
+
+// sweepAccountWithRescue 在普通补领之外，仅对零积分且允许成长任务的账号
+// 补跑 Sequential_Tasks_7。whitelist 收窄到这一条纯事件任务，避免周期清扫
+// 意外提前执行专家对话、夜间对话等其他付费/高风险行为链。
+func (p *Panel) sweepAccountWithRescue(a *auth.Auth, uid string, zeroCreditRescue bool) (res sweepResult) {
 	res.accounts = 1
 	if !p.tryLockAccount(uid) {
 		res.skipped = 1
@@ -209,6 +221,30 @@ func (p *Panel) sweepAccount(a *auth.Auth, uid string) (res sweepResult) {
 	mpOK, mpFailed := p.acceptCodesWithFallback(a, mpCodes, true)
 	res.accepted += ok + mpOK
 	res.errors += failed + mpFailed
+
+	// 零积分补给：只补跑 PC 限定的体验灵感任务。已达标项不重复上报，
+	// 留给下方统一补领；已 claimed / locked 由 growthPending 排除。
+	if zeroCreditRescue {
+		for _, t := range tasks {
+			if t.TaskCode != "Sequential_Tasks_7" || !growthPending(t) || t.Claimable {
+				continue
+			}
+			msg, rerr := p.runGrowthQueued(a, t.TaskCode)
+			if rerr != nil {
+				res.errors++
+				log.Printf("panel: 零积分补给 uid=%s code=%s 失败: %v", uid, t.TaskCode, rerr)
+				continue
+			}
+			// 只有回读确认 claimed 才记补给成功；上报 200 不等于进度点亮。
+			if after, err := p.taskByCode(a, t.TaskCode); err == nil && after != nil && after.Claimed {
+				res.rescued++
+				res.claimed++
+				res.credit += t.Credit
+				res.energy += t.Energy
+			}
+			log.Printf("panel: 零积分补给 uid=%s code=%s: %s", uid, t.TaskCode, msg)
+		}
+	}
 
 	// 阶段二：领取已达标的奖励。claim 幂等（重复领 already_claimed → 0 分 0 能），
 	// 单项出错只记录、不中断后续任务。
