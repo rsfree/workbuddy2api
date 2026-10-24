@@ -190,3 +190,28 @@ cp /root/wb2api-hk-proxy.inc.bak-20261023 /www/server/panel/vhost/nginx/wb2api-h
 > 校准实况（上线 10 分钟、真实流量）：`deepseek-v4.1-flash` 49 样本 slope≈1.96、
 > `kimi-k2.5` 12 样本 slope≈0.89 + intercept≈557（说明上游把固定开销算进了 prompt_tokens，
 > intercept 正是为它准备的）、另有 4 个模型在学。文件在 `data/token-calib.json`，重建容器不丢。
+
+## 上线验证清单（1.13.30 实测 · 2026-10-24 16:16）
+
+```
+model=deepseek-v4.1-flash
+count_tokens 首探（mode=miss）      22      ← 与真实 35 差 -37%（整段粗估）
+/v1/messages 真跑                  usage.input_tokens=35
+count_tokens 再探（完全命中）        35      ← 与上游一字不差，零估算
+追加一条短 user                    61      ← 35 + 新增（tail<500，不打日志）
+追加 1789 字符中英混合             805     ← 真实 658（+22%），tail 估算 770 vs 实际 623
+追加 3000 字符 'x'                 1878    ← 真实 411（+357%），重复串被 tokenizer 压缩
+/status token_baseline            entries=18 hits=6 misses=1 pred_verified=3 pred_pending=4
+                                  deepseek mae=1.3881 worst=3.5693
+日志                               count_tokens model=… mode=miss msgs=1 est=12
+                                  count_tokens model=… mode=prefix matched=1/2 base=35 tail=1004 out=1878
+```
+
+> **结论**：完全命中（同一批 messages 跑过 chat）时与上游完全一致，这是 Claude Code 压缩前
+> 探测的典型路径；前缀命中时误差集中在「新增段」，自然语言 +22%、极端重复字符 +3.5 倍。
+>
+> **已暴露的优化点（下一版）**：`AdjustTail` 现在借用整段回归的 `slope`（本例 1.28），但整段
+> 斜率把 system / tools 的固定开销摊进了比例，而 tail 段没有那部分开销 —— 所以按比例地高估。
+> 数据来源已经现成：`pred_by_model.mae` 就是 tail 段的独立误差，样本攒到几十条后可以给 tail
+> 单开一个只用比例（不带 intercept）的系数，或者把 `guessTokens` 的「1 token ≈ 3 字符」按
+> ASCII / CJK 分开标定。先看线上 `mae` 收敛到多少再决定要不要动。
