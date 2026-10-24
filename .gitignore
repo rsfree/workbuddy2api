@@ -45,3 +45,7 @@ docs/
 *.zip
 server.exe
 .DS_Store
+
+# Node (scripts/register_sms.mjs)
+node_modules/
+scripts/package-lock.json

@@ -1,0 +1,9 @@
+{
+  "name": "workbuddy2api-scripts",
+  "private": true,
+  "type": "module",
+  "description": "面板配套脚本（register_sms.mjs 依赖 puppeteer-core；python 任务脚本无关）",
+  "dependencies": {
+    "puppeteer-core": "^24.0.0"
+  }
+}
