@@ -32,8 +32,8 @@ func bodyCaptureUpstream(t *testing.T, got *string) *upstream.Client {
 	}
 }
 
-// TestModelAliasRewritesOutboundBody 别名 kimi-k3.1 必须归一为 kimi-k3-1 再出站；
-// 否则上游（CodeBuddy 体系只认连字符 id）11102 白占一次选号。
+// TestModelAliasRewritesOutboundBody 别名 kimi-k3.1 必须归一为 kimi-k3.1-pro 再出站；
+// 上游没有 kimi-k3.1 这个 id（11102），且 K3.1 系列仅 Pro 一款，不可投向 k3-1。
 func TestModelAliasRewritesOutboundBody(t *testing.T) {
 	var got string
 	up := bodyCaptureUpstream(t, &got)
@@ -50,8 +50,8 @@ func TestModelAliasRewritesOutboundBody(t *testing.T) {
 	if err := json.Unmarshal([]byte(got), &obj); err != nil {
 		t.Fatalf("upstream body not json: %v", err)
 	}
-	if obj["model"] != "kimi-k3-1" {
-		t.Fatalf("出站 model=%v want kimi-k3-1（别名未归一，上游必然 11102）", obj["model"])
+	if obj["model"] != "kimi-k3.1-pro" {
+		t.Fatalf("出站 model=%v want kimi-k3.1-pro（别名未归一，上游必然 11102）", obj["model"])
 	}
 }
 
@@ -68,7 +68,7 @@ func TestModelAliasWithRealmPrefix(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
-	if !strings.Contains(got, `"model":"kimi-k3-1"`) {
+	if !strings.Contains(got, `"model":"kimi-k3.1-pro"`) {
 		t.Fatalf("cn: 前缀 + 别名：出站 body 未含规范名，got=%s", got)
 	}
 }

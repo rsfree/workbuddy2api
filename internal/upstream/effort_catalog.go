@@ -35,10 +35,13 @@ var cnEffortFallback = map[string]effortCap{
 	"glm-5.2":             {efforts: []string{"high", "xhigh"}, defaultEffort: "high"},
 	"glm-5.1":             {efforts: []string{"medium"}},
 	"glm-5v-turbo":        {efforts: []string{"medium"}},
-	"kimi-k3-1":           {efforts: []string{"medium"}},
-	"kimi-k2.7":           {efforts: []string{"medium"}},
-	"kimi-k2.6":           {efforts: []string{"medium"}},
-	"minimax-m3":          {efforts: []string{"medium"}},
+	// kimi-k3.1-pro：上游 /v1/models 下发 [low,high,max]、默认 high（与 k3-1 的
+	// 单档 medium 完全不同——这正是"两者不是同一模型"的又一证据）。
+	"kimi-k3.1-pro": {efforts: []string{"low", "high", "max"}, defaultEffort: "high"},
+	"kimi-k3-1":     {efforts: []string{"medium"}},
+	"kimi-k2.7":     {efforts: []string{"medium"}},
+	"kimi-k2.6":     {efforts: []string{"medium"}},
+	"minimax-m3":    {efforts: []string{"medium"}},
 }
 
 // globalEffortFallback global / WorkBuddy 国际版面静态兜底表。

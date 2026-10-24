@@ -51,6 +51,10 @@ var contextCapFallback = map[string]contextCap{
 	"kimi-k2.5":         {context: 164000, maxOutput: 262144},  // 实测（global 侧同 id 外推 164K）；输出 models.dev 共识 262144
 	"kimi-k3":           {context: 1048576, maxOutput: 131072}, // models.dev 官方（moonshotai 1M/128K）
 	"kimi-k2.8-preview": {context: 1048576, maxOutput: 0},      // models.dev（Kimi K2.8 Preview 1M；输出上限未收录，省略）
+	// 以下两条 2026-10-24 上游直连实测补齐（此前缺条目，全靠 remote 下发，
+	// 一旦探测失败就掉到 DefaultContextWindow 且无任何提示）。
+	"kimi-k3-1":     {context: 1048576, maxOutput: 1048576}, // 上游下发 maxInput 1M / maxOutput 1048576（原值照抄）
+	"kimi-k3.1-pro": {context: 1048576, maxOutput: 32000},   // 上游下发 1M / 32000（3T 旗舰，独立于 k3-1）
 
 	// ---- MiniMax / 混元（tencent）----
 	"minimax-m3":    {context: 512000, maxOutput: 512000}, // 实测（CN 512K）；输出 models.dev 共识 512000
