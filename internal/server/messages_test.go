@@ -271,11 +271,12 @@ func TestMessagesSearchUpstreamErrorShape(t *testing.T) {
 	}
 }
 
-// TestMessagesRouteDoesNotShadowV1Messages 断言搜索端点没有占用 /v1/messages
-// （该路径保留给 Anthropic 模型对话）。
-func TestMessagesRouteDoesNotShadowV1Messages(t *testing.T) {
+// TestV1MessagesIsChatNotSearch 断言 /v1/messages 归模型对话前门（Anthropic
+// 协议），搜索仍独占 /v1/search/messages：两侧不能互相抢占——搜索请求打到
+// /v1/messages 时绝不能进搜索链路，也不该再回 404 让客户端以为不支持。
+func TestV1MessagesIsChatNotSearch(t *testing.T) {
 	up := newSearchUpstream(t, func(w http.ResponseWriter, r *http.Request) {
-		t.Error("不得打上游")
+		t.Error("搜索上游不得被 /v1/messages 触发")
 	})
 	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
 		Upstream: up})
@@ -283,8 +284,21 @@ func TestMessagesRouteDoesNotShadowV1Messages(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte(`{}`)))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("POST /v1/messages code=%d want 404（该路径留给模型对话）", rec.Code)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("POST /v1/messages code=%d want 400（messages 为空）", rec.Code)
+	}
+	var out struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("error body must be JSON: %v", err)
+	}
+	if out.Type != "error" || out.Error.Type != "invalid_request_error" {
+		t.Errorf("envelope=%+v want Anthropic invalid_request_error", out)
 	}
 }
 

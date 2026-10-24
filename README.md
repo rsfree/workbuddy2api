@@ -64,6 +64,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 🧲 **会话粘性** | 同一会话（`conversation_id`）尽量绑定同一账号，TTL 滚动续期，失败自动解绑，可镜像 Redis 防重启丢失 |
 | ⏰ **定时任务** | 签到（09/21 点，末尾自动跑**连登管家**：兑换已解锁档位 + 抽完抽奖次数）+ 活跃上报（10 点，点亮连登 / 解锁领养 + streak 自检）+ 猫猫旅行（09/21 点，独立排程）+ token 保活（22 点），四类独立开关 |
 | ⚡ **流式 + 非流式** | 出站强制 `stream:true`；SSE 帧按规范白名单重建；非流式由本地聚合为单响应 |
+| 🤝 **双协议前门** | `POST /v1/messages`（Anthropic Messages）与 `POST /v1/responses`（OpenAI Responses）把 Claude Code / Codex 等客户端接进来：请求翻成 chat 形态、响应（含 SSE）翻回目标协议，中间复用同一条选号 / 粘性 / 轮转 / 冷却 / 记账链路；另提供 `POST /v1/messages/count_tokens`（按真实 `usage.prompt_tokens` 在线自校准的输入估算） |
 | 🧠 **推理模型兼容** | DeepSeek 思维链注入（`thinking.type=enabled` + 默认档）、`reasoning_content` 多轮回填、effort 档位自动降级 |
 | 🔍 **联网搜索** | `POST /v1/search/messages` 把上游 `/agenttool/v1/search` 包成 Anthropic Messages 兼容形态（DSH 等客户端的搜索 provider 零改动接入）；复用账号池选号 / 在途租约 / token 刷新 / 错误冷却，出站请求头对齐官方客户端 |
 | 🎨 **图像生成** | `POST /v1/images/generations`（文生图）与 `POST /v1/images/edits`（图生图，multipart / JSON）把上游 `/v2/images/*` 包成 OpenAI images 形态；另提供 **chat 前门**：`/v1/chat/completions` 选图像模型即可直接生图（`stream` 回 SSE）。复用账号池 / 租约 / 冷却 / 用量积分记账。默认 `hunyuan-image-alpha` 与 `hunyuan-image-alpha-edit` |
@@ -745,6 +746,79 @@ export WB2A_EGRESS_PASSWORD=<口令>
 
 ## API 端点
 
+### 对话协议前门 `POST /v1/messages` / `POST /v1/responses`
+
+除了 OpenAI 的 `/v1/chat/completions`，网关还内置两种对话协议的前门，让只会说别家协议
+的客户端零改动接入：
+
+| 端点 | 协议 | 典型客户端 |
+|---|---|---|
+| `POST /v1/messages` | Anthropic Messages | Claude Code、Anthropic SDK（Python/TS） |
+| `POST /v1/messages/count_tokens` | Anthropic token 预估 | Claude Code（上下文压缩前探测） |
+| `POST /v1/responses` | OpenAI Responses | Codex CLI、OpenAI Responses SDK |
+
+**实现方式**：入口把请求翻成 chat 请求，交给 `chatCompletions` 跑**同一条链路**；出口在写入器
+层面把 chat 的输出（含 SSE 增量）翻回目标协议。因此账号选择、会话粘性、轮转重试、冷却熔断、
+提示词改写、指纹脱敏、用量与积分记账对新协议**天然一致**，不存在两套行为。
+
+翻译保真度：
+
+- **Anthropic**：`system`（字符串或块数组）→ system 消息；`text` / `image`（base64 自动拼 data URL）；
+  `tool_use` → `tool_calls`，`tool_result` → 独立 `tool` 消息（顺序对齐 OpenAI 要求）；
+  `tools[].input_schema` → `function.parameters`；`tool_choice` auto/any/tool/none 双向映射；
+  上游 `reasoning_content` 回填为 `thinking` 块。
+- **Responses**：`instructions` → system，`developer` → system，`input` 字符串或条目数组
+  （`message` / `function_call` / `function_call_output`，`reasoning` 条目跳过）；
+  `max_output_tokens` → `max_tokens`；扁平工具形态与已嵌套形态都认；`text.format` 的
+  `json_schema` / `json_object` → `response_format`。
+- **流式**：Anthropic 侧发 `message_start` → `content_block_*`（`text_delta` / `thinking_delta` /
+  `input_json_delta`）→ `message_delta`（含 `stop_reason`）→ `message_stop`；Responses 侧发
+  `response.created` → `output_item.*` / `output_text.delta` → `response.completed`。
+  工具参数跨帧到达时会攒完再发整块 `tool_use` / `function_call`。
+- **`count_tokens` 自校准**：网关没有上游分词器，先按字符数粗估，再用该模型**已学到**的
+  系数换算成上游口径（`实际 ≈ slope × 粗估 + intercept`）。样本来自每一次成功的对话
+  请求（`/v1/chat/completions`，以及复用同一条链路的 `/v1/messages` / `/v1/responses`）：
+  请求进来时手里有本地估算，响应结束时有真实的 `usage.prompt_tokens`，两者配对做
+  在线回归：拟合用指数遗忘（≈ 最近 50 条，跟得上内容分布变化），置信度用**累计**样本数
+  （`w = n/(n+4)` 向 `slope=1 / intercept=0` 收缩，200 条后退到 2% 以内——最坏就是不校准，
+  不会比粗估更差）。样本长度都差不多时 `slope`/`intercept` 不可辨识，此时只允许斜率在
+  0.5~2 的带宽内微调，避免把「固定开销」当成「比例」。带图请求不计入样本：图像 token 进得了
+  上游 `prompt_tokens`，但字符估算侧一个都数不到，混进来会把斜率抬高。参数落在 state 文件同目录的 `token-calib.json`（重启不丢），
+  并实时透出在 `GET /status` 的 `token_calib` 里：
+  `{"glm-5.2":{"slope":2.31,"intercept":180,"samples":42,"weighted_samples":38.2}}`。
+  Claude Code 压缩时机偏早/偏晚时先看 `slope` 是否明显偏离 1；`samples` 到几十条即稳定。
+  `intercept` 吸收的是网关注入的 system 提示词这类固定开销（粗估里没有）。
+- **错误**：上游错误按目标协议的信封回包（Anthropic 是 `{"type":"error","error":{...}}`，
+  429→`rate_limit_error`、503→`overloaded_error`、400→`invalid_request_error`），
+  `message` 保留上游原文，`gateway_hint` 一并带上；鉴权失败的 401 同样是协议原生形状。
+
+```bash
+# Anthropic Messages（Claude Code 把 ANTHROPIC_BASE_URL 指向网关根路径即可）
+curl -s http://localhost:7863/v1/messages \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4-flash","max_tokens":128,
+       "messages":[{"role":"user","content":"hi"}]}'
+
+# Anthropic 流式
+curl -sN http://localhost:7863/v1/messages \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4-flash","max_tokens":128,"stream":true,
+       "messages":[{"role":"user","content":"hi"}]}'
+
+# OpenAI Responses（Codex CLI 把 base_url 指向 <网关>/v1）
+curl -s http://localhost:7863/v1/responses \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4-flash","input":"hi"}'
+```
+
+> ⚠️ **配合 `prompt_mode`**：默认 `custom` 会用网关自有提示词**整段替换** system 消息。
+> Claude Code / Codex 的 system 里带工具使用约定，被替换后工具行为会退化。这两个客户端
+> 场景建议把 `prompt_mode` 设为 `append`（保留客户端 system，追加网关提示词）或
+> `passthrough`（完全透传）。
+
 ### 联网搜索 `POST /v1/search/messages`
 
 把上游 `/agenttool/v1/search` 包成 **Anthropic Messages 兼容**的搜索端点。这样任何按
@@ -754,8 +828,9 @@ baseURL 指向 `<网关>/v1/search`，即可零代码接入本网关的搜索能
 与 chat 共享同一套账号池语义：选号轮转、在途租约、token 临近过期自动刷新、失败按错误
 类型冷却或熔断。
 
-**为什么不用 `/v1/messages`**：那是 Anthropic 模型对话的标准路径，留给未来的 chat 转发；
-搜索挂在 `/v1/search/messages`，语义清晰且互不干扰。
+**为什么不占用 `/v1/messages`**：该路径是 Anthropic 模型对话的标准路径，已由
+[对话协议前门](#对话协议前门-post-v1messages--post-v1responses) 承接；搜索挂在
+`/v1/search/messages`，语义清晰且互不干扰（客户端把搜索 baseURL 指向 `<网关>/v1/search`）。
 
 请求（Anthropic Messages 形态）：
 

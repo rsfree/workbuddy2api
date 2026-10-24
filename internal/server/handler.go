@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/bridge"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
@@ -24,6 +25,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/tokencalib"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
@@ -65,6 +67,11 @@ type Config struct {
 	// ModelsHidden 模型黑名单原始条目（config models.hidden；Live 为 nil 的
 	// 裸用/测试路径经 loadLive() 归一化后使用）。
 	ModelsHidden []string
+
+	// TokenCalib /v1/messages/count_tokens 的输入 token 校准器（可选；nil =
+	// 纯字符粗估）。协议前门每次对话回来都会用真实 usage.prompt_tokens 在线
+	// 更新它，count_tokens 再拿学到的系数换算（见 internal/tokencalib）。
+	TokenCalib *tokencalib.Calibrator
 
 	// Usage 逐请求用量记录器（可选；nil = 不记录）。
 	// 在 recordAttempt 这一唯一汇聚点调用，因此流式/非流式、成功/失败都会计入，
@@ -199,14 +206,23 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	// 另外两种对话协议的前门（见 proto_chat.go / bridge.go）：入口把请求翻成
+	// chat 形态，出口把 chat 的输出翻回目标协议，中间复用同一条选号/轮转/记账
+	// 链路。Claude Code 只说 /v1/messages，Codex 只说 /v1/responses。
+	h.mux.HandleFunc("POST /v1/messages", h.withAuthProto(protoAnthropic, h.messagesChat))
+	// count_tokens 不是模型调用（本地估算），但 Claude Code 会在压缩上下文前探它，
+	// 缺这个路由会让客户端走 404 异常分支。见 proto_chat.go。
+	h.mux.HandleFunc("POST /v1/messages/count_tokens", h.withAuthProto(protoAnthropic, h.countTokens))
+	h.mux.HandleFunc("POST /v1/responses", h.withAuthProto(protoResponses, h.responsesChat))
 	// 图像生成（OpenAI images 兼容形态，见 images.go）。两条路由共用同一条
 	// 选号/租约/冷却/记账管道；edits 额外接受 multipart 上传。
 	if h.imagesCfg().Enabled {
 		h.mux.HandleFunc("POST /v1/images/generations", h.withAuth(h.imageGenerations))
 		h.mux.HandleFunc("POST /v1/images/edits", h.withAuth(h.imageEdits))
 	}
-	// 联网搜索（Anthropic Messages 兼容形态，见 messages.go）。路径刻意不占用
-	// /v1/messages——那是 Anthropic 模型对话的标准路径，留给未来的 chat 转发。
+	// 联网搜索（Anthropic Messages 兼容形态，见 messages.go）。路径不占用
+	// /v1/messages——那是 Anthropic 模型对话的标准路径，已由上面的对话前门承接；
+	// 搜索挂在 /v1/search/messages，客户端把搜索 baseURL 指向 <网关>/v1/search。
 	h.mux.HandleFunc("POST /v1/search/messages", h.withAuth(h.messages))
 	// 网页正文抓取（JSON，见 fetch.go）：搜索给链接、抓取给全文，两者互补。
 	h.mux.HandleFunc("POST /v1/fetch", h.withAuth(h.webFetch))
@@ -235,6 +251,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if isVideoPath(r.URL.Path) {
 			trace.model = videoToolLabel // 提交成功后会被真实模型名覆盖
+		}
+		if label := protoModelLabel(r.URL.Path); label != "" {
+			// count_tokens 没有模型调用，面板「模型」列空着看不出是什么流量。
+			trace.model = label
 		}
 		if h.loadLive().RecordClientInfo {
 			trace.captureClientInfo(r)
@@ -269,7 +289,8 @@ func (h *Handler) tracedRequest(r *http.Request) bool {
 		return false
 	}
 	return r.URL.Path == "/v1/chat/completions" || isSearchPath(r.URL.Path) ||
-		isFetchPath(r.URL.Path) || isImagePath(r.URL.Path) || isVideoPath(r.URL.Path)
+		isFetchPath(r.URL.Path) || isImagePath(r.URL.Path) || isVideoPath(r.URL.Path) ||
+		isProtoPath(r.URL.Path)
 }
 
 // isSearchPath 判断是否为搜索端点。
@@ -346,7 +367,7 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	// (域, 模型) 的最近探索时刻（键 "realm|model"）。与 accounts[].model_costs
 	// 行对照即可读出「探索→毕业」全链路（单一事实来源，不做双表示）。零回归只增键。
 	exploreEvents, exploreLast := h.cfg.Pool.CostExploreStatus()
-	writeJSON(w, http.StatusOK, map[string]any{
+	out := map[string]any{
 		"accounts":       h.cfg.Pool.List(),
 		"total":          total,
 		"healthy":        healthy,
@@ -374,7 +395,14 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 			"events_total": exploreEvents,
 			"per_model":    exploreLast,
 		},
-	})
+	}
+	// token_calib 协议前门的输入 token 校准参数（按模型）：slope/intercept 就是
+	// count_tokens 实际用的换算系数，配合 samples 判断「学到位了没」——
+	// Claude Code 压缩时机偏早/偏晚时，先看这里的斜率是不是明显偏离 1。
+	if h.cfg.TokenCalib != nil {
+		out["token_calib"] = h.cfg.TokenCalib.Snapshot()
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // countsMapFrom 把 CountsDetailed 五元组打包成 /status 的域分组建模。
@@ -735,6 +763,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.Unmarshal(body, &peek)
 
+	// 输入 token 校准的「估算侧」：客户端原始 body 的字符粗估，真实侧是本次响应的
+	// usage.prompt_tokens（在 recordAttempt 里配对）。两处刻意设计：
+	//  1. 延迟到确认拿到 usage 之后再算：多一次 body unmarshal（220KB 约 1.2ms）
+	//     不该挡在首字节前面，失败的轮转也不产生样本；
+	//  2. 认 rawBody 而不是 body：后者会被下面的提示词 / 模型名改写覆盖，估算必须
+	//     对应客户端原文（与 count_tokens 拿到的输入同源）。否则网关注入的 system
+	//     会被算进估算侧，intercept 学不到「固定开销」，count_tokens 反而偏小。
+	rawBody := body
+	estimateIn := func() int {
+		if h.cfg.TokenCalib == nil {
+			return 0
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal(rawBody, &parsed); err != nil {
+			return 0
+		}
+		return bridge.EstimateInputTokens(parsed)
+	}
+
 	// 工具名名单：上游在没有 tools 的请求里会把工具调用吐成原生标记文本
 	// （见 upstream/dsml.go），修复层用它做严格判定。名单来自「本请求声明的 tools」
 	// 与「会话历史里出现过的工具名」两个来源——实测 tools 声明会在中转环节丢失，
@@ -868,6 +915,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.attempts++
 		if delta.HasPromptTokens {
 			st.promptTokens = delta.PromptTokens
+			// 输入 token 校准：把「客户端 body 的字符粗估」与「上游真实 prompt_tokens」
+			// 配对喂给校准器。不另找采集点——recordAttempt 是 chat 链路 usage 的唯一
+			// 汇聚点，/v1/messages、/v1/responses 复用 chatCompletions 后同样经过这里，
+			// 一份统计覆盖全部入口，也不会因为某个协议走别的分支而漏采。
+			// 只有真带 prompt_tokens 的那次尝试才算数：轮转失败的分支传的是空 delta，
+			// 天然被 delta.HasPromptTokens 挡掉，错误流量不会污染系数。
+			// 带图请求也排除：图像 token 会进上游 prompt_tokens，但字符估算侧一个都
+			// 数不到，混进来会把 slope 抬高——遭殃的正是纯文本的 count_tokens。
+			if bareModel != "" && !reqHasImage {
+				if est := estimateIn(); est > 0 {
+					h.cfg.TokenCalib.Observe(bareModel, est, int(st.promptTokens))
+				}
+			}
 		}
 		if delta.HasCompletionTokens {
 			st.completionTokens = delta.CompletionTokens

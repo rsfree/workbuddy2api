@@ -28,6 +28,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/tokencalib"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
@@ -310,6 +311,13 @@ func main() {
 	// 基线）。挂载在余额查询路径上（upstream 的余额观察者），签到 / 活跃上报 /
 	// 旅行 / 保活 / 面板手动刷新全覆盖——上游只在少数渠道落金额日志，比对余额
 	// 是唯一可靠的口径。与 state/usage/request-logs 同目录，随 state_file 搬移。
+	// 输入 token 校准：/v1/messages/count_tokens 的字符粗估乘上「上游真实
+	// usage.prompt_tokens / 本地估算」学来的系数，让 Claude Code 的上下文压缩
+	// 时机贴近真实 token 数。与 state/usage 同目录，随 state_file 搬移。
+	tokenCal := tokencalib.New(stateSibling(cfg.StateFile, "token-calib.json"))
+	defer tokenCal.Save()
+	log.Printf("[tokencalib] 输入 token 校准已启用: %s", stateSibling(cfg.StateFile, "token-calib.json"))
+
 	creditHist := credithist.New(stateSibling(cfg.StateFile, "credit-history.json"), 2000)
 	up.SetCreditObserver(creditHist.Observe)
 	log.Printf("[credithist] 积分历史已启用: %s", stateSibling(cfg.StateFile, "credit-history.json"))
@@ -362,6 +370,7 @@ func main() {
 		Live:         live,
 		Usage:        rec,
 		RequestLog:   requestLog,
+		TokenCalib:   tokenCal,
 		PromptMode:   cfg.Prompt.Mode,
 		PromptText:   cfg.PromptText,
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的

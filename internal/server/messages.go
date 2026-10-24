@@ -5,9 +5,10 @@
 // （含 `web_search_tool_result` block）。把该协议壳做在网关侧，客户端只需把搜索
 // baseURL 指向 `<网关>/v1/search`，零代码改动即可用上本网关的搜索能力。
 //
-// 为什么不占用 `/v1/messages`：那是 Anthropic **模型对话**的标准路径，将来网关若要
-// 支持 Anthropic 协议的 chat 转发会与搜索冲突。搜索挂在 `/v1/search/messages`，
-// 与 OpenAI 风格的 `/v1/search` 同前缀，语义清晰且互不干扰。
+// 为什么不占用 `/v1/messages`：那是 Anthropic **模型对话**的标准路径，已由
+// proto_chat.go 的对话前门承接（同一路径同时做搜索会让 claude 客户端拿到搜索结果）。
+// 搜索挂在 `/v1/search/messages`，与 OpenAI 风格的 `/v1/search` 同前缀，
+// 语义清晰且互不干扰。
 //
 // 与真实 Anthropic 行为的差异（有意为之）：本端点**不做模型调用**。真实 Anthropic
 // 的 web_search 是 server tool，由模型决定何时搜、并生成带引用的自然语言回答；
