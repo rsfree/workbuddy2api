@@ -145,6 +145,22 @@ func (c *Calibrator) Adjust(model string, est int) int {
 	return int(math.Round(v))
 }
 
+// AdjustTail 只对「基线之后的增量」做比例放大，不加 intercept。
+//
+// 与 Adjust 的分工：上下文没变的那部分已由 Baseline 用上游真数覆盖，intercept
+// （system 模板等固定开销）也含在那条记录里；这里若再叠加一次 intercept、或用
+// 全量估算重算，都会把固定开销重复计进去。只把增量按学到的字符/token 比放大。
+func (c *Calibrator) AdjustTail(model string, est int) int {
+	if est <= 0 {
+		return 0
+	}
+	if c == nil {
+		return est
+	}
+	p := c.Params(model)
+	return int(math.Round(p.Slope * float64(est)))
+}
+
 // Observe 记录一对（本地估算, 上游实际 prompt_tokens）。任一侧非正数时忽略：
 // 缺 usage 的响应（错误帧、上游没带 usage）不能当成 actual=0 学进去。
 func (c *Calibrator) Observe(model string, est, actual int) {

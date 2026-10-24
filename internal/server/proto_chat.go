@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/bridge"
@@ -47,6 +48,13 @@ func (h *Handler) responsesChat(w http.ResponseWriter, r *http.Request) {
 	h.forwardToChat(w, r, protoResponses, chatBody)
 }
 
+// baselineLogTail 命中基线且新增段估算超过该值时打一条 INFO。
+//
+// 阈值不是拍脑袋：一条普通 user 消息粗估约 100~300 token，正常轮次到不了 500；
+// 到了 500 说明客户端一次灌进大段上下文（粘贴长文件、工具输出回填），那时
+// 「base + tail」最容易偏，值得留痕。低于此值只进 /status 的统计，不刷日志。
+const baselineLogTail = 500
+
 // countTokens POST /v1/messages/count_tokens：Anthropic 的输入 token 预估。
 //
 // Claude Code 在上下文压缩前会调它；网关侧没有上游分词器，先按字符数粗估
@@ -64,10 +72,41 @@ func (h *Handler) countTokens(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	est := bridge.EstimateInputTokens(chatBody)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"input_tokens": h.cfg.TokenCalib.Adjust(calibKey(bridge.Str(chatBody["model"])), est),
-	})
+	idx := bridge.IndexMessages(chatBody)
+	key := calibKey(bridge.Str(chatBody["model"]))
+
+	// 首选「会话基线」：同一客户端每轮发的是累积上下文，上一轮的真实
+	// usage.prompt_tokens 就是这批消息的真数，只需补上本轮新增的那几条。
+	// 完全命中（matched == 全部消息）时连增量都是 0，直接返回上游原话。
+	if h.cfg.Baseline != nil {
+		if base, matched, ok := h.cfg.Baseline.Lookup(key, idx.Digests); ok {
+			tail := idx.TailTokens(matched)
+			out := base + h.cfg.TokenCalib.AdjustTail(key, tail)
+			// 登记预测：客户端多半紧接着用同一批 messages 发 chat，那次的真实
+			// usage.prompt_tokens 会在 Record 里与这条配对，累计成 /status 的
+			// token_baseline.pred_by_model.mae——这是判断「估得准不准」的唯一数据源。
+			h.cfg.Baseline.Predict(key, idx.Digests, out)
+			// 只在新增段较长时留痕：tail 小（常见的一两条 user）没什么可优化的，
+			// 逐次打日志会把 INFO 刷满；tail 大说明客户端在灌大块上下文，正是误差来源。
+			if tail >= baselineLogTail {
+				log.Printf("INFO: [server] count_tokens model=%s mode=prefix matched=%d/%d base=%d tail=%d out=%d",
+					key, matched, len(idx.Digests), base, tail, out)
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"input_tokens": out})
+			return
+		}
+		// 未命中：首轮、上下文被压缩、换了会话，或客户端每轮都在改 system。
+		// 这类事件频率远低于命中，全量记录——线上 hits 为 0 时靠它定位是哪种原因。
+		log.Printf("INFO: [server] count_tokens model=%s mode=miss msgs=%d est=%d（无基线匹配：首轮/压缩/换会话）",
+			key, len(idx.Digests), idx.Total)
+	}
+
+	// 没有匹配的基线（首轮、上下文被压缩、换了会话）：回落到整段系数换算。
+	out := h.cfg.TokenCalib.Adjust(key, idx.Total)
+	if h.cfg.Baseline != nil {
+		h.cfg.Baseline.Predict(key, idx.Digests, out)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"input_tokens": out})
 }
 
 // calibKey 校准器的模型键，必须与 chat 链路同口径（剥 realm 前缀 + 别名归一）。

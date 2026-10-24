@@ -162,6 +162,14 @@ cp /root/wb2api-hk-proxy.inc.bak-20261023 /www/server/panel/vhost/nginx/wb2api-h
   现在两个头都认（Bearer 优先，`Authorization` 是别的方案时不回落），常量时间比较性质不变。
   回滚：`cp .pre-v1.13.29 docker-compose.yml && docker compose up -d`。
 
+- `1.13.30`（2026-10-24）：**`count_tokens` 改用会话基线**。之前只有「整段字符粗估 × 系数」，
+  误差来自整段；现在按逐条消息的 SHA-256 指纹做前缀匹配，命中后返回「上一轮真实
+  `usage.prompt_tokens` + 新增消息的估算」，完全命中（同一批 messages 跑过 chat）时直接返回
+  上游原话、误差 0；匹配不上才回落系数换算。新增 `token_baseline` 观测（`hits`/`misses`/
+  `pred_by_model.mae`/`pred_pending`）与两类日志（`mode=miss` 全量、`mode=prefix` 仅当新增段
+  ≥500 token）。纯内存不落盘，重启即清（换会话基线本来无用）。回滚：
+  `cp .pre-v1.13.30 docker-compose.yml && docker compose up -d`。
+
 ## 上线验证清单（1.13.28/1.13.29 实测）
 
 ```

@@ -6,6 +6,8 @@
 package bridge
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -665,7 +667,16 @@ func createdOf(v any) int64 {
 // 上游一致；客户端（Claude Code）只用这个数字做上下文压缩决策，量级正确即可。
 // 口径按「中文约 1 字/token，英文约 4 字符/token」折中取 rune/3，并对每条消息
 // 加固定开销（role/分隔符）。
+// EstimateInputTokens 估算一个 chat 请求的输入 token 数（messages + tools）。
+//
+// 上游没有分词接口，只能按字符数估：中文约 1.5 字/token、英文约 4、代码约 3.5，
+// 所以取 runes/3 做粗估，再由 tokencalib 用真实 usage.prompt_tokens 校准。
 func EstimateInputTokens(chatBody map[string]any) int {
+	return estimateMessages(chatBody) + estimateTools(chatBody)
+}
+
+// estimateMessages 估算 messages 数组本身的 token（不含 tools）。
+func estimateMessages(chatBody map[string]any) int {
 	total := 0
 	msgs, _ := chatBody["messages"].([]any)
 	for _, raw := range msgs {
@@ -673,23 +684,99 @@ func EstimateInputTokens(chatBody map[string]any) int {
 		if !ok {
 			continue
 		}
-		text := ContentToText(m["content"])
-		if s, ok := m["content"].(string); ok {
-			text = s
-		}
-		total += 4 + guessTokens(text)
-		if calls, ok := m["tool_calls"].([]any); ok {
-			if b, err := json.Marshal(calls); err == nil {
-				total += guessTokens(string(b))
-			}
-		}
-	}
-	if tools, ok := chatBody["tools"].([]any); ok && len(tools) > 0 {
-		if b, err := json.Marshal(tools); err == nil {
-			total += guessTokens(string(b))
-		}
+		total += messageTokens(m)
 	}
 	return total
+}
+
+// messageTokens 单条消息的 token 估算：固定 4（role/分隔符开销）+ 正文 + 工具调用参数。
+func messageTokens(m map[string]any) int {
+	text := ContentToText(m["content"])
+	if s, ok := m["content"].(string); ok {
+		text = s
+	}
+	n := 4 + guessTokens(text)
+	if calls, ok := m["tool_calls"].([]any); ok {
+		if b, err := json.Marshal(calls); err == nil {
+			n += guessTokens(string(b))
+		}
+	}
+	return n
+}
+
+// estimateTools 估算 tools 声明的 token（整段 JSON）。
+func estimateTools(chatBody map[string]any) int {
+	tools, ok := chatBody["tools"].([]any)
+	if !ok || len(tools) == 0 {
+		return 0
+	}
+	b, err := json.Marshal(tools)
+	if err != nil {
+		return 0
+	}
+	return guessTokens(string(b))
+}
+
+// TokenIndex 一次遍历 messages 得到的索引，供 count_tokens 做「前缀基线 + 尾部增量」。
+//
+// 单独成类型而不是让调用方各算一遍：count_tokens 既要拿每条消息的指纹去和
+// 历史对话做前缀匹配，又要知道匹配位置之后的增量估算，两件事都要逐条遍历。
+type TokenIndex struct {
+	// Digests 每条消息的指纹（顺序敏感，见 digestMessage）。
+	Digests []uint64
+	// Prefix Prefix[i] = 前 i 条消息的估算累计（不含 tools），长度 = len(Digests)+1。
+	Prefix []int
+	// Total 全量估算：messages + tools。
+	Total int
+}
+
+// IndexMessages 构造 TokenIndex。
+func IndexMessages(chatBody map[string]any) TokenIndex {
+	msgs, _ := chatBody["messages"].([]any)
+	idx := TokenIndex{
+		Digests: make([]uint64, 0, len(msgs)),
+		Prefix:  make([]int, 0, len(msgs)+1),
+	}
+	idx.Prefix = append(idx.Prefix, 0)
+	total := 0
+	for _, raw := range msgs {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		total += messageTokens(m)
+		idx.Prefix = append(idx.Prefix, total)
+		idx.Digests = append(idx.Digests, digestMessage(m))
+	}
+	idx.Total = total + estimateTools(chatBody)
+	return idx
+}
+
+// TailTokens 返回第 from 条消息之后的估算（不含 tools）。
+//
+// 基线里已经含了 tools 与 system 模板的固定开销，增量只算「新增消息」；
+// 再加 tools 会把那部分重复计一次。
+func (x TokenIndex) TailTokens(from int) int {
+	if from < 0 {
+		from = 0
+	}
+	if from >= len(x.Prefix) {
+		return 0
+	}
+	return x.Prefix[len(x.Prefix)-1] - x.Prefix[from]
+}
+
+// digestMessage 单条消息的指纹（64 位，取 SHA-256 前 8 字节）。
+//
+// 为什么用内容摘要而不是「role + 长度」：前缀匹配要求「同一条消息」能被认出来，
+// 长度相同但内容不同的两条消息必须区分开，否则会拿错误的历史基线去回答。
+func digestMessage(m map[string]any) uint64 {
+	b, err := json.Marshal(m)
+	if err != nil {
+		return 0
+	}
+	sum := sha256.Sum256(b)
+	return binary.BigEndian.Uint64(sum[:8])
 }
 
 // guessTokens 按字符数估算 token 数（见 EstimateInputTokens 注释）。

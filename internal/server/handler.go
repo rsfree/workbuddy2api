@@ -73,6 +73,11 @@ type Config struct {
 	// 更新它，count_tokens 再拿学到的系数换算（见 internal/tokencalib）。
 	TokenCalib *tokencalib.Calibrator
 
+	// Baseline 会话基线缓存：记住「某批消息在上游的真实 prompt_tokens」，
+	// count_tokens 用它做前缀匹配，回答「上一轮真数 + 本轮新增消息的估算」。
+	// 可选（nil = 只用系数换算）。两者是互补关系，见 tokencalib/baseline.go。
+	Baseline *tokencalib.Baseline
+
 	// Usage 逐请求用量记录器（可选；nil = 不记录）。
 	// 在 recordAttempt 这一唯一汇聚点调用，因此流式/非流式、成功/失败都会计入，
 	// 且与 pool 的每账号累计器同源，两条口径不会漂移。
@@ -401,6 +406,11 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	// Claude Code 压缩时机偏早/偏晚时，先看这里的斜率是不是明显偏离 1。
 	if h.cfg.TokenCalib != nil {
 		out["token_calib"] = h.cfg.TokenCalib.Snapshot()
+	}
+	// token_baseline 会话基线的命中情况。hits 恒为 0 说明客户端每轮都在改
+	// system/messages（前缀永远匹配不上），此时基线形同虚设、只剩系数换算。
+	if h.cfg.Baseline != nil {
+		out["token_baseline"] = h.cfg.Baseline.Snapshot()
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -771,15 +781,31 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	//     对应客户端原文（与 count_tokens 拿到的输入同源）。否则网关注入的 system
 	//     会被算进估算侧，intercept 学不到「固定开销」，count_tokens 反而偏小。
 	rawBody := body
-	estimateIn := func() int {
-		if h.cfg.TokenCalib == nil {
-			return 0
+	// 拿到真实 usage 后统一记账：一次 unmarshal 同时喂两个消费者——系数校准器
+	// （整段估算 vs 真实值）与会话基线缓存（这批消息的标志序列 vs 真实值）。
+	// 只记成功样本：调用点被 delta.HasPromptTokens 挡着，轮转失败/错误响应不产生
+	// 数据；带图请求只进基线不进系数（图像 token 估算侧数不到，会抬高 slope）。
+	// 显式入参而不是捕获 bareModel / reqHasImage：这两个变量在闭包之后才解析出来，
+	// 靠顺序捕获会让将来重排代码时静默失效（与 recordAttempt 的 ttfb 同理）。
+	recordTokenSample := func(model string, withImage bool, actual int) {
+		if model == "" || actual <= 0 || (h.cfg.TokenCalib == nil && h.cfg.Baseline == nil) {
+			return
 		}
 		var parsed map[string]any
 		if err := json.Unmarshal(rawBody, &parsed); err != nil {
-			return 0
+			return
 		}
-		return bridge.EstimateInputTokens(parsed)
+		key := calibKey(model)
+		if h.cfg.Baseline != nil {
+			if idx := bridge.IndexMessages(parsed); len(idx.Digests) > 0 {
+				h.cfg.Baseline.Record(key, idx.Digests, actual)
+			}
+		}
+		if h.cfg.TokenCalib != nil && !withImage {
+			if est := bridge.EstimateInputTokens(parsed); est > 0 {
+				h.cfg.TokenCalib.Observe(key, est, actual)
+			}
+		}
 	}
 
 	// 工具名名单：上游在没有 tools 的请求里会把工具调用吐成原生标记文本
@@ -923,11 +949,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 天然被 delta.HasPromptTokens 挡掉，错误流量不会污染系数。
 			// 带图请求也排除：图像 token 会进上游 prompt_tokens，但字符估算侧一个都
 			// 数不到，混进来会把 slope 抬高——遭殃的正是纯文本的 count_tokens。
-			if bareModel != "" && !reqHasImage {
-				if est := estimateIn(); est > 0 {
-					h.cfg.TokenCalib.Observe(bareModel, est, int(st.promptTokens))
-				}
-			}
+			recordTokenSample(bareModel, reqHasImage, int(st.promptTokens))
 		}
 		if delta.HasCompletionTokens {
 			st.completionTokens = delta.CompletionTokens

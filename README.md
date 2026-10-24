@@ -788,6 +788,20 @@ export WB2A_EGRESS_PASSWORD=<口令>
   `{"glm-5.2":{"slope":2.31,"intercept":180,"samples":42,"weighted_samples":38.2}}`。
   Claude Code 压缩时机偏早/偏晚时先看 `slope` 是否明显偏离 1；`samples` 到几十条即稳定。
   `intercept` 吸收的是网关注入的 system 提示词这类固定开销（粗估里没有）。
+- **`count_tokens` 会话基线（优先于系数换算）**：`count_tokens` 在请求**之前**被调，
+  那一刻上游还没算过这批消息，当次的真值不存在；但客户端每轮发的是累积上下文，
+  **上一轮**那次真实 `usage.prompt_tokens` 就是这批消息的真数。按逐条消息的 SHA-256
+  指纹做前缀匹配，命中后返回「真实基线 + 新增消息的估算」——完全命中时直接返回上游
+  原话、一次估算都不做（误差 0），常见情形（只多一条 user）误差只剩那一小段。匹配不上
+  （首轮 / 上下文被压缩 / 换会话 / 客户端改了 system）才回落到上面的系数换算。
+  纯内存、不落盘：换了会话基线本来就没用，存了只是噪音。`GET /status` 的 `token_baseline`：
+  `hits`/`misses` 判断这套机制有没有生效（`hits` 恒为 0 说明每轮 system 都在变，应关掉）；
+  `pred_by_model.<model>.mae` 是「预测 vs 随后那次真实值」的平均相对误差（0.05 = 平均差
+  5%，持续 >0.15 说明新增段的字符估算在该模型上偏得厉害）；`pred_pending` 是登记了预测
+  却没等到真值的条数（客户端探完就压缩）。日志只在两种情况下打，避免刷屏：
+  未命中一律 `count_tokens model=<m> mode=miss ...`；命中且新增段 ≥500 token 时
+  `mode=prefix matched=…/… base=… tail=… out=…`（新增这么大说明客户端在灌上下文，正是
+  误差来源）。
 - **错误**：上游错误按目标协议的信封回包（Anthropic 是 `{"type":"error","error":{...}}`，
   429→`rate_limit_error`、503→`overloaded_error`、400→`invalid_request_error`），
   `message` 保留上游原文，`gateway_hint` 一并带上；鉴权失败的 401 同样是协议原生形状。

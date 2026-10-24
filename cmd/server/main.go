@@ -315,6 +315,9 @@ func main() {
 	// usage.prompt_tokens / 本地估算」学来的系数，让 Claude Code 的上下文压缩
 	// 时机贴近真实 token 数。与 state/usage 同目录，随 state_file 搬移。
 	tokenCal := tokencalib.New(stateSibling(cfg.StateFile, "token-calib.json"))
+	// 会话基线：count_tokens 优先用「上一轮真实 prompt_tokens + 新增消息估算」，
+	// 比整段乘系数准得多。纯内存（重启后几十个请求内自然重建），不落盘。
+	baseLine := tokencalib.NewBaseline(32)
 	defer tokenCal.Save()
 	log.Printf("[tokencalib] 输入 token 校准已启用: %s", stateSibling(cfg.StateFile, "token-calib.json"))
 
@@ -371,6 +374,7 @@ func main() {
 		Usage:        rec,
 		RequestLog:   requestLog,
 		TokenCalib:   tokenCal,
+		Baseline:     baseLine,
 		PromptMode:   cfg.Prompt.Mode,
 		PromptText:   cfg.PromptText,
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
