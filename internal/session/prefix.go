@@ -37,11 +37,33 @@ func PrefixKey(body []byte) string {
 	if obj == nil {
 		return ""
 	}
-	return prefixKeyOf(obj)
+	key, _ := prefixPartsOf(obj)
+	return key
+}
+
+// PrefixKeySized 同 PrefixKey，额外返回**前缀材料的字节数**（供观测「这段前缀
+// 在一次请求里占多大比例」——亲和命中率单看没意义，prefix 占 prompt 很小的时候
+// 命中率天然上不去，再怎么调路由也省不下钱）。
+func PrefixKeySized(body []byte) (string, int) {
+	obj := parseBody(body)
+	if obj == nil {
+		return "", 0
+	}
+	return prefixPartsOf(obj)
 }
 
 // prefixKeyOf 是 PrefixKey 的已解析版本（供 ExtractKeys 复用同一次解析）。
 func prefixKeyOf(obj map[string]any) string {
+	key, _ := prefixPartsOf(obj)
+	return key
+}
+
+// prefixPartsOf 一次算出「指纹 + 材料字节数」，返回 ("", 0) 表示没有前缀成分。
+//
+// 字节数是**保守下界**：tools 只算名字与描述（schema 不入指纹，见上方口径取舍），
+// 所以真实可缓存前缀 ≥ 这个值。用它算比例只会低估前缀占比，不会把「前缀其实很小」
+// 误报成「前缀很大」——方向对安全。
+func prefixPartsOf(obj map[string]any) (string, int) {
 	var b strings.Builder
 	// system：messages 里的 system/developer（多段全拼，顺序保留），再加顶层
 	// system 字段（Anthropic 形态）。developer 与 system 在上游等价，同一个客户端
@@ -90,8 +112,8 @@ func prefixKeyOf(obj map[string]any) string {
 		}
 	}
 	if b.Len() == 0 {
-		return ""
+		return "", 0
 	}
 	sum := sha256.Sum256([]byte(b.String()))
-	return prefixKeyPrefix + hex.EncodeToString(sum[:12])
+	return prefixKeyPrefix + hex.EncodeToString(sum[:12]), b.Len()
 }

@@ -599,11 +599,19 @@ async function loadOverview(quiet) {
       // 有会变的内容），种数涨得慢只是还没凑到同前缀的第二个会话。两者都叫 0%，
       // 但一个要改指纹口径、一个什么都不用做。
       const np = d.affinity_prefixes || 0;
+      // 前缀占比决定「命中率值多少钱」：占比 5% 时 100% 命中也只省 5% 的 token。
+      // 没有前缀体积样本时明说，别让人把手里的 0% 当成机制失效。
+      const share = cm.prefix_share_est || 0;
+      const shareLine = share > 0
+        ? '前缀占 prompt 约 ' + share + '%（平均 ' + Math.round(cm.prefix_avg_bytes || 0) + ' 字节）：' +
+          (share < 20 ? '可省空间有限，命中率天然高不了' : '可省空间大，命中率值得追')
+        : '还没有前缀体积样本';
       $('sAffinityHit').parentNode.title = den
         ? '同前缀命中 ' + (cm.affinity_hit || 0) + ' · 满载被带离 ' + (cm.affinity_miss || 0) +
           ' · 新建落点 ' + (cm.affinity_new || 0) + '（只统计会话尚无绑定的请求）\n' +
-          '已注册前缀 ' + np + ' 种：接近新建次数说明前缀在漂移，远小于则只是样本还没重复'
-        : '还没有需要分配落点的新会话（已注册前缀 ' + np + ' 种）';
+          '已注册前缀 ' + np + ' 种：接近新建次数说明前缀在漂移，远小于则只是样本还没重复\n' +
+          shareLine
+        : '还没有需要分配落点的新会话（已注册前缀 ' + np + ' 种）\n' + shareLine;
     }
     $('navSub').textContent = 'v' + d.version;
     $('navVer').textContent = 'v' + d.version;

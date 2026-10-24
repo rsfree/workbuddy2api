@@ -66,6 +66,7 @@ func (r *Router) NoteAffinity(key, uid string) {
 		r.evictAffinityLocked(now)
 	}
 	r.aff[key] = affEntry{uid: uid, lastSeen: now}
+	r.dirty = true
 }
 
 // AffinityFor 查这段前缀「应该去哪个账号」；没有可用的亲和记录时 ok=false。
@@ -103,6 +104,7 @@ func (r *Router) dropAffinity(key, uid string) {
 	r.mu.Lock()
 	if cur, ok := r.aff[key]; ok && cur.uid == uid {
 		delete(r.aff, key)
+		r.dirty = true
 	}
 	r.mu.Unlock()
 }
@@ -128,6 +130,9 @@ func (r *Router) evictAffinityLocked(now time.Time) {
 			expired++
 		}
 	}
+	if expired > 0 {
+		r.dirty = true
+	}
 	if expired >= n {
 		return
 	}
@@ -149,5 +154,6 @@ func (r *Router) evictAffinityLocked(now time.Time) {
 		}
 		oldest[i], oldest[min] = oldest[min], oldest[i]
 		delete(r.aff, oldest[i].k)
+		r.dirty = true
 	}
 }

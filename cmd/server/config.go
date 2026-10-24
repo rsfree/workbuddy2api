@@ -346,17 +346,27 @@ type Config struct {
 		// bool 零值是 false，没有指针就无法表达"缺省开启"。只在 session_sticky.enabled
 		// 为 true 时生效。
 		PrefixAffinity *bool `json:"prefix_affinity"`
+		// StateFile 会话绑定 + 前缀亲和的本地快照路径；空 = 与 state_file 同目录的
+		// session_state.json（部署只有一个数据盘挂载点，分开配容易写进容器镜像层，
+		// 重启即丢）。详见 session.StartStateFile。
+		StateFile string `json:"state_file"`
+		// PersistInterval 快照落盘周期，默认 "30s"；"0" = 关停持久化（路由照常，
+		// 但重启后全量冷启动——重看前缀缓存的代价就靠它）。
+		PersistInterval string `json:"persist_interval"`
 	} `json:"session_sticky"`
 
 	// 解析后
-	SoftRateDur            time.Duration `json:"-"`
-	SoftRateMaxDur         time.Duration `json:"-"`
-	BreakerCooldownDur     time.Duration `json:"-"`
-	BreakerCooldownMaxD    time.Duration `json:"-"`
-	DegradeCooldownDur     time.Duration `json:"-"`
-	DegradeCooldownMaxD    time.Duration `json:"-"`
-	SessionTTL             time.Duration `json:"-"`
-	SessionGCInterval      time.Duration `json:"-"`
+	SoftRateDur         time.Duration `json:"-"`
+	SoftRateMaxDur      time.Duration `json:"-"`
+	BreakerCooldownDur  time.Duration `json:"-"`
+	BreakerCooldownMaxD time.Duration `json:"-"`
+	DegradeCooldownDur  time.Duration `json:"-"`
+	DegradeCooldownMaxD time.Duration `json:"-"`
+	SessionTTL          time.Duration `json:"-"`
+	SessionGCInterval   time.Duration `json:"-"`
+	// 会话状态快照（粘性绑定 + 前缀亲和）。Interval=0 表示关停（不读不写）。
+	SessionStateFile       string        `json:"-"`
+	SessionPersistInterval time.Duration `json:"-"`
 	BalanceRefreshInterval time.Duration `json:"-"` // 0 = 不启动（enabled=false）
 	TaskSweepInterval      time.Duration `json:"-"` // 0 = 不启动（task_sweep_enabled=false）
 	ExpiringSoonDur        time.Duration `json:"-"`
@@ -434,6 +444,7 @@ func Default() *Config {
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
+	c.SessionSticky.PersistInterval = "30s"
 	// 图像接口：缺省开启，模型名取服务端 product config 里实际存在的 hunyuan 系
 	//（2026-10 账号目录为 alpha / alpha-edit；已开通 v3.0 的账号可显式改配置）。
 	// 总时限 420s：官方客户端实测生图 p99 在分钟级，太短会把成功请求误判超时。
@@ -782,6 +793,23 @@ func (c *Config) normalize() error {
 	}
 	if c.SessionGCInterval, err = time.ParseDuration(c.SessionSticky.GCInterval); err != nil {
 		return fmt.Errorf("session_sticky.gc_interval: %w", err)
+	}
+	// 会话状态快照：路径空 → 与 state_file 同目录（同一个挂载点，重启能读到）。
+	c.SessionStateFile = strings.TrimSpace(c.SessionSticky.StateFile)
+	if c.SessionStateFile == "" {
+		c.SessionStateFile = filepath.Join(filepath.Dir(c.StateFile), "session_state.json")
+	}
+	// "0" 是合法值（关停持久化），不按空值回落默认——否则想关也关不掉。
+	if c.SessionSticky.PersistInterval == "" {
+		c.SessionSticky.PersistInterval = "30s"
+	}
+	if c.SessionSticky.PersistInterval != "0" {
+		if c.SessionPersistInterval, err = time.ParseDuration(c.SessionSticky.PersistInterval); err != nil {
+			return fmt.Errorf("session_sticky.persist_interval: %w", err)
+		}
+		if c.SessionPersistInterval < 0 {
+			c.SessionPersistInterval = 0
+		}
 	}
 	// 快过期窗口：空 = 禁用（ExpiringSoonDur 0）；非空必须可解析（拼写错误 fail fast）。
 	if c.Pool.ExpiringSoon != "" {

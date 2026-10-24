@@ -79,6 +79,11 @@ type chatStat struct {
 	// affinity 本轮前缀亲和落点（reqlog.Affinity*）；空 = 会话已有绑定（亲和不参与）
 	// 或该请求没有可用的前缀指纹。
 	affinity string
+	// prefixBytes 本次请求「可共享前缀」的材料字节数（system + tools 名字/描述），
+	// 由 session.ExtractKeysSized 一次解析顺带算出。0 = 无前缀成分。
+	// 与 promptTokens 一起换算成「前缀占 prompt 的比例」，用来判断亲和到底有多少
+	// 可省空间——比例很小的时候，亲和命中率再高也省不下钱（见 reqlog.CacheMetrics）。
+	prefixBytes int
 
 	logged bool
 }
@@ -491,6 +496,7 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		e.Egress = s.egress
 		e.Sticky = s.sticky
 		e.Affinity = s.affinity
+		e.PrefixBytes = s.prefixBytes
 	}
 	if e.Egress == "" {
 		e.Egress = t.egress

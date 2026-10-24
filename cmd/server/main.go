@@ -131,8 +131,21 @@ func main() {
 			// 缺省开启（config 里写 false 才关）。
 			PrefixAffinity: cfg.SessionSticky.PrefixAffinity == nil || *cfg.SessionSticky.PrefixAffinity,
 		})
-		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
+		// 持久化关闭（persist_interval="0"）时连读都不做：语义就是「完全不持久化」，
+		// 否则会拿一份陈旧快照把会话钉在不再承接它的账号上。
+		if cfg.SessionPersistInterval > 0 {
+			sessRouter.LoadStateFile(cfg.SessionStateFile) // 本地快照优先：同机重启这条路径最快
+		}
+		sessRouter.LoadFromStore() // Redis 只补本地快照里没有的（跨机备份）
 		sessRouter.StartGC()
+		// 定期把绑定 + 亲和表落盘：没有它，每次发版/重启 = 一次全量冷启动
+		//（线上实测重启后 prompt≥5k 的缓存命中从 79.5% 掉到 32.7%）。
+		// persist_interval="0" 时整段跳过（连读都不做，语义就是「不持久化」）。
+		if cfg.SessionPersistInterval > 0 {
+			sessRouter.StartStateFile(cfg.SessionStateFile, cfg.SessionPersistInterval)
+			// defer 是 LIFO：StopStateFile 先跑（flush 最后一段变更），再停 GC。
+			defer sessRouter.StopStateFile()
+		}
 		defer sessRouter.StopGC()
 	}
 	sessCount := func() int {

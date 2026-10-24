@@ -142,6 +142,8 @@
     "enabled": true,
     "ttl": "30m",
     "gc_interval": "5m",
-    "prefix_affinity": true
+    "prefix_affinity": true,
+    "state_file": "",
+    "persist_interval": "30s"
   }
 }

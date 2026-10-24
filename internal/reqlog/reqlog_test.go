@@ -364,3 +364,42 @@ func TestAffinityMetricsAggregate(t *testing.T) {
 		t.Errorf("sticky counters must stay independent: %+v", s)
 	}
 }
+
+// TestPrefixShareEstimate 锁住「前缀占比」的口径——它是亲和命中率的含金量：
+// 占比 5% 时 100% 命中也只省 5%，占比 90% 时命中率每涨 10 个点都是真金。
+//
+//   - 分母只含「有前缀材料 + 有真实 prompt_tokens」的请求（轮转失败分支
+//     prompt_tokens=0，天然被排除）；
+//   - token 用 bytes/4 粗估，比例钳在 100%（中文/密集 JSON 会高估）。
+func TestPrefixShareEstimate(t *testing.T) {
+	r := New(Config{})
+	// 4000 字节前缀 / 4 ≈ 1000 token，prompt 2000 → 50%
+	r.Record(Event{Status: 200, OK: true, PrefixBytes: 4000, PromptTokens: 2000})
+	// 100 字节 / 4 = 25 token，prompt 1000 → 2.5%
+	r.Record(Event{Status: 200, OK: true, PrefixBytes: 100, PromptTokens: 1000})
+	// 无前缀材料：不进分母
+	r.Record(Event{Status: 200, OK: true, PromptTokens: 1000})
+	// 有前缀但上游没回 prompt_tokens（轮转失败）：不进分母
+	r.Record(Event{Status: 502, OK: false, PrefixBytes: 4000})
+
+	s := r.Snapshot().Cache
+	want := round1((0.5 + 0.025) / 2 * 100) // 26.3
+	if s.PrefixShareEst != want {
+		t.Errorf("prefix_share_est=%v want %v", s.PrefixShareEst, want)
+	}
+	if s.PrefixAvgBytes != 2050 { // (4000+100)/2
+		t.Errorf("prefix_avg_bytes=%d want 2050", s.PrefixAvgBytes)
+	}
+
+	// 估出来的 token 比 prompt 还大（中文场景 bytes/4 会高估）→ 钳到 100%，不出现 137%。
+	over := New(Config{})
+	over.Record(Event{Status: 200, OK: true, PrefixBytes: 40000, PromptTokens: 1000})
+	if got := over.Snapshot().Cache.PrefixShareEst; got != 100 {
+		t.Errorf("over-estimated share must clamp to 100, got %v", got)
+	}
+
+	// 无样本时保持 0：前端据此显示「还没有前缀体积样本」，而不是「前缀占 0%」。
+	if empty := New(Config{}).Snapshot().Cache.PrefixShareEst; empty != 0 {
+		t.Errorf("empty snapshot share=%v want 0", empty)
+	}
+}

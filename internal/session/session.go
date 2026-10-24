@@ -89,6 +89,14 @@ type Router struct {
 	aff  map[string]affEntry
 	cfg  Config
 	stop chan struct{}
+	// dirty 自上次成功落盘以来是否有变更（见 persist.go）。只在 dirty 时写盘，
+	// 无流量时完全不产生 IO。
+	dirty bool
+	// statePath / stateStop 本地快照落盘的目标与后台 goroutine 的停止信号。
+	// 用**独立的** stop channel 而不是复用 stop：GC 与落盘的启停时机不同
+	// （落盘关停时要先 flush 再退），共用一个 channel 会让 close 语义互相干扰。
+	statePath string
+	stateStop chan struct{}
 }
 
 // New 构建路由器。若 cfg.Store 为 nil 则用 Noop（纯内存）；cfg.Available 为 nil 视为空池。
@@ -188,6 +196,7 @@ func (r *Router) LookupForModel(key, model string) (string, bool) {
 		return "", false
 	}
 	r.entries[key] = entry{uid: e.uid, lastActive: now}
+	r.dirty = true // 续期也是变更：重启后要按新时间判过期
 	r.cfg.Store.SetBind(key, e.uid, r.cfg.TTL)
 	return e.uid, true
 }
@@ -272,6 +281,7 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 
 	prev, existed := r.entries[key]
 	r.entries[key] = entry{uid: uid, lastActive: now}
+	r.dirty = true
 	if existed && prev.uid != uid {
 		r.cfg.Store.DelBind(key)
 	}
@@ -283,6 +293,7 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 func (r *Router) touch(key, uid string, now time.Time) {
 	r.mu.Lock()
 	r.entries[key] = entry{uid: uid, lastActive: now}
+	r.dirty = true
 	r.mu.Unlock()
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
 }
@@ -297,6 +308,7 @@ func (r *Router) Bind(key, uid string) {
 	now := time.Now()
 	r.mu.Lock()
 	r.entries[key] = entry{uid: uid, lastActive: now}
+	r.dirty = true
 	r.mu.Unlock()
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
 }
@@ -307,6 +319,7 @@ func (r *Router) Unbind(key string) bool {
 	_, found := r.entries[key]
 	if found {
 		delete(r.entries, key)
+		r.dirty = true
 	}
 	r.mu.Unlock()
 	if found {
@@ -338,7 +351,11 @@ func (r *Router) gcOnce(now time.Time) int {
 	for k, e := range r.aff {
 		if now.Sub(e.lastSeen) > r.affinityTTL() {
 			delete(r.aff, k)
+			r.dirty = true
 		}
+	}
+	if len(expiredKeys) > 0 {
+		r.dirty = true
 	}
 	r.mu.Unlock()
 	for _, key := range expiredKeys {
@@ -474,6 +491,21 @@ func ExtractKeys(body []byte) (sessKey, prefixKey string) {
 		return "", ""
 	}
 	return extractKeyFrom(obj), prefixKeyOf(obj)
+}
+
+// ExtractKeysSized 同 ExtractKeys，额外返回前缀材料的字节数（见 prefixPartsOf）。
+//
+// 为什么要这个观测（2026-10-25）：线上出现「亲和大量 hit、整体缓存命中率却只有
+// 8%」的时段——亲和确实把这些请求撮合到了同一个号，但那批请求 ~1k prompt 里
+// 共同前缀只有一百多 token，可命中的部分本来就小。没有 prefix 体积，这个现象
+// 只能靠翻原始 body 才能发现，面板上看就是「机制失灵」。
+func ExtractKeysSized(body []byte) (sessKey, prefixKey string, prefixBytes int) {
+	obj := parseBody(body)
+	if obj == nil {
+		return "", "", 0
+	}
+	prefixKey, prefixBytes = prefixPartsOf(obj)
+	return extractKeyFrom(obj), prefixKey, prefixBytes
 }
 
 // extractKeyFrom 是 ExtractKey 的「已解析」版本，键优先级链见 ExtractKey 注释。

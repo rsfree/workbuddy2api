@@ -705,7 +705,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <!-- 前缀亲和：不同会话但共享同一段 system+tools 时，是否被撮合到同一个号。
              它是粘性解决不了的那一半——粘性管「同一会话多轮」，亲和管「多个并行会话
              共享的共同前缀」。只看粘性正常就以为缓存没问题，是这里最常见的误判。 -->
-        <div class="stat" title="前缀亲和命中率：会话新建时，是否落到了「这段 system+tools 缓存已热」的账号"><div class="v" id="sAffinityHit">-</div><div class="k">前缀亲和（同前缀）</div></div>
+        <div class="stat" title="前缀亲和命中率：会话新建时，是否落到了「这段 system+tools 缓存已热」的账号（悬停看前缀占比——占比小则命中率再高也省不下钱）"><div class="v" id="sAffinityHit">-</div><div class="k">前缀亲和（同前缀）</div></div>
       </div>
 
       <!-- 卡片默认可见：此前 hidden + 「仅点检查才渲染」形成死锁（按钮藏在隐藏卡片里，

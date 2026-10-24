@@ -886,7 +886,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// ExtractKey 与粘性开关解耦（issue #35 侧）：关闭粘性时会话头族的聚合主键仍按
 	// 会话级（RequestIDForKey(sessKey)），不悄悄退化成轮级——提取本身与粘性无关。
 	// 一次解析同时取会话键与「共享前缀指纹」（前缀亲和用，见 session.PrefixKey）。
-	sessKey, prefixKey := session.ExtractKeys(body)
+	sessKey, prefixKey, prefixBytes := session.ExtractKeysSized(body)
+	// 前缀材料的字节数是「亲和值得投多少」的判断依据：prefix 只占 prompt 一小部分时，
+	// 亲和命中率再高也省不下钱（可命中的 token 本来就那么多）。随事件落进日志，
+	// 面板据此算 prefix_share_est。
+	st.prefixBytes = prefixBytes
 	// prevBound 是**本次请求之前**的绑定（只读快照，不续期）。必须在这里取：
 	// ResolveForModel 可能已经把绑定换掉，事后看返回值分不清「命中同号」和
 	// 「失效换号」——两者都返回一个 uid，而面板的换号率正是靠这个区分。

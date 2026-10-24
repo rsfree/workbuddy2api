@@ -126,6 +126,13 @@ type Event struct {
 	// 只在「会话尚无绑定」时才有值——会话强粘性命中时亲和根本不参与决策，
 	// 那种情况记空串，避免把两条机制的指标混在一起。
 	Affinity string `json:"affinity,omitempty"`
+	// PrefixBytes 本次请求「可共享前缀」的材料字节数（system 全文 + tools 名字/描述），
+	// 由 session.ExtractKeysSized 顺带算出，0 = 无前缀成分（omitempty 省略）。
+	//
+	// 它回答的是「亲和这件事值多少」：亲和命中率再高，如果 prefix 只占 prompt 的
+	// 5%，能省的就只有那 5%。线上出现过「亲和大量 hit 但整体命中 8%」的时段，
+	// 有了这个字段才能一眼区分「机制失灵」与「前缀本来就小」。
+	PrefixBytes int `json:"prefix_bytes,omitempty"`
 }
 
 // Filter 用于从归档中筛选最近记录。字符串字段一律「包含」匹配（大小写不敏感），
@@ -177,6 +184,13 @@ type CacheMetrics struct {
 	AffinityMiss    int64   `json:"affinity_miss"`
 	AffinityNew     int64   `json:"affinity_new"`
 	AffinityHitRate float64 `json:"affinity_hit_rate"`
+	// PrefixShareEst 前缀占 prompt 的比例（%，bytes/4 粗估 token，保守下界）。
+	// 亲和命中率的"含金量"：命中率高低要跟它一起看——比例 5% 时 100% 命中只值 5%。
+	// 分母只统计「有前缀成分且上游回报了 prompt_tokens」的请求。
+	PrefixShareEst float64 `json:"prefix_share_est"`
+	// PrefixAvgBytes 前缀材料的平均字节数（同分母）。配合 PrefixShareEst 判断
+	// 「前缀小」是客户端 prompt 短，还是我们没把 tools schema 算进指纹。
+	PrefixAvgBytes int64 `json:"prefix_avg_bytes"`
 }
 
 // Snapshot 一次面板读取的完整指标快照。
@@ -216,8 +230,12 @@ type Recorder struct {
 	affinityHit     int64
 	affinityMiss    int64
 	affinityNew     int64
-	recent          []Event
-	archive         *archiveWriter
+	// 前缀体积观测（见 CacheMetrics.PrefixShareEst）。
+	prefixShareSum float64
+	prefixShareN   int64
+	prefixBytesSum int64
+	recent         []Event
+	archive        *archiveWriter
 }
 
 // New 创建记录器；Dir 为空或 Enabled=false 时只启用内存指标。
@@ -294,6 +312,19 @@ func (r *Recorder) Record(e Event) {
 	case AffinityNew:
 		r.affinityNew++
 	}
+	// 前缀占比：只在「有前缀 + 有真实 prompt_tokens」时计入。轮转失败的分支
+	// prompt_tokens 为 0，天然被排除；非 chat 路径没有 prompt 维度，也不进分母。
+	// token 用 bytes/4 粗估（英文/JSON 大致的字/token 比），乘 4 之后的绝对精度
+	// 一般，但「占几成」这个结论对系数不敏感。
+	if e.PrefixBytes > 0 && e.PromptTokens > 0 {
+		share := float64(e.PrefixBytes) / 4 / float64(e.PromptTokens)
+		if share > 1 {
+			share = 1 // 估算系数在中文/密集 JSON 下会高估，钳在 100%
+		}
+		r.prefixShareSum += share
+		r.prefixShareN++
+		r.prefixBytesSum += int64(e.PrefixBytes)
+	}
 	r.recent = append([]Event{e}, r.recent...)
 	if len(r.recent) > recentLimit {
 		r.recent = r.recent[:recentLimit]
@@ -333,6 +364,10 @@ func (r *Recorder) Snapshot() Snapshot {
 		AffinityHit:     r.affinityHit,
 		AffinityMiss:    r.affinityMiss,
 		AffinityNew:     r.affinityNew,
+	}
+	if r.prefixShareN > 0 {
+		s.Cache.PrefixShareEst = round1(r.prefixShareSum / float64(r.prefixShareN) * 100)
+		s.Cache.PrefixAvgBytes = r.prefixBytesSum / r.prefixShareN
 	}
 	if total := r.cacheHitTokens + r.cacheMissTokens; total > 0 {
 		s.Cache.CacheHitRate = round1(float64(r.cacheHitTokens) / float64(total) * 100)

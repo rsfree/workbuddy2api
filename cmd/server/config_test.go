@@ -163,6 +163,14 @@ func TestNewPoolConfigDefaults(t *testing.T) {
 	if c.SessionTTL.Minutes() != 30 || c.SessionGCInterval.Minutes() != 5 {
 		t.Errorf("session durations=%v/%v", c.SessionTTL, c.SessionGCInterval)
 	}
+	// 会话状态快照缺省开：与 state_file 同目录（部署只有一个数据盘挂载点），
+	// 30s 一次。写成 "0" 才是关停。
+	if c.SessionStateFile != "data/session_state.json" {
+		t.Errorf("session_state_file=%q want data/session_state.json", c.SessionStateFile)
+	}
+	if c.SessionPersistInterval != 30*time.Second {
+		t.Errorf("session persist interval=%v want 30s", c.SessionPersistInterval)
+	}
 	if c.Upstash.URL != "" || c.Upstash.Token != "" {
 		t.Errorf("upstash default should be empty: %+v", c.Upstash)
 	}
@@ -857,5 +865,51 @@ func TestServerReadTimeout(t *testing.T) {
 	c.Server.ReadTimeout = "bogus"
 	if err := c.normalize(); err == nil {
 		t.Error("unparsable read_timeout should fail fast")
+	}
+}
+
+// TestSessionPersistConfig 锁住会话快照的配置语义：
+//   - 不写 → 与 state_file 同目录的 session_state.json（同一个挂载点）；
+//   - 显式路径 → 原样使用；
+//   - "0" → 关停（不读不写，等价于回到「每次重启全量冷启动」）；
+//   - 拼错 → 启动即失败，不允许静默回落（否则「配了但没生效」查不出来）。
+func TestSessionPersistConfig(t *testing.T) {
+	loadWith := func(body string) (*Config, error) {
+		fp := filepath.Join(t.TempDir(), "c.json")
+		if err := os.WriteFile(fp, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return Load(fp)
+	}
+
+	c, err := loadWith(`{"state_file":"/var/lib/wb/state.json"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.SessionStateFile != "/var/lib/wb/session_state.json" {
+		t.Errorf("derived path=%q want /var/lib/wb/session_state.json", c.SessionStateFile)
+	}
+
+	c, err = loadWith(`{"session_sticky":{"state_file":"/tmp/x/sess.json","persist_interval":"2m"}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.SessionStateFile != "/tmp/x/sess.json" {
+		t.Errorf("explicit path=%q", c.SessionStateFile)
+	}
+	if c.SessionPersistInterval != 2*time.Minute {
+		t.Errorf("interval=%v want 2m", c.SessionPersistInterval)
+	}
+
+	c, err = loadWith(`{"session_sticky":{"persist_interval":"0"}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.SessionPersistInterval != 0 {
+		t.Errorf(`persist_interval="0" must disable, got %v`, c.SessionPersistInterval)
+	}
+
+	if _, err := loadWith(`{"session_sticky":{"persist_interval":"bogus"}}`); err == nil {
+		t.Error("unparsable persist_interval should fail fast")
 	}
 }
