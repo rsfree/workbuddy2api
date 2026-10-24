@@ -104,6 +104,12 @@ type Panel struct {
 	catOnce sync.Once
 	cat     *taskCatalog
 
+	// acceptStuck accept 负缓存（tasksweep_accept_backoff.go）：
+	// key = uid + NUL + task_code，value = 退避到期时间。上游 accept 回 200 但
+	// 状态不落账时会记进来，TTL 内不再重复 accept（线上实测 4.4 万次无效请求/天）。
+	acceptStuckMu sync.Mutex
+	acceptStuck   map[string]time.Time
+
 	// 专家市场快照（autotask.go）：定向专家任务按名字匹配专家，一次快照多任务
 	// 复用，避免逐任务重拉分页列表。uid → 快照，TTL 见 expertCacheTTL。
 	expertMu    sync.Mutex

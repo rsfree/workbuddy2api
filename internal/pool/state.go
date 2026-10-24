@@ -421,6 +421,35 @@ func (p *Pool) AvailableUIDsForModel(model string) []string {
 // 这是粘性能"换得动"的关键：绑定只记 uid，若只按账号级 healthy 校验，
 // 被模型级限额的号（账号整体仍健康）会被持续选中直到轮换次数耗尽。
 func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
+	a, _ := p.PickStickyForModel(uid, model)
+	return a
+}
+
+// StickyPickResult 粘性号本次选不中的成因分类。handler 据此决定要不要解绑：
+// 只有「持久不可用」才解绑，「临时繁忙」必须保留绑定（详见 PickStickyForModel）。
+type StickyPickResult int
+
+const (
+	// StickyPicked 命中：账号已占用在途名额，调用方须在结束时 Release。
+	StickyPicked StickyPickResult = iota
+	// StickyBusy 账号本身健康、该模型也没被限额，仅因在途名额占满而本次不可用。
+	// 🔴 临时状态：绑定必须保留，本次请求溢出到普通轮换即可。若在这里解绑，整段
+	// 会话会被永久搬到另一个冷账号，上游账号级前缀缓存从此全部重算。
+	StickyBusy
+	// StickyUnusable 账号不存在 / 冷却 / 封禁 / 该模型被限额 / 积分保底拦截。
+	// 这是持久状态，绑定应解绑，让下次请求重新分配。
+	StickyUnusable
+)
+
+// PickStickyForModel 粘性命中判定，额外回报「为什么没命中」，供 handler 区分
+// 临时繁忙与持久不可用（见 StickyPickResult）。
+//
+// 为什么需要这个区分（2026-10-24 线上实测）：上一版把 in-flight 满和冷却一律当
+// 「不可用」返回 nil，handler 随即 unbindSticky。于是一个并发的兄弟请求只要把
+// 绑定号在途名额吃掉，整段会话就被永久搬走——上游前缀缓存是按账号隔离的，
+// 搬走即全冷。实测同一份 66340 token 上下文 8 秒内打到 4 个账号：两个命中
+// 99.9%，两个 0%；glm-5.3-flash 整体命中率因此只有 11.9%。
+func (p *Pool) PickStickyForModel(uid, model string) (*auth.Auth, StickyPickResult) {
 	now := time.Now()
 	// 读锁校验 + 锁外提交（与 pick 同一套口径）：粘性命中是每请求都会走的路径，
 	// 在这里持写锁会把所有会话钉在同一个串行点上。
@@ -428,11 +457,11 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	e, ok := p.byUID[uid]
 	if !ok {
 		p.mu.RUnlock()
-		return nil
+		return nil, StickyUnusable
 	}
 	if !e.healthyForModel(now, model) {
 		p.mu.RUnlock()
-		return nil
+		return nil, StickyUnusable
 	}
 	// 积分保底（粘性路径）：与 pick 的 floorBlocked 同判据——触底 + 收费即拦
 	// （判据含上游目录倍率兜底，realm 取账号所属域——粘性号已确定，无需外部传入）。
@@ -447,13 +476,14 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	if blocked {
 		log.Printf("WARN: [pool] credit floor: sticky acct=%s model=%s credits=%d < floor=%d, unbind (paid model held out)",
 			logfmt.Label(e.a.UID, e.a.Nickname), model, credits, floor)
-		return nil
+		return nil, StickyUnusable
 	}
 	if full {
-		return nil
+		// 临时繁忙：不解绑，只让本次请求溢出。
+		return nil, StickyBusy
 	}
 	p.commitPick(e, now)
-	return e.a
+	return e.a, StickyPicked
 }
 
 // PickByUID 若 uid 当前 healthy 且未占满在途名额，返回其凭证（记录 lastUsed 防撞号）；
@@ -586,6 +616,7 @@ func (p *Pool) List() []Status {
 	}
 	return out
 }
+
 // importedAtSource 把 Auth 的进池时间来源翻成对外字符串（空串 = 未知）。
 func importedAtSource(a *auth.Auth) string {
 	if a == nil || a.ImportedAtTime().IsZero() {

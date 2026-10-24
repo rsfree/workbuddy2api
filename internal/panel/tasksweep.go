@@ -50,6 +50,10 @@ type TaskSweepStats struct {
 	Discovered int   `json:"discovered"` // 本轮首次发现的新任务数（任务目录 diff）
 	NewAuto    int   `json:"new_auto"`   // 新任务中具备自动动作的个数
 	Rescued    int   `json:"rescued"`    // 零积分账号体验灵感补跑并成功领取的数量
+	// AcceptBackoff 本轮因「accept 不落账」负缓存而跳过的任务数（见
+	// tasksweep_accept_backoff.go）。只做可观测性：它正常应该大于 0、且 Accepted
+	// 随之趋近 0——两者同时为 0 才说明上游又开始落账了。
+	AcceptBackoff int `json:"accept_backoff"`
 
 	// newCodes 新发现且可自动的任务码（不导出：只在本轮调度内部流转）。
 	newCodes []string
@@ -65,6 +69,8 @@ func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 	// 会在生产上一把跑掉全账号的待办（每个含真实对话）。所以首轮只登记不触发，
 	// 由每日成长队列或手动按钮接手；从第二轮起，真正的新码才即时执行。
 	bootstrapping := p.catalog().total() == 0
+	// accept 负缓存剪枝：清掉已过期的退避条目（顺带避免长期运行后旧键累积）。
+	p.pruneAcceptStuck()
 
 	for _, ps := range p.cfg.Pool.List() {
 		if ps.Disabled {
@@ -91,6 +97,7 @@ func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 			st.Discovered += r.discovered
 			st.NewAuto += r.newAuto
 			st.Rescued += r.rescued
+			st.AcceptBackoff += r.acceptBackoff
 			st.newCodes = append(st.newCodes, r.newCodes...)
 		}(a, ps.UID, ps.Credits, ps.CreditsTotal)
 	}
@@ -117,9 +124,9 @@ func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 		go p.runDiscoveredTasks(codes)
 	}
 
-	if st.Claims() > 0 || st.Errors > 0 || st.Accepted > 0 || st.Discovered > 0 || st.Rescued > 0 {
-		log.Printf("panel: 任务补领清扫：%d 个账号（跳过 %d）· 新任务 %d（可自动 %d）· 接受 %d · 领奖 %d · 零积分补给 %d · +%d 分 +%d 能 · 出错 %d",
-			st.Accounts, st.Skipped, st.Discovered, st.NewAuto, st.Accepted, st.Claimed, st.Rescued, st.Credits, st.Energy, st.Errors)
+	if st.Claims() > 0 || st.Errors > 0 || st.Accepted > 0 || st.Discovered > 0 || st.Rescued > 0 || st.AcceptBackoff > 0 {
+		log.Printf("panel: 任务补领清扫：%d 个账号（跳过 %d）· 新任务 %d（可自动 %d）· 接受 %d · accept退避 %d · 领奖 %d · 零积分补给 %d · +%d 分 +%d 能 · 出错 %d",
+			st.Accounts, st.Skipped, st.Discovered, st.NewAuto, st.Accepted, st.AcceptBackoff, st.Claimed, st.Rescued, st.Credits, st.Energy, st.Errors)
 	}
 	return st
 }
@@ -159,6 +166,7 @@ type sweepResult struct {
 	accounts, skipped, accepted, claimed, errors int
 	discovered, newAuto                          int
 	rescued                                      int
+	acceptBackoff                                int
 	newCodes                                     []string // 新发现且具备自动动作的码
 	credit, energy                               int64
 }
@@ -211,6 +219,12 @@ func (p *Panel) sweepAccountWithRescue(a *auth.Auth, uid string, zeroCreditRescu
 		if t.AcceptStatus == "accepted" || t.AcceptStatus == "completed" {
 			continue
 		}
+		// accept 负缓存：这个 (账号, 任务码) 上一轮接受了但回读没翻，且仍在退避期内
+		// → 本轮跳过。**不消耗轮次、不打上游**，把 4.4 万次无效请求/天压到千级。
+		if p.acceptStuckActive(uid, t.TaskCode) {
+			res.acceptBackoff++
+			continue
+		}
 		if isMPTaskCode(t.TaskCode) || mpOnly[t.TaskCode] {
 			mpCodes = append(mpCodes, t.TaskCode)
 		} else {
@@ -221,6 +235,15 @@ func (p *Panel) sweepAccountWithRescue(a *auth.Auth, uid string, zeroCreditRescu
 	mpOK, mpFailed := p.acceptCodesWithFallback(a, mpCodes, true)
 	res.accepted += ok + mpOK
 	res.errors += failed + mpFailed
+	// 回读结算（仅在本轮真发过 accept 时做）：把「回了 200 但状态没翻」的组合记进
+	// 退避表。回读失败不改表（宁可多试一轮，不要误退避 6 小时）。
+	// 次数：每次 accept 只多 1 次列表请求；接受数归零后连这一次都省掉。
+	if ok+mpOK > 0 {
+		attempted := make([]string, 0, len(codes)+len(mpCodes))
+		attempted = append(attempted, codes...)
+		attempted = append(attempted, mpCodes...)
+		p.settleAcceptBackoff(a, uid, attempted)
+	}
 
 	// 零积分补给：只补跑 PC 限定的体验灵感任务。已达标项不重复上报，
 	// 留给下方统一补领；已 claimed / locked 由 growthPending 排除。

@@ -1,6 +1,8 @@
 package session
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"sync"
@@ -144,7 +146,7 @@ func TestExtractKeyPriority(t *testing.T) {
 	}{
 		{`{"metadata":{"conversation_id":"mc","user_id":"mu"},"conversation_id":"top"}`, "mc"}, // metadata.conversation_id 优先
 		{`{"conversation_id":"top"}`, "top"},                                                   // 顶层 conversation_id
-		{`{"metadata":{"user_id":"mu"}}`, ""},                                                  // user_id 已剔除粘性键（粒度过粗），回落轮换
+		{`{"metadata":{"user_id":"mu"}}`, ""},                                                  // 只有 user_id 无消息：无从派生（user_id 自身不作键）
 		{`{"metadata":{"conversation_id":123}}`, ""},                                           // 非字符串 → 空
 		{`not-json`, ""}, // 非法 JSON → 空
 		// issue #35：客户端实际发 camelCase conversationId，ExtractKey 必须识别。
@@ -160,6 +162,47 @@ func TestExtractKeyPriority(t *testing.T) {
 		if got := ExtractKey([]byte(c.body)); got != c.want {
 			t.Errorf("ExtractKey(%s)=%q want %q", c.body, got, c.want)
 		}
+	}
+}
+
+// TestExtractKeyUserIDNamespacedDerive 锁住 2026-10-24 修订后的契约：user_id 不再
+// 抑制派生，而是作为命名空间混入哈希。旧契约下这类客户端零粘性、每请求换号，
+// 上游前缀缓存全冷（线上 glm-5.3-flash 命中率 11.9% 的直接成因）。
+func TestExtractKeyUserIDNamespacedDerive(t *testing.T) {
+	msgs := `"messages":[{"role":"system","content":"sys"},{"role":"user","content":"hello"}]`
+	mk := func(extra string) string {
+		if extra == "" {
+			return "{" + msgs + "}"
+		}
+		return "{" + extra + "," + msgs + "}"
+	}
+	withTop := ExtractKey([]byte(mk(`"user_id":"tenant-A"`)))
+	withMeta := ExtractKey([]byte(mk(`"metadata":{"user_id":"tenant-A"}`)))
+	again := ExtractKey([]byte(mk(`"user_id":"tenant-A"`)))
+	other := ExtractKey([]byte(mk(`"user_id":"tenant-B"`)))
+	plain := ExtractKey([]byte(mk("")))
+
+	if withTop == "" || withMeta == "" || plain == "" {
+		t.Fatalf("派生键不应为空: top=%q meta=%q plain=%q", withTop, withMeta, plain)
+	}
+	// 同一 user + 同一内容 → 同键（粘性的来源）。
+	if withTop != withMeta {
+		t.Errorf("同一 user_id 顶层/metadata 应同键: %q vs %q", withTop, withMeta)
+	}
+	if again != withTop {
+		t.Errorf("同 body 重复提取应稳定: %q vs %q", again, withTop)
+	}
+	// 不同 user + 同一内容 → 不同键（租户隔离）。
+	if withTop == other {
+		t.Errorf("不同 user_id 必须不同键，实际都是 %q", withTop)
+	}
+	if plain == withTop {
+		t.Errorf("带/不带 user_id 的键不应相同: %q", withTop)
+	}
+	// 无 user_id 的哈希材料必须与旧实现逐字节一致，否则既有粘性绑定全体失效。
+	h := sha256.Sum256([]byte("sys\x00hello"))
+	if want := derivedKeyPrefix + hex.EncodeToString(h[:16]); plain != want {
+		t.Errorf("无 user_id 派生键必须与旧实现一致: got %q want %q", plain, want)
 	}
 }
 

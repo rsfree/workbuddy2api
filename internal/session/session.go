@@ -325,13 +325,14 @@ func hashIndex(key string, n int) int {
 //  4. conversationId
 //  5. prompt_cache_key（OpenAI 前缀缓存键，见下）
 //  6. 派生键：system 提示词 + 首条用户消息的哈希（客户端不发会话 id 时的回退，
-//     带 user_id 的请求不派生——见下方契约说明）
+//     带 user_id 时把 user 维度混入哈希当命名空间——见下方契约说明）
 //
-// 前 5 项均为 conversation 维度（对话级）。metadata.user_id 不再作为粘性键
+// 前 5 项均为 conversation 维度（对话级）。metadata.user_id **本身不作粘性键**
 // （P1-anti-monopoly 剔除）：user 维度粒度过粗——一个 user 的全部并行对话
 // 会钉同一账号（粘性范围远大于上游 prompt cache 的对话级边界），且曾抢占顶层
-// conversation_id 的优先级。剔除后发 user_id 的客户端回落加权轮换（与无标识
-// 客户端同路径），旧 user_id 绑定靠 TTL 自然过期，键消失不产生脏绑定。
+// conversation_id 的优先级。旧 user_id 绑定靠 TTL 自然过期，键消失不产生脏绑定。
+// user_id 现在只作为第 6 项派生键的**命名空间**参与哈希（见下方 2026-10-24 修订），
+// 不再导致「完全不粘性」。
 //
 // issue #35：客户端实际发 camelCase 的 conversationId，此前只识别 snake_case，
 // 导致粘性路由不命中、同对话轮转不同账号、上游上下文缓存 miss。现两种命名均识别，
@@ -343,11 +344,25 @@ func hashIndex(key string, n int) int {
 // 无需改配置即可命中粘性。置于显式会话键之后、派生键之前，绝不抢占 conversation
 // 维度的优先级。
 //
-// 派生键的 user_id 抑制（P1-anti-monopoly 契约在 fallback 路径的延伸）：body 携带
-// metadata.user_id 或顶层 user_id 时**不派生**。ExtractKey 有意剔除 user_id 作粘性键
-// （user 维度粒度过粗——一个 user 的全部并行对话会被钉到同一账号），若派生路径不设
-// 此闸，只发 user_id 的请求会借内容哈希重新获得粘性，使该契约在 fallback 路径失效
-// （上游 #169 同款回归修正）。这类客户端回落加权轮换。
+// 🔴 派生键与 user_id（2026-10-24 修订，推翻旧「不派生」契约）：
+//
+// 旧实现是 body 带 metadata.user_id / 顶层 user_id 时**完全不派生**，让这类客户端
+// 回落加权轮换。上线后发现代价极大：这类客户端每条请求都换号，而上游前缀缓存是
+// **账号级**的，于是同一份上下文每次都在冷账号上重算。线上实测（1.8h / 1000 条）：
+//   - glm-5.3-flash 缓存命中 11.9%、kimi-k3-1 7.0%、kimi-k2.5 5.1%、deepseek-v4-flash 0%
+//   - 同一份 66340 token 上下文 8 秒内打到 4 个账号：两个命中 99.9%，两个 0%
+//   - 对照实验：同 body 连发两次，不带 user_id → 同一账号；带 user_id → 两个不同账号
+//
+// 而「粘住即命中」在实测里是 99.9%（prompt=5123 miss=3）。
+//
+// 新契约：user_id 不再抑制派生，而是**作为命名空间混入哈希**（见 userScopeOf）。
+// P1-anti-monopoly 的原意是「别把某个 user 的全部并行对话钉到同一账号」，那份担忧
+// 在混入哈希后依然成立——键仍由 system + 首条 user 决定，粒度还是对话级：
+//   - 同一 user 的不同对话 → 不同键（不会被整体钉在一个号上）
+//   - 不同 user 的相同内容 → 不同键（租户隔离不破）
+//   - 同一对话多轮 → 同键（上游前缀缓存可命中）
+//
+// 无 user_id 的请求哈希材料与旧实现逐字节一致，既有绑定不受影响。
 func ExtractKey(body []byte) string {
 	if len(body) == 0 {
 		return ""
@@ -375,22 +390,23 @@ func ExtractKey(body []byte) string {
 	if v := strOrEmpty(obj["prompt_cache_key"]); v != "" {
 		return v
 	}
-	// 派生回退闸：带 user 维度标识的请求不派生（契约见上）。
-	if hasUserIDKey(obj) {
-		return ""
-	}
+	// 派生键（带 user_id 时以用户命名空间混入哈希，见 deriveKey 与上方契约说明）。
 	return deriveKey(obj)
 }
 
-// hasUserIDKey 报告已解析 body 是否携带 user 维度标识（metadata.user_id 或顶层
-// user_id，非空字符串才算）。只用于派生回退闸（ExtractKey）；解析失败按无处理。
-func hasUserIDKey(obj map[string]any) bool {
+// userScopeOf 取已解析 body 的 user 维度标识（metadata.user_id 优先，其次顶层
+// user_id；非空字符串才算），作为派生键的命名空间。无标识返回空串。
+//
+// 只认 user_id 这两个位置，不认 OpenAI 的顶层 user 字段：user 常被客户端塞成
+// 每请求变化的随机值（或以 request-id 形态出现），拿它入键会让派生键逐请求漂移，
+// 把当前本来能粘住的客户端一起弄坏。user_id 的语义是稳定的租户/账号标识。
+func userScopeOf(obj map[string]any) string {
 	if meta, ok := obj["metadata"].(map[string]any); ok {
-		if strOrEmpty(meta["user_id"]) != "" {
-			return true
+		if v := strOrEmpty(meta["user_id"]); v != "" {
+			return v
 		}
 	}
-	return strOrEmpty(obj["user_id"]) != ""
+	return strOrEmpty(obj["user_id"])
 }
 
 // derivedKeyPrefix 派生键前缀，与显式会话 id 的命名空间隔离：
@@ -437,7 +453,14 @@ func deriveKey(obj map[string]any) string {
 	if firstUserText == "" {
 		return "" // 无用户消息：无从归属会话
 	}
-	sum := sha256.Sum256([]byte(systemText + "\x00" + firstUserText))
+	// user 命名空间前缀：无 user_id 时材料与修订前逐字节一致（既有绑定不失效）；
+	// 有 user_id 时把用户维度混入哈希——不同用户永不同键（隔离），同一用户的
+	// 不同对话仍各自成键（对话级粒度不变），同一对话多轮仍是同键（粘性）。
+	material := systemText + "\x00" + firstUserText
+	if scope := userScopeOf(obj); scope != "" {
+		material = scope + "\x00" + material
+	}
+	sum := sha256.Sum256([]byte(material))
 	return derivedKeyPrefix + hex.EncodeToString(sum[:16])
 }
 

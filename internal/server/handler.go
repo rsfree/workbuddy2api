@@ -1080,15 +1080,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
-		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
+		// 选号：粘性号优先（PickStickyForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
 		if stickyUID != "" {
-			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
-			// 跨域回退开启且请求为裸名时，粘性号可以落在任一域（回退成功后绑定的是另一域
-			// 的账号，下一轮不该被 realm 校验立刻解绑）。
-			if acct == nil || (realm != "" && acct.Realm() != realm && !crossRealm) {
-				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑，
-				// 本次回落普通轮换。
+			var why pool.StickyPickResult
+			acct, why = h.cfg.Pool.PickStickyForModel(stickyUID, bareModel)
+			switch {
+			case acct == nil && why == pool.StickyBusy:
+				// 🔴 只是「在途名额占满」这一个临时原因：**不解绑**。
+				// 解绑会把整段会话永久搬到另一个账号，而上游前缀缓存按账号隔离，
+				// 搬走即全冷（实测命中率从 99.9% 掉到 0）。本次请求溢出到普通轮换，
+				// 绑定留给下一个（通常是串行的）轮次继续命中。
+				// 保留绑定的代价只是每轮多一次 PickByUID 读锁查询，可忽略。
+			case acct == nil:
+				// 持久不可用：账号不存在/冷却/封禁/该模型被限额/积分保底 → 解绑重分配。
+				unbindSticky()
+			case realm != "" && acct.Realm() != realm && !crossRealm:
+				// 跨域回退开启且请求为裸名时，粘性号可以落在任一域（回退成功后绑定的是另一域
+				// 的账号，下一轮不该被 realm 校验立刻解绑）。
 				unbindSticky()
 				acct = nil
 			}
