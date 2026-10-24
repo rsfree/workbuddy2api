@@ -80,7 +80,7 @@ func TestBaselineRejectsBadInput(t *testing.T) {
 	b.Record("m", nil, 10)                          // 无消息
 	b.Record("m", []uint64{1}, 0)                   // 无 usage
 	b.Record("m", []uint64{1, 0}, 10)               // 含指纹 0（序列化失败）
-	b.Record("m", make([]uint64, maxDigests+1), 10) // 超长不截断
+	b.Record("m", make([]uint64, maxDigests+1), 10) // 超长（全 0 → 先被指纹检查挡掉）
 	b.Record("m", []uint64{2}, -5)                  // 负值
 
 	if n := b.Snapshot()["entries"].(int); n != 0 {
@@ -160,5 +160,29 @@ func TestBaselinePendingBounded(t *testing.T) {
 	}
 	if n := b.Snapshot()["pred_pending"].(int); n != maxPreds {
 		t.Fatalf("pending=%d want %d", n, maxPreds)
+	}
+}
+
+// TestBaselineCountsOversize 超长会话（消息条数 > maxDigests）放弃记录但必须计数：
+// 线上若这一项持续增长，说明长会话根本没基线可用，该做滑动窗口而不是继续调容量。
+func TestBaselineCountsOversize(t *testing.T) {
+	b := NewBaseline(4)
+	big := make([]uint64, maxDigests+1)
+	for i := range big {
+		big[i] = uint64(i + 1)
+	}
+	b.Record("m", big, 8000)
+
+	snap := b.Snapshot()
+	if snap["entries"].(int) != 0 {
+		t.Fatalf("entries=%d want 0（超长不截断、不入库）", snap["entries"])
+	}
+	if snap["oversize"].(uint64) != 1 {
+		t.Fatalf("oversize=%v want 1", snap["oversize"])
+	}
+	// 刚好等于上限仍要收：边界差一条不该被当成超长。
+	b.Record("m", big[:maxDigests], 8000)
+	if n := b.Snapshot()["entries"].(int); n != 1 {
+		t.Fatalf("entries=%d want 1（=maxDigests 应入库）", n)
 	}
 }

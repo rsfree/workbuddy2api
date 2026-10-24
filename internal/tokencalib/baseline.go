@@ -32,6 +32,9 @@ type Baseline struct {
 	predsBy map[string]*predStat
 	hits    uint64
 	misses  uint64
+	// oversize 因消息条数超 maxDigests 而放弃记录的轮数（长会话）。
+	// 它是「该不该做滑动窗口」的唯一判据：持续增长说明长会话根本没基线可用。
+	oversize uint64
 }
 
 type baseEntry struct {
@@ -63,9 +66,13 @@ const (
 	// 截断后「前 N 条匹配」仍会命中，但存的 tokens 对应的是完整 messages，
 	// 两者错位会算出偏大的值。宁可放弃这一条，等下一轮短一点再记。
 	maxDigests = 512
-	// defaultBaselineLimit 默认保留多少个会话/批次。每条最多 512*8B ≈ 4KB，
-	// 32 条约 128KB 上限，对常驻进程可忽略。
-	defaultBaselineLimit = 32
+	// defaultBaselineLimit 默认保留多少个会话/批次。
+	//
+	// 128 而不是更小：线上实测（68 账号的网关）每轮 chat 都会新增一条（messages 变长），
+	// 旧轮次只能等 LRU 淘汰，一个活跃会话就会占好几条。32 条上线 3 分钟即打满，
+	// 之后每次 Record 都要淘汰一条——被淘汰的若是另一会话的最新记录，那次 count_tokens
+	// 就白白 miss。每条最多 512*8B ≈ 4KB，128 条约 512KB，对常驻进程仍可忽略。
+	defaultBaselineLimit = 128
 	// maxPreds 同时挂多少条待验证预测。count_tokens 是客户端高频动作（每轮数次），
 	// 只保留最近若干条足够配对——真正要验证的是「紧接着那次 chat」。
 	maxPreds = 16
@@ -84,7 +91,7 @@ func NewBaseline(limit int) *Baseline {
 // 同 model 且指纹序列完全相同的记录会就地更新（客户端重试、并发重放不占新槽位）。
 // tokens 非正数（上游没带 usage）时忽略：不能把「缺数据」记成 0。
 func (b *Baseline) Record(model string, digests []uint64, tokens int) {
-	if b == nil || model == "" || len(digests) == 0 || len(digests) > maxDigests {
+	if b == nil || model == "" || len(digests) == 0 {
 		return
 	}
 	if tokens <= 0 {
@@ -99,6 +106,13 @@ func (b *Baseline) Record(model string, digests []uint64, tokens int) {
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	// 超长不记录（不截断）：截断后「前 N 条匹配」仍会命中，但存的 tokens 对应完整
+	// messages，两者错位会算出偏大值。只计数，供 /status 判断要不要做滑动窗口。
+	if len(digests) > maxDigests {
+		b.oversize++
+		return
+	}
 
 	b.seq++
 	cp := append([]uint64(nil), digests...)
@@ -256,6 +270,7 @@ func (b *Baseline) Snapshot() map[string]any {
 		"pred_verified": verified,
 		"pred_pending":  len(b.preds),
 		"pred_by_model": byModel,
+		"oversize":      b.oversize,
 	}
 }
 
