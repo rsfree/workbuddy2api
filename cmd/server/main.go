@@ -317,7 +317,9 @@ func main() {
 	tokenCal := tokencalib.New(stateSibling(cfg.StateFile, "token-calib.json"))
 	// 会话基线：count_tokens 优先用「上一轮真实 prompt_tokens + 新增消息估算」，
 	// 比整段乘系数准得多。纯内存（重启后几十个请求内自然重建），不落盘。
-	baseLine := tokencalib.NewBaseline(32)
+	// 容量传 0 = 用 tokencalib 的默认值：容量是那个包的不变量，别在这里再硬编码一份
+	// （两侧各写一个数字，改了一处忘了另一处会静默失效——1.13.31 就这么踩过）。
+	baseLine := tokencalib.NewBaseline(0)
 	defer tokenCal.Save()
 	log.Printf("[tokencalib] 输入 token 校准已启用: %s", stateSibling(cfg.StateFile, "token-calib.json"))
 

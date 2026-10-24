@@ -186,3 +186,22 @@ func TestBaselineCountsOversize(t *testing.T) {
 		t.Fatalf("entries=%d want 1（=maxDigests 应入库）", n)
 	}
 }
+
+// TestNewBaselineDefaultLimit 默认容量必须是包内的不变量。
+//
+// 1.13.31 的教训：常量从 32 改成 128，但 cmd/server 里硬编码了 NewBaseline(32)，
+// 线上跑起来还是 32（/status 的 limit 一眼看穿）。调用方一律传 0 走默认，
+// 这里同时守住「默认值不能再退回 32」——线上 68 账号的网关 3 分钟就打满。
+func TestNewBaselineDefaultLimit(t *testing.T) {
+	b := NewBaseline(0)
+	if got := b.Snapshot()["limit"].(int); got != defaultBaselineLimit {
+		t.Fatalf("limit=%d want %d（调用方传 0 应走默认）", got, defaultBaselineLimit)
+	}
+	if defaultBaselineLimit < 64 {
+		t.Fatalf("defaultBaselineLimit=%d 太小，线上实测 32 条 3 分钟即打满", defaultBaselineLimit)
+	}
+	// 显式传值仍要生效（测试用得到小容量）。
+	if got := NewBaseline(4).Snapshot()["limit"].(int); got != 4 {
+		t.Fatalf("显式 limit=%d want 4", got)
+	}
+}
