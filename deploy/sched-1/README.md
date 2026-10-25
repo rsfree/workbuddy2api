@@ -58,6 +58,29 @@
 
 ## 重部署 / 升级
 
+**首选：一条命令**（推代码 → 等 tag → 等多架构镜像 → 切 compose → 重启 → 校验版本）
+
+```bash
+./scripts/release.sh              # 只推 + 等镜像就绪
+./scripts/release.sh --deploy     # 再上线（幂等：已同版本则跳过重建）
+./scripts/release.sh --tag v1.13.40 --deploy   # 补发/重部署指定版本
+./scripts/release.sh --dry-run --deploy        # 探路，不动任何东西
+```
+
+脚本内置默认值就是本机（`root@154.40.45.18:/opt/workbuddy2api`，服务 `wb2api`）。
+换机器不必改脚本，覆盖即可（优先级 **命令行 > 环境变量 > 默认值**）：
+
+```bash
+WB2API_DEPLOY_HOST=root@1.2.3.4 WB2API_DEPLOY_DIR=/opt/wb ./scripts/release.sh --deploy
+./scripts/release.sh --deploy --host root@1.2.3.4 --dir /opt/wb --service wb2api
+```
+
+判断「是否需要重建」看**运行中的容器镜像**（`docker compose ps -q | docker inspect`），
+不只比 compose 文件——「compose 已改但没 apply」这种半吊子状态也能识破。所以 `--deploy`
+在什么都没变时是纯空转，不会重启容器。
+
+<details><summary>备用路径：源码直推 + 本机构建（改配置/装依赖、不走镜像时）</summary>
+
 ```bash
 # 本地：只传源码（排除 auths/data/config.json）
 cd ~/PycharmProjects/AI/reverse/workbuddy2api
@@ -69,6 +92,9 @@ ssh root@154.40.45.18 'cd /opt/workbuddy2api && docker compose up -d --build'
 ```
 
 `auths/`（凭证）与 `data/`（池状态）在宿主目录，重建镜像不丢。
+</details>
+
+回滚：`cd /opt/workbuddy2api && cp docker-compose.yml.bak-<旧版本> docker-compose.yml && docker compose up -d wb2api`（脚本每次切 tag 前会自动留这份备份）。
 
 ## 首次部署踩到的点（复用时的清单）
 
