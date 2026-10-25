@@ -23,6 +23,9 @@ on:
 
 permissions:
   contents: write
+  # 末尾要派发 docker-ghcr（见「触发镜像构建」步骤）。显式声明 permissions 时
+  # 未列出的权限一律为 none，漏了这条 dispatch 会被 403。
+  actions: write
 
 # 同一分支串行：并发发版会各自读到同一个 tag 再各自自增，必然撞版本。
 # 不能改成按 sha 分组——那会丢掉「同一分支串行」这层保护。
@@ -278,3 +281,26 @@ jobs:
           gh release create "$TAG" dist/* \
             --title "wb2api-panel ${TAG}" \
             --notes-file notes.md
+
+      # 为什么需要这一步：tag 是 GITHUB_TOKEN 推的，GITHUB_TOKEN 产生的事件默认
+      # **不会**再触发别的 workflow（否则容易无限自激）。所以 docker-ghcr 的
+      # `tags: ["v*"]` 永远等不到这个 tag，镜像会静默缺失。
+      # 官方例外清单里有 workflow_dispatch —— 用 GITHUB_TOKEN 派发是**会**真跑的，
+      # 因此这里显式补一次，取代以前「发完版再手动 gh workflow run」那一步。
+      - name: 触发镜像构建
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # tag 刚 push，GitHub 侧的 ref 索引有几秒延迟；先确认可见再派发，
+          # 否则 gh workflow run --ref <tag> 会 404（"could not resolve ref"）。
+          for i in 1 2 3 4 5; do
+            if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+              break
+            fi
+            echo "tag ${TAG} 尚不可见（${i}/5），等 5s"
+            sleep 5
+          done
+          gh workflow run docker-ghcr.yml --ref "$TAG"
+          echo "已派发 docker-ghcr @ ${TAG}（多架构构建约需 5-15 分钟）"
