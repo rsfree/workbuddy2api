@@ -170,7 +170,9 @@ type Config struct {
 		// DeadlineSeconds 单次生图请求的总时限（跨账号轮转 + 重试），缺省 420。
 		// 只决定「还换不换号」，不打断已经在途的那一次。
 		DeadlineSeconds int `json:"deadline_seconds"`
-		// MaxRefImages 单次请求参考图上限（超出截尾），缺省 4。
+		// MaxRefImages 单次请求参考图上限（超出截尾），缺省 5（混元 Hy Image3.5 单次最多 5 张参考图）。
+		// 另有独立硬限：入站请求体 96MB、单张参考图 32M 字符（base64 后）；
+		// 5 张超大原图会先撞那道墙并返回 413，不会静默丢图。
 		MaxRefImages int `json:"max_ref_images"`
 		// FetchSourceIP 下载 URL 参考图时绑定的本机源 IP（空 = 默认路由）。
 		// 多公网 IP 主机上默认路由 IP 可能被图片 CDN 单独拉黑（sched-1 的
@@ -458,7 +460,7 @@ func Default() *Config {
 	c.Images.DefaultModel = "hunyuan-image-alpha"
 	c.Images.EditModel = "hunyuan-image-alpha-edit"
 	c.Images.DeadlineSeconds = 420
-	c.Images.MaxRefImages = 4
+	c.Images.MaxRefImages = 5
 	// 媒体模型（图像/视频）默认进 /v1/models：列表本身是动态探测的，开箱即可
 	// 在聊天客户端里选到图像模型；不需要时显式 false。
 	c.Images.ListInModels = true
@@ -930,7 +932,7 @@ func (c *Config) normalize() error {
 		c.Images.DeadlineSeconds = 420
 	}
 	if c.Images.MaxRefImages <= 0 {
-		c.Images.MaxRefImages = 4
+		c.Images.MaxRefImages = 5
 	}
 	if err := c.validateScheduleHours(); err != nil {
 		return err

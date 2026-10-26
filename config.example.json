@@ -53,7 +53,7 @@
     "edit_model": "hunyuan-image-alpha-edit",
     "fallback_model": "",
     "deadline_seconds": 420,
-    "max_ref_images": 4,
+    "max_ref_images": 5,
     "fetch_source_ip": "",
     "list_in_models": true
   },

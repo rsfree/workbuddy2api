@@ -145,7 +145,7 @@ func (h *Handler) imagesCfg() ImagesConfig {
 		c.Deadline = 420 * time.Second
 	}
 	if c.MaxRefImages <= 0 {
-		c.MaxRefImages = 4
+		c.MaxRefImages = 5
 	}
 	return c
 }
