@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
@@ -2070,6 +2071,87 @@ func TestChatHiddenModelRejected(t *testing.T) {
 	if calls != 1 {
 		t.Errorf("allowed model: upstream calls=%d, want 1", calls)
 	}
+}
+
+// TestModelsExtraListed models.extra 静态补录：上游目录里没有的模型也要进 /v1/models，
+// 并按 type 带上端点字段；hidden 优先于 extra。
+func TestModelsExtraListed(t *testing.T) {
+	dynamicModelsCache.Lock()
+	dynamicModelsCache.ids = []upstream.ModelInfo{{ID: "glm-5.2"}}
+	dynamicModelsCache.fetched = time.Now()
+	dynamicModelsCache.Unlock()
+	defer func() {
+		dynamicModelsCache.Lock()
+		dynamicModelsCache.ids = nil
+		dynamicModelsCache.fetched = time.Time{}
+		dynamicModelsCache.lastFail = time.Time{}
+		dynamicModelsCache.Unlock()
+	}()
+
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, `{"data":[]}`, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{
+		Pool:     p,
+		Upstream: up,
+		ModelsExtra: []livecfg.ExtraModel{
+			{ID: "hy-image-3.5-preview", Type: "image", Name: "Hy Image 3.5 Preview"},
+			{ID: "global:hy-video-x", Type: "video"},
+			{ID: "cn:secret-extra", Type: "image"},
+			{ID: "glm-5.2", Type: "image"}, // 与上游同名：不得覆盖真实条目
+		},
+		ModelsHidden: []string{"secret-extra"},
+	})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode /v1/models: %v", err)
+	}
+	byID := map[string]map[string]any{}
+	for _, m := range resp.Data {
+		if id, ok := m["id"].(string); ok {
+			byID[id] = m
+		}
+	}
+	img, ok := byID["cn:hy-image-3.5-preview"]
+	if !ok {
+		t.Fatalf("extra image model missing: ids=%v", keysOf(byID))
+	}
+	if img["type"] != "image" || img["endpoint"] != "/v1/images/generations" ||
+		img["edits_endpoint"] != "/v1/images/edits" {
+		t.Errorf("extra image entry fields wrong: %v", img)
+	}
+	if img["name"] != "Hy Image 3.5 Preview" {
+		t.Errorf("extra name missing: %v", img["name"])
+	}
+	vid, ok := byID["global:hy-video-x"]
+	if !ok {
+		t.Errorf("extra global video model missing: ids=%v", keysOf(byID))
+	} else if vid["type"] != "video" || vid["endpoint"] != "/v1/videos/generations" {
+		t.Errorf("extra video entry fields wrong: %v", vid)
+	}
+	if _, leaked := byID["cn:secret-extra"]; leaked {
+		t.Errorf("hidden 应压过 extra，泄漏了 cn:secret-extra")
+	}
+	if real, ok := byID["cn:glm-5.2"]; !ok || real["type"] != nil {
+		t.Errorf("上游真实条目被 extra 覆盖或丢失: %v", real)
+	}
+}
+
+func keysOf(m map[string]map[string]any) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
 
 // TestModelsHiddenFiltered models.hidden 黑名单：/v1/models 列表里过滤掉隐藏模型。

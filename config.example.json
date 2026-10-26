@@ -102,8 +102,9 @@
     "sanitize_blacklist_fingerprints": true
   },
   "models": {
-    "_comment": "hidden: 不对外暴露的模型黑名单。裸名=两域都藏；\"cn:xxx\"/\"global:xxx\"=只藏该域。/v1/models 列表过滤 + chat 点名拒绝，面板保存后热生效。",
-    "hidden": []
+    "_comment": "hidden: 不对外暴露的模型黑名单。裸名=两域都藏；\"cn:xxx\"/\"global:xxx\"=只藏该域。/v1/models 列表过滤 + chat 点名拒绝，面板保存后热生效。extra: 静态补录，把上游账号目录里没有的模型列进 /v1/models（裸名归 cn；type=image/video 自动带端点字段），hidden 优先。注意：补录只影响列表呈现，上游没路由时调用仍会失败（如生图返回 14401 route config not found）。",
+    "hidden": [],
+    "extra": []
   },
   "prompt": {
     "mode": "passthrough",

@@ -569,6 +569,11 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if hasAccounts {
+		// models.extra 静态补录：面板同步展示（标 extra=true 与上游真实目录区分）。
+		// 上游路由未下发时该条目调用会失败，运维需要一眼看出它来自网关声明而非上游。
+		if p.cfg.Live != nil {
+			out = appendPanelExtraModels(out, p.cfg.Live.Load().ExtraModels)
+		}
 		out = append(out, panelToolEntries()...)
 	}
 	if len(out) == 0 {
@@ -599,6 +604,52 @@ func appendPanelMediaModels(out []map[string]any, realm string, infos []upstream
 			entry["endpoint"] = "/v1/images/generations"
 			entry["edits_endpoint"] = "/v1/images/edits"
 		} else {
+			entry["endpoint"] = "/v1/videos/generations"
+			entry["poll_endpoint"] = "/v1/videos/{id}"
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// appendPanelExtraModels 把 models.extra 静态补录条目附到面板目录。
+//
+// 与 /v1/models 的差异：面板**不套 models.hidden 过滤**（面板是运维诊断视图，
+// 要看全量目录），但会打 extra=true 标记——补录条目不代表上游可用，必须能区分。
+func appendPanelExtraModels(out []map[string]any, extras []livecfg.ExtraModel) []map[string]any {
+	if len(extras) == 0 {
+		return out
+	}
+	seen := make(map[string]bool, len(out))
+	for _, m := range out {
+		if id, ok := m["id"].(string); ok {
+			seen[id] = true
+		}
+	}
+	for _, em := range extras {
+		if seen[em.ID] {
+			continue
+		}
+		seen[em.ID] = true
+		entry := map[string]any{
+			"id":       em.ID,
+			"object":   "model",
+			"owned_by": "workbuddy",
+			"extra":    true,
+		}
+		if em.Name != "" {
+			entry["name"] = em.Name
+		}
+		if len(em.Tags) > 0 {
+			entry["tags"] = em.Tags
+		}
+		switch em.Type {
+		case "image":
+			entry["type"] = "image"
+			entry["endpoint"] = "/v1/images/generations"
+			entry["edits_endpoint"] = "/v1/images/edits"
+		case "video":
+			entry["type"] = "video"
 			entry["endpoint"] = "/v1/videos/generations"
 			entry["poll_endpoint"] = "/v1/videos/{id}"
 		}

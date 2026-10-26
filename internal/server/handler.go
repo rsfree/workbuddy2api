@@ -68,6 +68,11 @@ type Config struct {
 	// 裸用/测试路径经 loadLive() 归一化后使用）。
 	ModelsHidden []string
 
+	// ModelsExtra 静态补录的模型条目（config models.extra）。只影响 /v1/models
+	// 的呈现，不参与可用性判断：上游没有路由时点名调用照样被上游拒绝。
+	// 与 ModelsHidden 同源处理（Live 为 nil 时经 loadLive() 归一化）。
+	ModelsExtra []livecfg.ExtraModel
+
 	// TokenCalib /v1/messages/count_tokens 的输入 token 校准器（可选；nil =
 	// 纯字符粗估）。协议前门每次对话回来都会用真实 usage.prompt_tokens 在线
 	// 更新它，count_tokens 再拿学到的系数换算（见 internal/tokencalib）。
@@ -155,6 +160,7 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		SoftCooldown:     h.cfg.SoftCooldown,
 		RecordClientInfo: h.cfg.RecordClientInfo,
 		HiddenModels:     livecfg.NormalizeHiddenModels(h.cfg.ModelsHidden),
+		ExtraModels:      livecfg.NormalizeExtraModels(h.cfg.ModelsExtra),
 	}
 }
 
@@ -672,6 +678,50 @@ func (h *Handler) modelList() []map[string]any {
 			case "video":
 				entry["endpoint"] = "/v1/videos/generations"
 				entry["poll_endpoint"] = "/v1/videos/{id}"
+			}
+			out = append(out, entry)
+		}
+	}
+	// models.extra 静态补录：上游账号目录里没有、但要对客户端可见的模型
+	// （典型场景：产品已宣传但账号级路由未下发的生图模型）。只负责「列出来」，
+	// 不承诺可用——上游缺路由时点名调用仍返错误；hidden 优先级更高。
+	// 放最后：与上面两段共用同一份 out 去重，上游真实条目永远压过补录条目。
+	if extras := h.loadLive().ExtraModels; len(extras) > 0 {
+		seen := make(map[string]bool, len(out)+len(extras))
+		for _, m := range out {
+			if id, ok := m["id"].(string); ok {
+				seen[id] = true
+			}
+		}
+		for _, em := range extras {
+			if _, hide := hidden[em.ID]; hide {
+				continue
+			}
+			if seen[em.ID] {
+				continue
+			}
+			seen[em.ID] = true
+			entry := map[string]any{
+				"id":       em.ID,
+				"object":   "model",
+				"created":  1753600000,
+				"owned_by": "workbuddy",
+			}
+			switch em.Type {
+			case "image":
+				entry["type"] = "image"
+				entry["endpoint"] = "/v1/images/generations"
+				entry["edits_endpoint"] = "/v1/images/edits"
+			case "video":
+				entry["type"] = "video"
+				entry["endpoint"] = "/v1/videos/generations"
+				entry["poll_endpoint"] = "/v1/videos/{id}"
+			}
+			if em.Name != "" {
+				entry["name"] = em.Name
+			}
+			if len(em.Tags) > 0 {
+				entry["tags"] = em.Tags
 			}
 			out = append(out, entry)
 		}

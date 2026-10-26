@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/egress"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 )
@@ -272,6 +273,11 @@ type Config struct {
 		// 生效点：GET /v1/models 列表过滤 + POST /v1/chat/completions 点名拒绝。
 		// 面板保存后经 livecfg 热生效，无需重启。
 		Hidden []string `json:"hidden"`
+		// Extra 静态补录：上游账号目录里没有、但要对客户端可见的模型。裸名归 cn 域；
+		// type=image/video 时自动带上对应端点字段。只影响 /v1/models 的呈现，
+		// 不代表上游真的开通——调用仍会被上游判定（路由缺失返 14401）。
+		// 与 hidden 冲突时 hidden 优先。面板保存后经 livecfg 热生效。
+		Extra []livecfg.ExtraModel `json:"extra"`
 	} `json:"models"`
 
 	Prompt struct {

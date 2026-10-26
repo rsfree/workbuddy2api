@@ -308,6 +308,7 @@ func main() {
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
 		HiddenModels:         livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
+		ExtraModels:          livecfg.NormalizeExtraModels(cfg.Models.Extra),
 	})
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
@@ -414,6 +415,8 @@ func main() {
 		// 模型黑名单原始条目；运行期以 livecfg 快照为准（热生效），此处供
 		// Live 为 nil 的裸用/测试路径。
 		ModelsHidden: cfg.Models.Hidden,
+		// 静态补录条目（与 hidden 同源、同样可热改）；此处供 Live 为 nil 的裸用/测试路径。
+		ModelsExtra: cfg.Models.Extra,
 		// 图像接口（/v1/images/*）：默认模型、总时限、参考图上限与 /v1/models 可见性。
 		Images: &server.ImagesConfig{
 			Enabled:       cfg.Images.Enabled,
@@ -653,6 +656,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
 		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
+		ExtraModels:          livecfg.NormalizeExtraModels(newCfg.Models.Extra),
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)

@@ -51,3 +51,37 @@ func TestNormalizeHiddenModels(t *testing.T) {
 		}
 	}
 }
+
+// TestNormalizeExtraModels 补录归一化语义：
+//   - nil/空/全空白/无 id → nil
+//   - 裸名 → 只落 cn（与 hidden 的两域语义不同：补录必须给客户端一个确切 id）
+//   - "global:" 前缀 → 只落该域
+//   - type 只认 image/video，其余（含 "chat"）落空串
+//   - 同 id 去重（先到先得）
+func TestNormalizeExtraModels(t *testing.T) {
+	if got := NormalizeExtraModels(nil); got != nil {
+		t.Errorf("nil → %v, want nil", got)
+	}
+	if got := NormalizeExtraModels([]ExtraModel{{ID: "  "}, {ID: ""}}); got != nil {
+		t.Errorf("blank ids → %v, want nil", got)
+	}
+
+	got := NormalizeExtraModels([]ExtraModel{
+		{ID: " hy-image-3.5-preview ", Type: "IMAGE", Name: " Hy 3.5 "},
+		{ID: "global:hy-video", Type: "video"},
+		{ID: "cn:chat-model", Type: "chat"},
+		{ID: "hy-image-3.5-preview", Type: "image"}, // 重复，先到先得
+	})
+	if len(got) != 3 {
+		t.Fatalf("got %d entries %+v, want 3", len(got), got)
+	}
+	if got[0].ID != "cn:hy-image-3.5-preview" || got[0].Type != "image" || got[0].Name != "Hy 3.5" {
+		t.Errorf("bare name entry = %+v, want cn-prefixed image + trimmed name", got[0])
+	}
+	if got[1].ID != "global:hy-video" || got[1].Type != "video" {
+		t.Errorf("global entry = %+v", got[1])
+	}
+	if got[2].ID != "cn:chat-model" || got[2].Type != "" {
+		t.Errorf("chat type must collapse to empty, got %+v", got[2])
+	}
+}
