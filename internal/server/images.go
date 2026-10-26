@@ -196,16 +196,26 @@ func (h *Handler) prepareImage(ctx context.Context, raw map[string]any, kind ups
 	if fail != nil {
 		return nil, fail
 	}
-	// 文本模型 + 参考图：上游 edits 需要 image-to-image 模型，自动切到编辑模型。
-	if kind == upstream.ImageEdit && strings.EqualFold(model, cfg.DefaultModel) {
-		model = cfg.EditModel
-		warns = append(warns, "model-switched-to-"+cfg.EditModel)
-	}
-	// 编辑模型但没图：generations 端点会拿编辑模型名去请求文本生图，必错。
-	// 给出可操作的 400（chat 前门会先把它切成默认文本模型）。
-	if kind == upstream.ImageGeneration && len(refs) == 0 && strings.EqualFold(model, cfg.EditModel) {
-		return nil, &imageFailure{status: http.StatusBadRequest,
-			msg: fmt.Sprintf("model %q requires a reference image; use %q for text-to-image", model, cfg.DefaultModel)}
+	// 下面两条规则都建立在「文生图模型 ≠ 图生图模型」这个前提上：
+	//   ① 文本模型 + 参考图 → 换成编辑模型；
+	//   ② 点名编辑模型但没图 → 400（拿 edit 模型去打文本生图必错）。
+	// 当配置让一个模型同时承担两条路径（default_model == edit_model）时，这个前提
+	// 不成立：同一个名字两条路径都接受，①②都会误伤——①会产生
+	// "model-switched-to-<同一个名字>" 这种空告警，②会把合法的文生图请求判成
+	// "requires a reference image"（2026-10-26 实测踩到）。故 sharedModel 时整体跳过。
+	sharedModel := cfg.DefaultModel != "" && strings.EqualFold(cfg.DefaultModel, cfg.EditModel)
+	if !sharedModel {
+		// 文本模型 + 参考图：上游 edits 需要 image-to-image 模型，自动切到编辑模型。
+		if kind == upstream.ImageEdit && strings.EqualFold(model, cfg.DefaultModel) {
+			model = cfg.EditModel
+			warns = append(warns, "model-switched-to-"+cfg.EditModel)
+		}
+		// 编辑模型但没图：generations 端点会拿编辑模型名去请求文本生图，必错。
+		// 给出可操作的 400（chat 前门会先把它切成默认文本模型）。
+		if kind == upstream.ImageGeneration && len(refs) == 0 && strings.EqualFold(model, cfg.EditModel) {
+			return nil, &imageFailure{status: http.StatusBadRequest,
+				msg: fmt.Sprintf("model %q requires a reference image; use %q for text-to-image", model, cfg.DefaultModel)}
+		}
 	}
 
 	payload, bodyWarns, err := buildImagePayload(kind, model, raw, refs)

@@ -106,6 +106,52 @@ func TestImageGenerationsSuccess(t *testing.T) {
 	}
 }
 
+// TestImageSharedModelServesBothPaths 单一模型同时承担文生图/图生图
+// （default_model == edit_model，如 hy-image-3.5）：不带参考图的文生图不得被判成
+// "requires a reference image"，带参考图的 edits 也不得产生 model-switched 空告警。
+func TestImageSharedModelServesBothPaths(t *testing.T) {
+	withFakeImageFetch(t)
+	const shared = "hy-image-3.5"
+	var gotPath, gotBody string
+	up, _ := newImageUpstream(t, func(r *http.Request) (int, string) {
+		gotPath = r.URL.Path
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		return 200, `{"code":0,"data":{"data":[{"b64_json":"aGk="}]}}`
+	})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(imageTestAccount("u1")),
+		Upstream: up,
+		Images:   &ImagesConfig{Enabled: true, DefaultModel: shared, EditModel: shared},
+	})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/images/generations",
+		strings.NewReader(`{"prompt":"a cat","size":"1024x1024"}`)))
+	if rec.Code != 200 {
+		t.Fatalf("shared model 文生图: code=%d body=%s", rec.Code, rec.Body)
+	}
+	if gotPath != "/v2/images/generations" || !strings.Contains(gotBody, `"model":"`+shared+`"`) {
+		t.Errorf("文生图 upstream path=%q body=%s", gotPath, gotBody)
+	}
+	if w := rec.Header().Get("X-WB2A-Image-Warn"); strings.Contains(w, "model-switched") {
+		t.Errorf("文生图不该出现 model-switched 空告警: %q", w)
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/images/edits",
+		strings.NewReader(`{"prompt":"replace bg","image":["https://cdn.example/ref.png"]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("shared model 图生图: code=%d body=%s", rec.Code, rec.Body)
+	}
+	if gotPath != "/v2/images/edits" || !strings.Contains(gotBody, `"model":"`+shared+`"`) {
+		t.Errorf("图生图 upstream path=%q body=%s", gotPath, gotBody)
+	}
+	if w := rec.Header().Get("X-WB2A-Image-Warn"); strings.Contains(w, "model-switched") {
+		t.Errorf("图生图不该出现 model-switched 空告警: %q", w)
+	}
+}
+
 // TestImageEditsMultipart 图生图 multipart：文件转 data URI，走独立 edits 端点。
 func TestImageEditsMultipart(t *testing.T) {
 	var gotPath, gotBody string
