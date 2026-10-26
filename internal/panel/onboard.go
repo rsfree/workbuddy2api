@@ -197,6 +197,25 @@ func (p *Panel) runOnboard(job onboardJob) {
 		a.UID, status, before, after, delta, claimed, err)
 }
 
+// onboardRetryDelay 首轮未达成时的补跑等待间隔。
+//
+// 上游对新号首轮行为事件存在整体性丢弃（2026-10-26 阿莫西林实测：20 个动作
+// 全部返回成功，只有 8 个任务进度生效；隔约两分钟后逐个重放同一动作，12 个
+// 全部生效，余额 2500→4300）。同轮立即重放仍被丢弃，所以必须等一段真实时间，
+// 再整轮重跑。60s 是实测可行下限，不要为了省时间压在秒级。
+// 独立变量供测试缩短。
+var onboardRetryDelay = 60 * time.Second
+
+// hasPendingTasks 判断 runAutoAll 结果里是否还有「动作已上报但进度未生效」的项。
+func hasPendingTasks(results []map[string]any) bool {
+	for _, it := range results {
+		if st, _ := it["status"].(string); st == "pending" {
+			return true
+		}
+	}
+	return false
+}
+
 // execOnboard 默认流水线：基线 → 全量动作（含接受/补领）→ 补一轮 sweep → 终值。
 func execOnboard(p *Panel, a *auth.Auth) (claimed int, before, after int64, err error) {
 	if a.Realm() == "global" {
@@ -224,6 +243,21 @@ func execOnboard(p *Panel, a *auth.Auth) (claimed int, before, after int64, err 
 	// 动作之外的达标任务（无自动动作的任务码）靠这一轮 sweep 接受 + 领奖。
 	if res := p.sweepAccount(a, a.UID); res.claimed > 0 {
 		claimed += res.claimed
+	}
+
+	// 第二轮补跑：首轮有项「动作成功但进度没翻」时，隔 onboardRetryDelay 整轮重跑。
+	// runAutoAll 对已完成/已领的任务走 skip，第二轮只重做仍 pending 的项，
+	// 不会把已领任务再跑一遍对话。只补一轮：上游若两次都丢弃，继续等也没用。
+	if hasPendingTasks(results) {
+		time.Sleep(onboardRetryDelay)
+		if p.tryLockAccount(a.UID) {
+			retryResults := p.runAutoAll(a)
+			p.unlockAccount(a.UID)
+			claimed += countAutoDone(retryResults)
+		}
+		if res := p.sweepAccount(a, a.UID); res.claimed > 0 {
+			claimed += res.claimed
+		}
 	}
 
 	if rm, _, uerr := p.cfg.Upstream.UserResource(a); uerr == nil {

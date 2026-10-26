@@ -630,6 +630,25 @@ func (p *Panel) taskByCodeWaiting(a *auth.Auth, code string) (*upstream.Task, er
 	return t, nil
 }
 
+// taskProgressReached 判断任务是否真的达成：已领 / 可领，或 current 达标。
+//
+// target<=0 的任务（串行解锁占位、按行为而非次数计的任务）无法用进度判据，
+// 视为「不阻塞」——把它们判成未达成会让重试和 pending 状态误伤正常任务。
+// t==nil（回读失败）判未达成：调用方据此重试一次，而不是把一次查询失败
+// 直接当成「已上报成功」。
+func taskProgressReached(t *upstream.Task) bool {
+	if t == nil {
+		return false
+	}
+	if t.Claimed || t.Claimable {
+		return true
+	}
+	if t.Target <= 0 {
+		return true
+	}
+	return t.Current >= t.Target
+}
+
 // taskByCodeMP 以小程序口径拉取任务列表并定位单个任务；未找到返回 nil。
 // 小程序限定任务（school_season / Sequential_Tasks_1）在默认口径列表不出现。
 func (p *Panel) taskByCodeMP(a *auth.Auth, code string) (*upstream.Task, error) {
@@ -1637,15 +1656,29 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 			out = append(out, item)
 			continue
 		}
-		var after *upstream.Task
-		if isMPTaskCode(act.TaskCode) {
-			after, _ = p.taskByCodeMP(a, act.TaskCode)
-		} else {
-			after, _ = p.taskByCodeWaiting(a, act.TaskCode)
+		// 回读口径统一走一个闭包：mp 码必须 mp 列表，其余走带轮询的默认列表。
+		readAfter := func() *upstream.Task {
+			if isMPTaskCode(act.TaskCode) {
+				t, _ := p.taskByCodeMP(a, act.TaskCode)
+				return t
+			}
+			t, _ := p.taskByCodeWaiting(a, act.TaskCode)
+			return t
 		}
-		item["status"] = "done"
-		item["message"] = msg
+		after := readAfter()
 		item["progress_after"] = taskProgressText(after)
+		// 动作「执行成功」不等于任务「达成」。未达成不能标 done：onboard 的
+		// 完成数（countAutoDone）与前端完成统计都按 status=='done' 计数，
+		// 早先无条件标 done 会把 20 个动作报成 20 个完成，实际只到账 8 个。
+		// 补跑不在这里做——同轮立即重放同一动作仍会被上游丢弃（实测），
+		// 由 execOnboard 在第一轮结束后隔一段时间整轮重跑（见 onboardRetryDelay）。
+		if taskProgressReached(after) {
+			item["status"] = "done"
+			item["message"] = msg
+		} else {
+			item["status"] = "pending"
+			item["message"] = msg + "；动作已上报但上游进度未生效（进度 " + taskProgressText(after) + "）"
+		}
 		// 进度达标即自动领奖（mp 任务走 chat 域 mp 口径，其余 Web 端接口）。
 		// 领奖失败不掩盖主流程结果：status 仍为 done，附加 claim_error 供前端提示。
 		if after != nil && after.Claimable {
