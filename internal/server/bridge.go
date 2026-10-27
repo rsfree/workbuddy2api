@@ -132,13 +132,34 @@ func (b *bridgeWriter) drain() {
 	}
 }
 
-// handleFrame 处理一帧 chat SSE（只认 data: 行，注释/心跳忽略）。
+// handleFrame 处理一帧 chat SSE。
+//
+// 🔴 一个 SSE 事件块**可以包含多条行**：注释（`: heartbeat` 心跳）、`event:`、`id:`
+// 与 `data:` 都可能并存，且 data 行可以有多条（按规范用 \n 拼接）。因此必须遍历块内
+// 每一行去收集 data，而不能假设「整块以 data: 开头」。
+//
+// 这条曾经写错成 `if !strings.HasPrefix(frame, "data:") { return }`，后果很严重：
+// 上游在流首必发一条 `: heartbeat` 心跳，它和紧随其后的第一帧同属一个 \n\n 块，
+// 于是整块被丢弃——而第一帧恰好是**携带 tool_calls 的 name/id 的那一帧**。
+// 实测（2026-10-28，glm-5.3）：/v1/responses 流式 4/4 轮丢失全部工具调用
+// （output 为空但 output_tokens=12），非流式完全正常；/v1/chat/completions 因为
+// 字节原样透传、不经过本函数，所以看不出问题——这就是它长期没被发现的原因。
+//
+// 同一处还影响 /v1/messages：首个 content 分片会被静默吃掉（正文少开头几个字）。
 func (b *bridgeWriter) handleFrame(frame string) {
-	frame = strings.TrimSpace(frame)
-	if !strings.HasPrefix(frame, "data:") {
-		return
+	// 收集块内所有 data 行；注释/event/id/空行一律忽略（心跳不该影响数据）。
+	var payloads []string
+	for _, line := range strings.Split(frame, "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payloads = append(payloads, strings.TrimPrefix(line, "data:"))
 	}
-	payload := strings.TrimSpace(strings.TrimPrefix(frame, "data:"))
+	if len(payloads) == 0 {
+		return // 纯心跳/纯注释块
+	}
+	payload := strings.TrimSpace(strings.Join(payloads, "\n"))
 	if payload == "" || payload == "[DONE]" {
 		return // 收尾由 Close 统一发（翻译器需要 Finish 才能补完工具调用块）
 	}

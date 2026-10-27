@@ -542,3 +542,110 @@ func TestMarkupRepairDisabled(t *testing.T) {
 		}
 	}
 }
+
+// TestMarkupSuppressor tool_choice=none 用的抑制模式：识别标记块并吞掉，
+// 但绝不产出 tool_calls，也不把标记原文留给客户端。
+//
+// 为什么需要它：上游忽略 tool_choice 取值，兑现 none 只能靠剥掉 tools；而 tools
+// 消失后模型会把调用写成正文标记。两种错误处置都比它差——还原成 tool_calls 违背
+// 客户端明确指令；全禁用修复则把标记原文（`<｜｜DSML｜｜ calls>`）直接漏给客户端
+// （2026-10-28 实测两版都踩过）。
+func TestMarkupSuppressor(t *testing.T) {
+	allowed := map[string]bool{"get_weather": true}
+	block := mkBlock(mkInvoke("get_weather", mkParam("city", "北京")))
+
+	// 1) 流式：整块一次喂入 —— 吃掉，不出调用
+	r := NewMarkupSuppressor(allowed, true)
+	if !r.Enabled() {
+		t.Fatal("抑制模式必须 Enabled（否则 Feed 恒等透传，标记会漏出）")
+	}
+	out, calls := r.Feed("好的，我查一下。" + block)
+	if len(calls) != 0 {
+		t.Errorf("抑制模式不得产出 tool_calls，got %d", len(calls))
+	}
+	if strings.Contains(out, markupPipe) {
+		t.Errorf("标记原文不能漏给客户端: %q", out)
+	}
+	if !strings.Contains(out, "我查一下") {
+		t.Errorf("正常正文必须保留: %q", out)
+	}
+	if r.Suppressed() != 1 {
+		t.Errorf("Suppressed=%d want 1", r.Suppressed())
+	}
+	if r.Converted() != 0 {
+		t.Errorf("Converted 必须为 0（抑制不是修复）")
+	}
+	if got := r.Flush(); got != "" {
+		t.Errorf("Flush 应为空，got %q", got)
+	}
+
+	// 2) 分片喂入：标记被切成多片也要正确吞掉（流式的真实形态）
+	r2 := NewMarkupSuppressor(allowed, true)
+	var all strings.Builder
+	total := 0
+	for i := 0; i < len(block); i += 7 {
+		end := i + 7
+		if end > len(block) {
+			end = len(block)
+		}
+		o, cs := r2.Feed(block[i:end])
+		all.WriteString(o)
+		total += len(cs)
+	}
+	all.WriteString(r2.Flush())
+	if total != 0 {
+		t.Errorf("分片喂入也不得产出调用，got %d", total)
+	}
+	if strings.Contains(all.String(), markupPipe) {
+		t.Errorf("分片喂入后仍漏出标记: %q", all.String())
+	}
+
+	// 3) 普通文本（无标记）逐字节不变
+	r3 := NewMarkupSuppressor(allowed, true)
+	const plain = "今天天气不错，没有标记。"
+	o3, c3 := r3.Feed(plain)
+	o3 += r3.Flush()
+	if len(c3) != 0 || o3 != plain {
+		t.Errorf("无标记文本必须原样透出: %q calls=%d", o3, len(c3))
+	}
+}
+
+// TestSuppressAggregatedMarkup 非流式抑制：吞标记、不出 tool_calls、回写正文。
+func TestSuppressAggregatedMarkup(t *testing.T) {
+	allowed := map[string]bool{"get_weather": true}
+	block := mkBlock(mkInvoke("get_weather", mkParam("city", "北京")))
+
+	// 有标记：内容被清掉、不产生 tool_calls
+	resp := map[string]any{"choices": []any{map[string]any{
+		"message":       map[string]any{"content": "我来查。" + block},
+		"finish_reason": "stop",
+	}}}
+	r := SuppressAggregatedMarkup(resp, allowed, true)
+	msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if got, _ := msg["content"].(string); strings.Contains(got, markupPipe) {
+		t.Errorf("非流式抑制后仍含标记: %q", got)
+	}
+	if _, ok := msg["tool_calls"]; ok {
+		t.Error("抑制模式不得写入 tool_calls")
+	}
+	if r.Suppressed() != 1 {
+		t.Errorf("Suppressed=%d want 1", r.Suppressed())
+	}
+	if got, _ := msg["content"].(string); !strings.Contains(got, "我来查") {
+		t.Errorf("正常正文必须保留: %q", got)
+	}
+
+	// 已有结构化 tool_calls：抑制逻辑完全不碰
+	resp2 := map[string]any{"choices": []any{map[string]any{
+		"message": map[string]any{
+			"content":    "x" + block,
+			"tool_calls": []any{map[string]any{"id": "c"}},
+		},
+		"finish_reason": "tool_calls",
+	}}}
+	SuppressAggregatedMarkup(resp2, allowed, true)
+	msg2 := resp2["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if !strings.Contains(msg2["content"].(string), markupPipe) {
+		t.Error("已有真实调用时不该动正文")
+	}
+}

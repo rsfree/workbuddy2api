@@ -84,6 +84,19 @@ type chatStat struct {
 	// 与 promptTokens 一起换算成「前缀占 prompt 的比例」，用来判断亲和到底有多少
 	// 可省空间——比例很小的时候，亲和命中率再高也省不下钱（见 reqlog.CacheMetrics）。
 	prefixBytes int
+	// choiceNone 入站在声明 tool_choice=none（见 upstream.ToolChoiceNone）。
+	// 这类请求必然被剥离 tools，prefix_bytes 与 prompt 的背离是设计使然，
+	// 不该计入「前缀丢失」告警——否则每个纯文本会话都会刷一条 WARN。
+	choiceNone bool
+	// choiceRequired 入站在声明 tool_choice=required / any（见 upstream.ToolChoiceRequired）。
+	choiceRequired bool
+	// toolCalls 本回合实际产出的结构化 tool_calls 数（**含标记修复还原的**）。
+	// 与 choiceRequired 组合成「上游是否真解析 tool_choice」的探针。
+	toolCalls int
+	// toolsDeclared / toolHistory 入站工具上下文（见 upstream.InspectTools）。
+	// 两者 + toolCalls 构成「模型跳过工具」的三元判据，供用量桶长期统计。
+	toolsDeclared int
+	toolHistory   bool
 
 	logged bool
 }
@@ -131,7 +144,11 @@ type chatStatsReader struct {
 	cacheHit     int
 	cacheMiss    int
 	hasCacheMiss bool
-	pend         []byte // 已读未返回的行缓存
+	// toolCalls 本回合出现过的结构化 tool_calls 数量（只计数，不保留内容）。
+	// 与入站 tool_choice=required 一起构成「上游是否真解析了该字段」的探针：
+	// 要求必调却一个都没有，说明字段被忽略或模型未遵从，两种都值得告警。
+	toolCalls int
+	pend      []byte // 已读未返回的行缓存
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
@@ -144,6 +161,9 @@ func (s *chatStatsReader) TTFB() time.Duration { return s.ttfb }
 
 // Tokens 返回末帧 usage.completion_tokens 与是否缺失；无 usage 时 ok=false。
 func (s *chatStatsReader) Tokens() (int, bool) { return s.completionTokens, s.hasCompletionTokens }
+
+// ToolCalls 返回本回合观测到的结构化 tool_calls 数量。
+func (s *chatStatsReader) ToolCalls() int { return s.toolCalls }
 
 // Credit 返回末帧 usage.credit（本次真实扣费积分）与是否缺失。
 func (s *chatStatsReader) Credit() (float64, bool) { return s.credit, s.hasCredit }
@@ -179,6 +199,16 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	}
 	var chunk struct {
 		Error json.RawMessage `json:"error"`
+		// Choices 只为数 tool_calls：与 usage 共用这一次 Unmarshal，不额外解析。
+		// delta 覆盖流式分片，message 覆盖非标准的上游整条帧（两种形态都实测出现过）。
+		Choices []struct {
+			Delta struct {
+				ToolCalls []json.RawMessage `json:"tool_calls"`
+			} `json:"delta"`
+			Message struct {
+				ToolCalls []json.RawMessage `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
 		Usage *struct {
 			PromptTokens         *int     `json:"prompt_tokens"`
 			CompletionTokens     *int     `json:"completion_tokens"`
@@ -188,8 +218,16 @@ func (s *chatStatsReader) parseSSELine(line string) {
 			PromptCacheMissTok   *int     `json:"prompt_cache_miss_tokens"`
 		} `json:"usage"`
 	}
-	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
-		if json.Unmarshal([]byte(payload), &chunk) == nil && len(chunk.Error) > 0 {
+	if json.Unmarshal([]byte(payload), &chunk) != nil {
+		return
+	}
+	// tool_calls 必须在 usage 判空之前数：绝大多数 tool_call 帧不带 usage，
+	// 放到后面数会漏掉全部。
+	for _, c := range chunk.Choices {
+		s.toolCalls += len(c.Delta.ToolCalls) + len(c.Message.ToolCalls)
+	}
+	if chunk.Usage == nil {
+		if len(chunk.Error) > 0 {
 			s.errorFrame = true
 		}
 		return
@@ -511,7 +549,47 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		}
 	}
 	e.OK = status >= 200 && status < 300 && e.Outcome == reqlog.OutcomeSuccess
+	if fired, msg := prefixLostWarn.note(e.Model, e.PrefixBytes, e.PromptTokens,
+		t.stat != nil && t.stat.choiceNone); fired {
+		log.Printf("%s", msg)
+	}
+	if t.stat != nil {
+		if fired, msg := requiredIgnoredWarn.note(e.Model, t.stat.choiceRequired, t.stat.toolCalls); fired {
+			log.Printf("%s", msg)
+		}
+	}
 	return e
+}
+
+// responseToolCallCount 数一个非流式聚合响应里的结构化 tool_calls（各 choice 求和）。
+// 兼容 message 与 delta 两种摆放（上游聚合帧两种形态都出现过）。
+//
+// 🔴 两个切片类型都要认：`upstream.Aggregate` 用 `[]map[string]any` 装 tool_calls
+// （sse.go 里 `calls := make([]map[string]any, 0, ...)`），而从 JSON 反序列化来的
+// 响应是 `[]any`。只断言 []any 会让网关自己聚合的响应恒数到 0——实测（2026-10-28）
+// 表现为「客户端明明收到 1 个调用，跳过统计却记成 0 调用」，把正常轮次误判成跳过。
+func responseToolCallCount(resp map[string]any) int {
+	choices, _ := resp["choices"].([]any)
+	n := 0
+	for _, raw := range choices {
+		ch, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		for _, key := range []string{"message", "delta"} {
+			holder, ok := ch[key].(map[string]any)
+			if !ok {
+				continue
+			}
+			switch tcs := holder["tool_calls"].(type) {
+			case []any:
+				n += len(tcs)
+			case []map[string]any:
+				n += len(tcs)
+			}
+		}
+	}
+	return n
 }
 
 // responseObserver 捕获 handler 实际写出的 HTTP 状态，同时保留 Flusher/Unwrap，
@@ -694,4 +772,89 @@ func (c *cacheMissSignal) noteCacheTokens(model string, prompt, hit, miss int64)
 	}
 	c.last[model] = now
 	log.Printf("WARN: [server] cache miss: model=%s 本次大前缀未命中（prompt=%d miss=%d，此前观测到过命中）；上游前缀缓存重算，费用会显著升高", model, prompt, miss)
+}
+
+// requiredIgnoredSignal「要求必调工具却没调用」告警。
+//
+// 客户端声明 tool_choice=required（Anthropic 是 any）意味着本回合**必须**产出工具
+// 调用，下游拿到纯文本就只能报错或空转。2026-10-28 实测上游忽略该字段取值
+// （deepseek 3/3、kimi 2/2 轮都没调），网关对此无能为力——但它一旦开始生效、
+// 或者哪天变成硬报错，都需要第一时间知道。
+//
+// 这条 WARN 同时覆盖两种成因，无法区分也不必区分：上游不认字段，或模型没遵从。
+// 两者的处置都是「查客户端为什么依赖 required」。
+type requiredIgnoredSignal struct {
+	mu   sync.Mutex
+	last map[string]time.Time
+}
+
+var requiredIgnoredWarn = &requiredIgnoredSignal{last: map[string]time.Time{}}
+
+// requiredIgnoredEvery 每模型冷却；变量供测试缩短。
+var requiredIgnoredEvery = 10 * time.Minute
+
+// note 记录一次观测；required=false 或确有调用时静默。
+func (r *requiredIgnoredSignal) note(model string, required bool, toolCalls int) (bool, string) {
+	if !required || model == "" || toolCalls > 0 {
+		return false, ""
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	if t, ok := r.last[model]; ok && now.Sub(t) < requiredIgnoredEvery {
+		return false, ""
+	}
+	r.last[model] = now
+	return true, fmt.Sprintf("WARN: [server] tool_choice ignored: model=%s 客户端要求 tool_choice=required（本回合必须调工具），但响应里 0 个 tool_calls —— "+
+		"上游未实现该字段（实测 2026-10-28 双模型 confirmed）或模型未遵从；依赖 required 的客户端会拿到纯文本。改用「声明 tools + 让模型自主决定」，不要依赖 required", model)
+}
+
+// prefixLostSignal「可共享前缀没到上游」告警。
+//
+// 判据是**不可能成立的量级关系**：入站的可共享前缀（system 全文 + tools 名字/描述）
+// 是 prompt 的一部分，折算成 token 后不可能显著超过整个 prompt。一旦超过，说明这段
+// 前缀根本没被上游计入——要么网关剥离了（tool_choice=none 的纯文本优化，属预期），
+// 要么客户端以为发了但其实没发。
+//
+// 为什么值得单独立信号：这类请求的粘性/亲和命中都是**空转**——账号选对了，可那段
+// 前缀压根没进去，于是"命中率 0%"看上去像缓存故障。2026-10-28 就有一次单次
+// 115,640 字节（≈29k token）却只计 130 token 的实案，当时只能靠拉 1000 条日志
+// 反推。有了这条 WARN，同一个问题会在发生的那一秒就写在日志里。
+//
+// 阈值取 1.5 倍而不是 1 倍：bytes/4 对中文是**低估**（UTF-8 一个汉字 3 字节、约
+// 1 token，实际 1.5~2 字节/token），留出余量避免中文长前缀误报；而这条路要抓的
+// 背离通常在两个数量级以上。
+type prefixLostSignal struct {
+	mu   sync.Mutex
+	last map[string]time.Time
+}
+
+var prefixLostWarn = &prefixLostSignal{last: map[string]time.Time{}}
+
+// prefixLostWarnEvery 每模型冷却；变量供测试缩短。
+var prefixLostWarnEvery = 10 * time.Minute
+
+// note 记录一次观测；返回是否触发与告警文案（触发由调用方打日志，便于测试）。
+//
+// expectedStripped=true 表示客户端自己声明了 tool_choice=none，网关据此剥掉了
+// tools——前缀"没到上游"是设计使然，跳过（否则每个纯文本会话都刷一条）。
+func (p *prefixLostSignal) note(model string, prefixBytes int, prompt int64, expectedStripped bool) (bool, string) {
+	if expectedStripped || model == "" || prefixBytes <= 0 || prompt <= 0 {
+		return false, ""
+	}
+	// prefixTok 是前缀材料的保守 token 下界（bytes/4）。
+	prefixTok := int64(prefixBytes) / 4
+	if prefixTok*2 <= prompt*3 { // prefixTok <= prompt*1.5
+		return false, ""
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	if t, ok := p.last[model]; ok && now.Sub(t) < prefixLostWarnEvery {
+		return false, ""
+	}
+	p.last[model] = now
+	return true, fmt.Sprintf("WARN: [server] prefix lost: model=%s 入站可共享前缀 %d B（≈%d tok）但上游只计入 prompt=%d tok —— 该前缀没有到达上游，粘性/亲和命中的是空转。"+
+		"客户端未声明 tool_choice=none（否则属预期剥离、不会告警），请查这条链路上谁吞掉了 tools/system",
+		model, prefixBytes, prefixTok, prompt)
 }

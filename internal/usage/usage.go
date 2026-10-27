@@ -42,9 +42,10 @@ const (
 )
 
 // fileVersion 是 usage.json 的当前格式版本。版本 2 增加积分观测字段，版本 3
-// 增加模型生效倍率分区，版本 4 增加前缀缓存命中/未命中累计；
+// 增加模型生效倍率分区，版本 4 增加前缀缓存命中/未命中累计，版本 5 增加工具调用
+// 观测（声明数 / 被模型跳过数）；
 // 旧版本缺失字段按零值加载，旧数据不会丢弃。
-const fileVersion = 4
+const fileVersion = 5
 
 // bucket 一个 (时间片, realm, uid, model, rate) 的累计量。
 // JSON 字段名刻意取短，因为桶数量会随时间增长。
@@ -68,6 +69,11 @@ type bucket struct {
 	CRT   int64   `json:"ct,omitempty"` // 同时具备 credit 与 token 的 Token 合计
 	CH    int64   `json:"ch,omitempty"` // 前缀缓存命中 token 累计（上游回该维度才累计）
 	CM    int64   `json:"cm,omitempty"` // 前缀缓存未命中 token 累计
+	// TD / TS 工具调用观测：TD = 本次**显式声明了 tools** 的请求数（分母），
+	// TS = 其中「对话已建立工具使用模式、本轮却 0 次调用」的次数（分子）。
+	// 判据刻意严格（见 ToolSkipped 注释）：只抓"中途放弃"，不把首轮不调当异常。
+	TD int64 `json:"td,omitempty"`
+	TS int64 `json:"ts,omitempty"`
 }
 
 // file 落盘结构。
@@ -148,14 +154,19 @@ type Delta struct {
 	Credit           float64
 	HasCredit        bool
 	ModelRate        string
+	// ToolsDeclared / ToolSkipped 工具调用观测（见 bucket.TD/TS）。
+	// 只在本次真的声明了 tools 时才置 HasTools，否则不参与分母。
+	HasTools      bool
+	ToolsDeclared int64
+	ToolSkipped   bool
 	// CacheHitTokens / CacheMissTokens 前缀缓存命中/未命中观测（issue #92）。
-	HasCacheTokens   bool
-	CacheHitTokens   int64
-	CacheMissTokens  int64
-	LatencyMs        int64
-	HasLatency       bool
-	TokensPerSecond  float64
-	HasTPS           bool
+	HasCacheTokens  bool
+	CacheHitTokens  int64
+	CacheMissTokens int64
+	LatencyMs       int64
+	HasLatency      bool
+	TokensPerSecond float64
+	HasTPS          bool
 }
 
 // Add 记录一次请求尝试。
@@ -213,6 +224,12 @@ func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool
 	if d.HasCacheTokens {
 		b.CH += d.CacheHitTokens
 		b.CM += d.CacheMissTokens
+	}
+	if d.HasTools && d.ToolsDeclared > 0 {
+		b.TD++
+		if d.ToolSkipped {
+			b.TS++
+		}
 	}
 	if d.HasLatency {
 		b.LatMs += d.LatencyMs
@@ -275,6 +292,8 @@ func (r *Recorder) Rollup(now time.Time) {
 			dst.CRT += src.CRT
 			dst.CH += src.CH
 			dst.CM += src.CM
+			dst.TD += src.TD
+			dst.TS += src.TS
 		}
 		delete(r.buckets, m.from)
 	}
@@ -360,8 +379,14 @@ type Agg struct {
 	CacheHitTokens     int64   `json:"cache_hit_tokens,omitempty"`
 	CacheMissTokens    int64   `json:"cache_miss_tokens,omitempty"`
 	CacheHitRate       float64 `json:"cache_hit_rate,omitempty"`
-	AvgLatencyMs       float64 `json:"avg_latency_ms"`
-	AvgTPS             float64 `json:"avg_tokens_per_second"`
+	// ToolRequests 声明了 tools 的请求数（跳过率的分母）；ToolSkipped 是其中
+	// 「对话已建立工具模式、本轮却 0 次调用」的次数。分母为 0 时不输出比率
+	// （omitempty 会让 0% 也消失——那种情况本来就该显示 "—" 而不是 0%）。
+	ToolRequests int64   `json:"tool_requests,omitempty"`
+	ToolSkipped  int64   `json:"tool_skipped,omitempty"`
+	ToolSkipRate float64 `json:"tool_skip_rate,omitempty"`
+	AvgLatencyMs float64 `json:"avg_latency_ms"`
+	AvgTPS       float64 `json:"avg_tokens_per_second"`
 }
 
 // aggAcc 是聚合过程中的累加器：Agg 只放已算好的结果，均值需要样本数才能
@@ -385,6 +410,8 @@ func (g *aggAcc) add(b *bucket) {
 	g.CreditTokens += b.CRT
 	g.CacheHitTokens += b.CH
 	g.CacheMissTokens += b.CM
+	g.ToolRequests += b.TD
+	g.ToolSkipped += b.TS
 	g.latSum += b.LatMs
 	g.latSamples += b.LatN
 	g.tpsSum += b.TPS
@@ -404,6 +431,9 @@ func (g *aggAcc) finish() Agg {
 	}
 	if total := g.CacheHitTokens + g.CacheMissTokens; total > 0 {
 		a.CacheHitRate = float64(g.CacheHitTokens) / float64(total) * 100
+	}
+	if g.ToolRequests > 0 {
+		a.ToolSkipRate = float64(g.ToolSkipped) / float64(g.ToolRequests) * 100
 	}
 	return a
 }

@@ -2,6 +2,7 @@ package panel
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -1519,5 +1520,254 @@ process.stdout.write(JSON.stringify({
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("mobile chart tooltip structure=%s\nwant %s（groups 应等于数据点数，loose 应为 0）",
 			strings.TrimSpace(string(out)), want)
+	}
+}
+
+// TestAppJSCacheCell 缓存命中单元格的口径与「结构性不可命中」提示。
+//
+// 为什么钉住：命中率有两种算法——按请求条数、按 token —— 在短请求密集的模型上能差
+// 出 70 个百分点（实测 kimi-k3.1-pro：条数口径 19%、token 口径 91.5%）。面板只认
+// token 口径；同时当平均 prompt 不足一个缓存块（128 tok）时必须把"物理不可命中"
+// 说出来，否则一排 0% 会被当成缓存故障去查路由。
+func TestAppJSCacheCell(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; cache cell test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const a = src.indexOf('/* cacheRateClass');
+const b = src.indexOf('function fmtBytes');
+if (a < 0 || b < 0) throw new Error('cache helpers not found');
+const ctx = {
+  fmtTok: v => String(v == null ? 0 : v),
+  esc: s => String(s == null ? '' : s),
+  trimFixed: s => String(s),
+  Number, String, Math,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(a, b) + '\nthis.cacheCell = cacheCell; this.cacheRateClass = cacheRateClass;', ctx);
+// vm 里 this.x= 挂在 context 对象上，模块作用域取不到裸名字，必须经 ctx 转一道。
+const cacheCell = ctx.cacheCell, cacheRateClass = ctx.cacheRateClass;
+
+const tip = a => (String(cacheCell(a)).match(/title="([^"]*)"/) || [])[1] || '';
+const out = {
+  // 大 prompt：只报数量，不该出现"不可命中"的解释
+  big: tip({ cache_hit_tokens: 9000, cache_miss_tokens: 1000, prompt_tokens: 10000, requests: 5 }),
+  // 平均 prompt 60 < 128：必须给出结构性解释
+  short: tip({ cache_hit_tokens: 0, cache_miss_tokens: 6000, prompt_tokens: 6000, requests: 100 }),
+  // 无缓存观测：渲染成占位符，不该造出一个 0%
+  none: String(cacheCell({ prompt_tokens: 1000, requests: 3 })),
+  // 语义色阈值：90 绿 / 80-90 黄 / <80 红 / 无样本灰
+  cls: [cacheRateClass(95, 5), cacheRateClass(85, 15), cacheRateClass(50, 50), cacheRateClass(0, 0)],
+  // 命中率必须按 token 加权，不是按条数
+  tokensNotRequests: String(cacheCell({
+    cache_hit_tokens: 1, cache_miss_tokens: 0, prompt_tokens: 1, requests: 100000,
+  })),
+};` + `
+process.stdout.write(JSON.stringify(out));`
+
+	f, err := os.CreateTemp(t.TempDir(), "cachecell-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	raw, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("cache cell node test failed: %v\n%s", err, raw)
+	}
+	var got struct {
+		Big    string   `json:"big"`
+		Short  string   `json:"short"`
+		None   string   `json:"none"`
+		Cls    []string `json:"cls"`
+		Tokens string   `json:"tokensNotRequests"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("解析输出失败: %v\n%s", err, raw)
+	}
+
+	if strings.Contains(got.Big, "不可命中") {
+		t.Errorf("大 prompt 不该提示结构性不可命中: %s", got.Big)
+	}
+	if !strings.Contains(got.Big, "命中 9000") || !strings.Contains(got.Big, "未命中 1000") {
+		t.Errorf("大 prompt 的绝对值提示不对: %s", got.Big)
+	}
+	if !strings.Contains(got.Short, "平均 prompt 仅 60 tok") {
+		t.Errorf("短请求必须提示平均 prompt 过小: %s", got.Short)
+	}
+	if !strings.Contains(got.None, "muted") {
+		t.Errorf("无缓存观测应渲染为占位符: %s", got.None)
+	}
+	wantCls := []string{"c-ok", "c-warn", "c-bad", "c-mute"}
+	for i, w := range wantCls {
+		if i < len(got.Cls) && got.Cls[i] != w {
+			t.Errorf("语义色档[%d]=%s want %s（阈值必须与表内一致）", i, got.Cls[i], w)
+		}
+	}
+	// 1 命中 / 0 未命中 → 100%，与 requests=100000 无关（按条数会算出 0.001%）
+	if !strings.Contains(got.Tokens, "100.0%") && !strings.Contains(got.Tokens, "100%") {
+		t.Errorf("命中率必须按 token 加权，与请求条数无关: %s", got.Tokens)
+	}
+}
+
+// TestUsageDimColumnsMatchSpan 表头列数必须等于 US_DIMS 里声明的空态 colspan。
+//
+// 为什么：明细表加了「缓存命中」列之后，span 少加 1 会让空态行的 colspan 撑不满，
+// 表头和数据行错位——而这种错位在"有数据"时完全看不出来，只有该维度恰好无数据
+// （比如新建实例还没跑过 global 域）才暴露，属于最容易漏到线上的那类。
+func TestUsageDimColumnsMatchSpan(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; usage dim test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const a = src.indexOf('const US_DIMS');
+const b = src.indexOf('function usSortRows');
+if (a < 0 || b < 0) throw new Error('US_DIMS not found');
+// cacheCell 所在的片段也要进来：usRow 会调用它
+const ca = src.indexOf('/* cacheRateClass');
+const cb = src.indexOf('function fmtBytes');
+const ctx = {
+  esc: s => String(s == null ? '' : s),
+  fmtTok: v => String(v == null ? 0 : v),
+  trimFixed: s => String(s),
+  fmtMs: v => String(v),
+  fmtRate: v => String(v),
+  Number, String, Math, Object,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(a, b) + '\nthis.US_DIMS = US_DIMS;', ctx);
+vm.runInContext(src.slice(ca, cb) + '\nthis.cacheCell = cacheCell;', ctx);
+// usRow / usMixBar / usDimHead 需要单独取（usMixBar 在 usRow 上方）
+const ra = src.indexOf('function usMixBar');
+const rb = src.indexOf('function usPct');
+const ha = src.indexOf('function usDimHead');
+const hb = src.indexOf('function usTabsHtml');
+vm.runInContext(src.slice(ra, rb) + '\nthis.usMixBar = usMixBar;', ctx);
+vm.runInContext(src.slice(ha, hb) + '\nthis.usDimHead = usDimHead;', ctx);
+const usRowStart = src.indexOf('function usRow');
+const usRowEnd = src.indexOf('/* ── 用量明细');
+vm.runInContext(src.slice(usRowStart, usRowEnd) + '\nthis.usRow = usRow;', ctx);
+
+const out = {};
+for (const dim of Object.keys(ctx.US_DIMS)) {
+  const span = ctx.US_DIMS[dim].span;
+  const head = ctx.usDimHead(dim);
+  const th = (head.match(/<th/g) || []).length;
+  const row = ctx.usRow('k', '', { requests: 1, prompt_tokens: 10, total_tokens: 20 },
+    ctx.US_DIMS[dim].withRealm ? '<td class="num">cn</td>' : '',
+    ctx.US_DIMS[dim].withPerf, '');
+  const td = (row.match(/<td/g) || []).length;
+  out[dim] = { span, th, td };
+}
+process.stdout.write(JSON.stringify(out));`
+
+	f, err := os.CreateTemp(t.TempDir(), "usagedim-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	raw, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("usage dim node test failed: %v\n%s", err, raw)
+	}
+	var got map[string]struct {
+		Span int `json:"span"`
+		Th   int `json:"th"`
+		Td   int `json:"td"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("解析输出失败: %v\n%s", err, raw)
+	}
+	if len(got) != 3 {
+		t.Fatalf("应覆盖 account/model/realm 三个维度，实得 %d", len(got))
+	}
+	for dim, v := range got {
+		if v.Th != v.Span {
+			t.Errorf("%s: 表头 %d 列 != span %d（空态 colspan 会撑不满）", dim, v.Th, v.Span)
+		}
+		if v.Td != v.Span {
+			t.Errorf("%s: 数据行 %d 格 != span %d（表头与数据行错位）", dim, v.Td, v.Span)
+		}
+	}
+}
+
+// TestAppJSToolSkipCell 「工具跳过」单元格的口径与语义色。
+//
+// 这是判断"某模型值不值得用"的依据，口径错会直接误导决策：
+//
+//	· 分母必须是"声明了 tools 的请求"，指标不能算成"全部请求"
+//	· 分母为 0 必须显示 —（0% 会被读成"从不跳过"，是反向误导）
+//	· 这里越低越好，颜色方向与缓存命中率相反
+func TestAppJSToolSkipCell(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const a = src.indexOf('/* toolSkipCell');
+const b = src.indexOf('function fmtBytes');
+if (a < 0 || b < 0) throw new Error('toolSkipCell not found');
+const ctx = { esc: s => String(s == null ? '' : s), trimFixed: s => String(s), Number, String, Math };
+vm.createContext(ctx);
+vm.runInContext(src.slice(a, b) + '\nthis.toolSkipCell = toolSkipCell;', ctx);
+const cell = ctx.toolSkipCell;
+const out = {
+  noTools: String(cell({ requests: 100, prompt_tokens: 1e6 })),
+  perfect: String(cell({ tool_requests: 50, tool_skipped: 0 })),
+  warn: String(cell({ tool_requests: 50, tool_skipped: 2 })),     // 4% → 黄
+  bad: String(cell({ tool_requests: 50, tool_skipped: 10 })),      // 20% → 红
+  tip: (String(cell({ tool_requests: 50, tool_skipped: 1 })).match(/title="([^"]*)"/) || [])[1] || '',
+};` + `
+process.stdout.write(JSON.stringify(out));`
+
+	f, err := os.CreateTemp(t.TempDir(), "toolskip-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	raw, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("toolskip node test failed: %v\n%s", err, raw)
+	}
+	var got struct {
+		NoTools string `json:"noTools"`
+		Perfect string `json:"perfect"`
+		Warn    string `json:"warn"`
+		Bad     string `json:"bad"`
+		Tip     string `json:"tip"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("解析输出失败: %v\n%s", err, raw)
+	}
+	if !strings.Contains(got.NoTools, "muted") {
+		t.Errorf("无 tools 请求应显示占位符（不能是 0%%）: %s", got.NoTools)
+	}
+	if !strings.Contains(got.Perfect, "var(--ok)") || !strings.Contains(got.Perfect, "0/50") {
+		t.Errorf("零跳过应为绿色且带 0/50 计数: %s", got.Perfect)
+	}
+	if !strings.Contains(got.Warn, "var(--warn)") {
+		t.Errorf("4%% 跳过应为黄色: %s", got.Warn)
+	}
+	if !strings.Contains(got.Bad, "var(--bad)") {
+		t.Errorf("20%% 跳过应为红色: %s", got.Bad)
+	}
+	if !strings.Contains(got.Tip, "声明 tools 的请求 50 次") {
+		t.Errorf("提示应说明分母口径: %s", got.Tip)
 	}
 }

@@ -54,6 +54,78 @@ func TestPrepareBodyToolChoiceNone(t *testing.T) {
 	}
 }
 
+// TestPrepareBodyToolChoiceNoneAlwaysStripsTools tool_choice=none 必须**无条件**
+// 剥离 tools/functions，哪怕对话历史里已经出现过工具调用。
+//
+// 这个断言方向看起来反直觉（"模型不是需要 schema 才能读懂历史吗"），但它是被
+// 真实请求打出来的结论（2026-10-28，隔离实例单账号，deepseek-v4.1-flash 与
+// kimi-k3.1-pro 交叉验证）：
+//
+//  1. tool_choice="required" 问「1+1 等于几」，3/3 轮都没调工具。该字段若生效，
+//     模型必须强制调用 ⇒ 上游根本不解析 tool_choice 的语义。
+//  2. 同一"上一轮调过该工具"的对话发 none：
+//     剥离 tools → 调工具 4/4，prompt 120
+//     保留 tools → 调工具 4/4，prompt 355
+//     行为完全一致，后者每轮白花 235 token。
+//  3. 剥离后模型仍凭历史正确产出了 {"city":"北京"} ⇒ 它不依赖 tools 声明来理解
+//     tool_calls / role=tool 历史。
+//
+// 所以：字段无效的前提下，剥离 tools 是唯一能实现 none 语义的手段，同时把整段
+// schema 移出计费（实案单次 115,640 B ≈ 29k token）。任何"有工具历史就保留
+// tools"的改动都会退化成纯浪费，这条测试就是拦它的。
+func TestPrepareBodyToolChoiceNoneAlwaysStripsTools(t *testing.T) {
+	tools := `[{"type":"function","function":{"name":"read_file","parameters":{"type":"object"}}}]`
+	cases := []struct{ name, body string }{
+		{"字符串 none · 纯文本",
+			`{"messages":[{"role":"user","content":"你好"}],"tool_choice":"none","tools":` + tools + `,"functions":` + tools + `}`},
+		{"对象 none · 纯文本",
+			`{"messages":[{"role":"user","content":"你好"}],"tool_choice":{"type":"none"},"tools":` + tools + `}`},
+		{"字符串 none · 有 tool_calls 历史",
+			`{"messages":[{"role":"user","content":"读a"},{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"read_file","arguments":"{}"}}]},{"role":"tool","tool_call_id":"c1","content":"hi"}],"tool_choice":"none","tools":` + tools + `}`},
+		{"对象 none · 有 role=tool 历史",
+			`{"messages":[{"role":"user","content":"读a"},{"role":"tool","tool_call_id":"c1","content":"hi"}],"tool_choice":{"type":"none"},"tools":` + tools + `}`},
+	}
+	for _, c := range cases {
+		out := PrepareBodyOpt([]byte(c.body), true)
+		var m map[string]any
+		if err := json.Unmarshal(out, &m); err != nil {
+			t.Fatalf("%s: 出站 body 不是合法 JSON: %v", c.name, err)
+		}
+		if _, ok := m["tools"]; ok {
+			t.Errorf("%s: none 必须剥离 tools（上游忽略该字段，剥离是唯一手段；保留纯属浪费 token）", c.name)
+		}
+		if _, ok := m["functions"]; ok {
+			t.Errorf("%s: none 必须剥离 functions", c.name)
+		}
+		if _, ok := m["tool_choice"]; ok {
+			t.Errorf("%s: none 必须删 tool_choice 字段", c.name)
+		}
+	}
+}
+
+// TestPrepareBodyToolChoiceNonNoneKeepsTools 非 none 的档位一律保留 tools：
+// 既然上游忽略取值，auto/required/指定函数 都只能靠"工具可见"来工作，
+// 剥掉会让这些客户端直接丧失工具能力。
+func TestPrepareBodyToolChoiceNonNoneKeepsTools(t *testing.T) {
+	tools := `[{"type":"function","function":{"name":"read_file"}}]`
+	for _, tc := range []string{
+		`"auto"`,
+		`"required"`,
+		`{"type":"auto"}`,
+		`{"type":"function","function":{"name":"read_file"}}`,
+	} {
+		body := `{"messages":[{"role":"user","content":"读a"}],"tool_choice":` + tc + `,"tools":` + tools + `}`
+		out := PrepareBodyOpt([]byte(body), true)
+		var m map[string]any
+		if err := json.Unmarshal(out, &m); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := m["tools"]; !ok {
+			t.Errorf("tool_choice=%s 必须保留 tools（上游忽略取值，工具可见是唯一工作途径）", tc)
+		}
+	}
+}
+
 func TestPrepareBodyToolChoiceAuto(t *testing.T) {
 	out := PrepareBodyOpt([]byte(`{"tool_choice":{"type":"auto"}}`), true)
 	var m map[string]any
@@ -1250,5 +1322,102 @@ func TestStreamWithoutMarkupRepairIsUnchanged(t *testing.T) {
 	}
 	if base.Body.String() != disabled.Body.String() {
 		t.Fatalf("未声明 tools 时输出被改动\nbase=%s\ngot =%s", base.Body.String(), disabled.Body.String())
+	}
+}
+
+// TestToolChoiceNone 入站 none 检测必须同时认 OpenAI 与 Anthropic 两种形态：
+// 这个函数是"预期剥离"与"异常前缀丢失"的唯一分界，判错会造成告警噪音
+// （把设计使然当故障）或漏报（真异常被静默）。body 不可解析时返回 false ——
+// 宁可多报也不掩盖。
+func TestToolChoiceNone(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"OpenAI 字符串 none", `{"tool_choice":"none"}`, true},
+		{"OpenAI 字符串大写 None", `{"tool_choice":" None "}`, true},
+		{"OpenAI 对象 none", `{"tool_choice":{"type":"none"}}`, true},
+		{"Anthropic 对象 none", `{"tool_choice":{"type":"none","disable_parallel_tool_use":true}}`, true},
+		{"OpenAI auto", `{"tool_choice":"auto"}`, false},
+		{"OpenAI 对象 auto", `{"tool_choice":{"type":"auto"}}`, false},
+		{"Anthropic any", `{"tool_choice":{"type":"any"}}`, false},
+		{"指定函数", `{"tool_choice":{"type":"function","function":{"name":"f"}}}`, false},
+		{"无该字段", `{"messages":[{"role":"user","content":"hi"}]}`, false},
+		{"空 body", ``, false},
+		{"坏 JSON", `{broken`, false},
+	}
+	for _, c := range cases {
+		if got := ToolChoiceNone([]byte(c.body)); got != c.want {
+			t.Errorf("%s: ToolChoiceNone=%v want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestToolChoiceRequired required/any 检测：覆盖 OpenAI 与 Anthropic 两种写法。
+// bridge 把 Anthropic 的 "any" 映射成 required，所以两者必须等价识别。
+func TestToolChoiceRequired(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"OpenAI 字符串 required", `{"tool_choice":"required"}`, true},
+		{"大小写与空白", `{"tool_choice":" Required "}`, true},
+		{"OpenAI 对象 required", `{"tool_choice":{"type":"required"}}`, true},
+		{"Anthropic any", `{"tool_choice":{"type":"any"}}`, true},
+		{"none", `{"tool_choice":"none"}`, false},
+		{"auto", `{"tool_choice":"auto"}`, false},
+		{"指定函数", `{"tool_choice":{"type":"function","function":{"name":"f"}}}`, false},
+		{"无字段", `{"messages":[]}`, false},
+		{"空 body", ``, false},
+		{"坏 JSON", `{`, false},
+	}
+	for _, c := range cases {
+		if got := ToolChoiceRequired([]byte(c.body)); got != c.want {
+			t.Errorf("%s: got %v want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestInspectTools 工具上下文解析：本次声明数与历史痕迹必须严格分开。
+//
+// 这两个值直接决定「模型跳过工具」比率的分母和分子，判错会得到完全错误的结论：
+//
+//	· Declared 混入历史里的工具名 → "本次没给工具"被算成"给了但没调"，假跳过
+//	· History 漏判 role=tool      → 真正的"中途放弃"被当成首轮，漏报
+func TestInspectTools(t *testing.T) {
+	cases := []struct {
+		name     string
+		body     string
+		declared int
+		history  bool
+	}{
+		{"OpenAI 声明 2 个", `{"tools":[{"type":"function","function":{"name":"a"}},{"type":"function","function":{"name":"b"}}]}`, 2, false},
+		{"Responses 扁平形态", `{"tools":[{"type":"function","name":"a","parameters":{}}]}`, 1, false},
+		{"Anthropic 扁平形态（bridge 前）", `{"tools":[{"name":"a","input_schema":{}}]}`, 1, false},
+		{"旧版 functions", `{"functions":[{"name":"a"},{"name":"b"}]}`, 2, false},
+		{"内置工具不算函数", `{"tools":[{"type":"web_search"}]}`, 0, false},
+		{"历史 tool_calls", `{"messages":[{"role":"assistant","tool_calls":[{"id":"c1"}]}]}`, 0, true},
+		{"历史 role=tool", `{"messages":[{"role":"tool","content":"x"}]}`, 0, true},
+		{"历史旧版 function_call", `{"messages":[{"role":"assistant","function_call":{"name":"a"}}]}`, 0, true},
+		{"历史 role=function", `{"messages":[{"role":"function","content":"x"}]}`, 0, true},
+		{"纯文本", `{"messages":[{"role":"user","content":"hi"}]}`, 0, false},
+		{"空 body", ``, 0, false},
+		{"坏 JSON", `{`, 0, false},
+	}
+	for _, c := range cases {
+		got := InspectTools([]byte(c.body))
+		if got.Declared != c.declared || got.History != c.history {
+			t.Errorf("%s: declared=%d history=%v want %d/%v",
+				c.name, got.Declared, got.History, c.declared, c.history)
+		}
+	}
+
+	// 关键组合：声明了工具 + 历史用过 → 两者都要报出来（这才是跳过判据的输入）
+	both := InspectTools([]byte(`{"tools":[{"type":"function","function":{"name":"a"}}],
+		"messages":[{"role":"tool","content":"r"}]}`))
+	if both.Declared != 1 || !both.History {
+		t.Errorf("声明+历史组合解析错: %+v", both)
 	}
 }

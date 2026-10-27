@@ -379,13 +379,33 @@ func ensureConsoleSystem(body []byte) []byte {
 }
 
 // normalizeToolChoice 按上游 Go struct（string 类型）改写 OpenAI tool_choice。
-//   - "none"            → 删 tool_choice + 删 tools/functions
+//   - "none"            → 删 tool_choice + 删 tools/functions（唯一能真正禁止调用的手段）
 //   - {"type":"none"}   → 同上
 //   - {"type":"auto"/"required"} → 字符串 "auto"/"required"
 //   - {"type":"function","function":{"name":"x"}} → 字符串 "x"
 //   - 其他对象/非标量 → 删 tool_choice
 func normalizeToolChoice(obj map[string]any) {
-	suppress := func() {
+	// suppressChoice 处理 tool_choice=none：删字段 + 删整个 tools/functions 子树。
+	//
+	// 🔴 为什么必须删 tools 而不只是发 "none"——2026-10-28 真实请求实测（隔离实例，
+	// 单账号，deepseek-v4.1-flash 与 kimi-k3.1-pro 双模型交叉验证）：
+	//   · tool_choice="required" 问「1+1 等于几」，3/3 轮都没调工具 —— 若该字段生效，
+	//     模型必须强制调用；它没有 ⇒ **上游忽略 tool_choice 的语义**
+	//   · 同一对话（上一轮调过该工具）发 "none"：
+	//       剥离 tools → 调工具 4/4，prompt 120
+	//       保留 tools → 调工具 4/4，prompt 355
+	//     两者行为完全相同、后者每轮多花 235 token ⇒ 保留 schema 的收益是零，
+	//     而剔除整段 schema 是纯赚（实案单次 115,640 B ≈ 29k token）。
+	//   · 剥离后模型仍能凭历史里的那一次调用正确产出 {"city":"北京"} —— 说明它不
+	//     依赖 tools 声明来理解 tool_calls/role=tool 历史（早先"剥离会让模型看不懂
+	//     历史"的推断不成立，别再按那个思路改回去）。
+	//
+	// 于是：剥离 tools 是**唯一**能实现 none 语义的手段（字段本身无效），顺带把
+	// 整段 schema 从计费里省掉。代价是"上游是否真不调"只能靠工具不可见来保证，
+	// 历史里出现过的工具仍有被复用的可能——这是上游不认该字段的必然结果，不是
+	// 网关能修的。
+	suppressChoice := func() {
+		delete(obj, "tool_choice")
 		delete(obj, "tools")
 		delete(obj, "functions")
 	}
@@ -396,16 +416,14 @@ func normalizeToolChoice(obj map[string]any) {
 	switch v := tc.(type) {
 	case string:
 		if strings.EqualFold(strings.TrimSpace(v), "none") {
-			delete(obj, "tool_choice")
-			suppress()
+			suppressChoice()
 		}
 	case map[string]any:
 		typ, _ := v["type"].(string)
 		typ = strings.ToLower(strings.TrimSpace(typ))
 		switch typ {
 		case "none":
-			delete(obj, "tool_choice")
-			suppress()
+			suppressChoice()
 		case "auto", "required":
 			obj["tool_choice"] = typ
 		case "function":
@@ -427,6 +445,132 @@ func normalizeToolChoice(obj map[string]any) {
 	default:
 		delete(obj, "tool_choice")
 	}
+}
+
+// ToolChoiceNone 报告入站 body 是否声明了 tool_choice=none。
+//
+// 供可观测侧区分「预期剥离」与「异常丢失」：声明 none 的请求会被
+// normalizeToolChoice 剥掉整个 tools 子树，于是入站 prefix_bytes 与上游 prompt
+// 必然严重背离——这是设计使然，不该触发前缀丢失告警。两种入站协议都要认：
+//   - OpenAI chat：`"tool_choice":"none"` 或 `{"type":"none"}`
+//   - Anthropic messages（bridge 转 chat 后同样是 none）：
+//     `"tool_choice":{"type":"none"}`
+//
+// body 不可解析时返回 false（宁可多报，不漏报）。
+func ToolChoiceNone(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return false
+	}
+	switch v := obj["tool_choice"].(type) {
+	case string:
+		return strings.EqualFold(strings.TrimSpace(v), "none")
+	case map[string]any:
+		typ, _ := v["type"].(string)
+		return strings.EqualFold(strings.TrimSpace(typ), "none")
+	}
+	return false
+}
+
+// ToolChoiceRequired 报告入站 body 是否声明了「本回合必须调工具」。
+//
+// 用于观测「上游是否真的解析了 tool_choice」——2026-10-28 实测发现上游忽略该字段
+// 的取值（required 也照样可能不调），但那是当时的实现，可能变化。这条探针让假设
+// 的失效点自己暴露：客户端要求 required 却整回合没有任何 tool_calls 时打 WARN。
+//
+// 三种写法都算 required，与 bridge/anthropic.go 的映射对齐：
+//   - OpenAI 字符串 "required"
+//   - OpenAI 对象 {"type":"required"}
+//   - Anthropic 对象 {"type":"any"}（bridge 会转成 required）
+func ToolChoiceRequired(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return false
+	}
+	switch v := obj["tool_choice"].(type) {
+	case string:
+		return strings.EqualFold(strings.TrimSpace(v), "required")
+	case map[string]any:
+		typ, _ := v["type"].(string)
+		typ = strings.ToLower(strings.TrimSpace(typ))
+		return typ == "required" || typ == "any"
+	}
+	return false
+}
+
+// ToolContext 描述一个入站请求的工具使用上下文，供「模型是否跳过工具」的观测使用。
+type ToolContext struct {
+	// Declared 本次 body 里显式声明的 tools 数量（0 = 客户端没给工具）。
+	// 只数本次声明的，**不含**历史里出现过的名字——两者必须分开，否则
+	// 「本次没给工具」会被历史污染成「给了工具」。
+	Declared int
+	// History 历史消息里已出现过工具使用痕迹（assistant.tool_calls / role=tool /
+	// 旧版 role=function + function_call）。用来区分两类"没调用"：
+	//   History=false → 首轮，模型判断不需要工具，正常
+	//   History=true  → 对话已建立工具模式却中途放弃，可疑
+	History bool
+}
+
+// InspectTools 解析入站 body 的工具上下文。body 不可解析时返回零值
+// （Declared=0 即不参与分母，宁可漏统计也不制造假分母）。
+func InspectTools(body []byte) ToolContext {
+	var out ToolContext
+	if len(body) == 0 {
+		return out
+	}
+	var req struct {
+		Tools []struct {
+			Type     string `json:"type"`
+			Name     string `json:"name"`
+			Function *struct {
+				Name string `json:"name"`
+			} `json:"function"`
+		} `json:"tools"`
+		Functions []struct {
+			Name string `json:"name"`
+		} `json:"functions"`
+		Messages []struct {
+			Role      string `json:"role"`
+			ToolCalls []struct {
+				ID string `json:"id"`
+			} `json:"tool_calls"`
+			FunctionCall *struct {
+				Name string `json:"name"`
+			} `json:"function_call"`
+		} `json:"messages"`
+	}
+	if json.Unmarshal(body, &req) != nil {
+		return out
+	}
+	// 只数「函数型」工具：Responses 的 web_search 之类内置工具没有函数体，
+	// 计入分母会把"本来就不该调函数"的请求算成跳过。
+	for _, t := range req.Tools {
+		if t.Function != nil && t.Function.Name != "" {
+			out.Declared++
+			continue
+		}
+		if t.Name != "" && (t.Type == "" || t.Type == "function") {
+			out.Declared++
+		}
+	}
+	out.Declared += len(req.Functions) // 旧版 functions 协议
+	for _, m := range req.Messages {
+		if m.Role == "tool" || m.Role == "function" {
+			out.History = true
+			break
+		}
+		if len(m.ToolCalls) > 0 || m.FunctionCall != nil {
+			out.History = true
+			break
+		}
+	}
+	return out
 }
 
 // normalizeToolPatterns 归一化 tools 子树里 pattern 的非标准转义 `\_`（→ `_`）。

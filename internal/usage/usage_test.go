@@ -353,3 +353,66 @@ func TestCacheTokensPersistRoundtrip(t *testing.T) {
 		t.Fatalf("恢复后 cache_hit_rate=%v want 75", snap.CreditByModel[0].CacheHitRate)
 	}
 }
+
+// TestToolSkipAccumulation 工具跳过率的累计与折叠：分母是"声明了 tools 的请求"，
+// 分子是其中"历史用过工具却本轮 0 调用"。没声明 tools 的请求不得进分母。
+func TestToolSkipAccumulation(t *testing.T) {
+	dir := t.TempDir()
+	r := New(dir + "/usage.json")
+	base := time.Date(2026, 10, 1, 10, 0, 0, 0, time.Local)
+
+	add := func(min int, declared int64, skipped bool) {
+		r.Add(base.Add(time.Duration(min)*time.Minute), "cn", "u1", "m", Delta{
+			HasTools:      declared > 0,
+			ToolsDeclared: declared,
+			ToolSkipped:   skipped,
+			TotalTokens:   10, HasTotal: true,
+		}, true)
+	}
+	add(0, 2, false) // 声明了，正常调用
+	add(1, 2, false)
+	add(2, 2, true)  // 声明了，跳过一次
+	add(3, 0, false) // 没声明：不进分母
+	add(4, 0, true)  // 没声明却标了 skipped：仍不得进分母/分子
+
+	snap := r.Snapshot(0, nil)
+	agg := snap.ByModel[0]
+	if agg.ToolRequests != 3 {
+		t.Errorf("ToolRequests=%d want 3（只有声明了 tools 的才进分母）", agg.ToolRequests)
+	}
+	if agg.ToolSkipped != 1 {
+		t.Errorf("ToolSkipped=%d want 1", agg.ToolSkipped)
+	}
+	if got := agg.ToolSkipRate; got < 33.3 || got > 33.4 {
+		t.Errorf("ToolSkipRate=%v want ~33.33", got)
+	}
+
+	// 落盘往返：v5 字段不能丢
+	r.Save()
+	r2 := New(dir + "/usage.json")
+	if got := r2.Snapshot(0, nil).ByModel[0].ToolSkipped; got != 1 {
+		t.Errorf("恢复后 ToolSkipped=%d want 1", got)
+	}
+
+	// 无工具请求：分母 0，比率保持 0（面板显示 "—" 而不是 0%）
+	r3 := New(t.TempDir() + "/u2.json")
+	r3.Add(base, "cn", "u", "m", Delta{TotalTokens: 5, HasTotal: true}, true)
+	if a := r3.Snapshot(0, nil).ByModel[0]; a.ToolRequests != 0 || a.ToolSkipRate != 0 {
+		t.Errorf("无 tools 请求应为 0/0，got %d/%v", a.ToolRequests, a.ToolSkipRate)
+	}
+}
+
+// TestToolSkipRollup 折叠日桶时 TD/TS 必须一并累加（漏了会让历史数据归零）。
+func TestToolSkipRollup(t *testing.T) {
+	r := New("")
+	old := time.Now().Add(-hourlyKeep - 48*time.Hour)
+	r.Add(old, "cn", "u1", "m", Delta{HasTools: true, ToolsDeclared: 1, ToolSkipped: true,
+		TotalTokens: 1, HasTotal: true}, true)
+	r.Add(old.Add(time.Hour), "cn", "u1", "m", Delta{HasTools: true, ToolsDeclared: 1,
+		TotalTokens: 1, HasTotal: true}, true)
+	r.Rollup(time.Now())
+	a := r.Snapshot(0, nil).ByModel[0]
+	if a.ToolRequests != 2 || a.ToolSkipped != 1 {
+		t.Errorf("折叠后 TD/TS=%d/%d want 2/1", a.ToolRequests, a.ToolSkipped)
+	}
+}

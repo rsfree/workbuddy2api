@@ -405,8 +405,13 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .kpis { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr));
     gap: 10px; padding: 14px 17px 2px; }
   .kpis.k4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  /* 用量总览 7 张卡：多出的那张是缓存命中率——它和请求数、延迟同级（都是"现在跑得
+     怎么样"），不应该只藏在下面的明细表里。1366px 主区下每张约 181px，放得下 "1.2M"；
+     再窄就退 4 列，不要硬撑 7 列把数字压成省略号。 */
+  .kpis.k7 { grid-template-columns: repeat(7, minmax(0, 1fr)); }
+  @media (max-width: 1400px) { .kpis.k7 { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
   @media (max-width: 1180px) { .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
-  @media (max-width: 700px) { .kpis, .kpis.k4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (max-width: 700px) { .kpis, .kpis.k4, .kpis.k7 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
   .kpi {
     position: relative; min-width: 0; overflow: hidden;
     background: var(--surface-2); border: 1px solid var(--line-soft);
@@ -457,6 +462,26 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .uschart-body rect.usbar { transition: opacity .12s; }
   .uschart-body rect.usbar:hover { opacity: .78; }
   .uschart-body .us-empty { padding: 30px 0; text-align: center; color: var(--ink-3); font-size: 12.5px; }
+  /* 缓存图在窄屏允许横向滚动而不是等比缩到 62px 高：1200 宽的 viewBox 压进 375px
+     视口后，刻度文字和柱宽都不可读，图就退化成一个装饰条。mobile.js 只接管 Token
+     图（440×230 重绘），这张图没有移动版，所以用最小宽度 + 滚动兜底。 */
+  @media (max-width: 760px) {
+    #usCacheChart { overflow-x: auto; }
+    #usCacheChart svg { min-width: 720px; }
+  }
+  /* 缓存视图的色块与折线：命中=绿（省钱）、未命中=红（花钱）、命中率折线=强调色。
+     刻意不复用 .sw-p/.sw-c —— 那组是 Token 视图的语义（prompt/completion），
+     两套视图共用一个类名时，图例只要有一处没换就会串色。 */
+  .uschart-hd .sw-h { background: var(--ok); }
+  .uschart-hd .sw-m { background: var(--bad); }
+  .uschart-hd .sw-r { background: var(--accent); }
+  .uschart-body .rt { stroke: var(--accent); stroke-width: 1.6; fill: none;
+    stroke-linejoin: round; stroke-linecap: round; }
+  .uschart-body .rt-dot { fill: var(--accent); }
+  /* 表内缓存占比条：命中/未命中两段，与 prompt/completion 的 .us-mix 同形但换色。
+     单独给 .h/.m 类而不是复用 .p/.c，避免「命中绿 = completion 绿」被误读为同义。 */
+  .us-mix .h { background: var(--ok); }
+  .us-mix .m { background: var(--bad); }
 
   /* 用量表内的 prompt/completion 占比条。用 .us-mix 而不是复用账号池的 .bar：
      全局 .bar 是块级容器（积分条），同优先级下会互相覆盖（v1.9.0 回归）。 */
@@ -937,7 +962,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="trange" id="usRange"></span>
           <button class="xs" id="btnUsage">刷新</button>
         </header>
-        <div class="kpis" id="usStats"></div>
+        <div class="kpis k7" id="usStats"></div>
         <div class="pad">
           <div class="uschart">
             <div class="uschart-hd">
@@ -950,6 +975,29 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               </span>
             </div>
             <div id="usChart" class="uschart-body"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>缓存效率 <span class="hint">上游前缀缓存 · token 加权</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="usCacheNote">—</span>
+        </header>
+        <div class="kpis k4" id="usCacheStats"></div>
+        <div class="pad">
+          <div class="uschart">
+            <div class="uschart-hd">
+              <span class="lb">命中 / 未命中 token</span>
+              <span class="note" id="usCacheChartNote">—</span>
+              <span class="grow"></span>
+              <span class="legend">
+                <i class="sw sw-h"></i>命中<i class="sw sw-m"></i>未命中
+                <span class="sep"></span><i class="sw sw-r"></i>命中率
+              </span>
+            </div>
+            <div id="usCacheChart" class="uschart-body"></div>
           </div>
         </div>
       </div>

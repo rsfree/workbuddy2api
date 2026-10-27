@@ -93,11 +93,20 @@ type MarkupCall struct {
 type MarkupRepair struct {
 	allowed      map[string]bool
 	allowUnknown bool
-	hold         string // 已确认可能属于标记、但还不足以判定的尾部缓冲
-	inBlock      bool   // 已消费掉 markupOpen，正在块内部累积
-	seen         int    // 识别到的标记块数（含被拒绝的）
-	rejected     int    // 识别到但未转换的块数（观测/排障用）
-	converted    int    // 已还原的调用数（观测用）
+	// suppress 抑制模式：识别标记块并吞掉，但**不**产出 tool_calls。
+	//
+	// 用于 tool_choice=none：客户端明确要求本轮不调工具，而兑现它的唯一手段是剥
+	// 掉 tools（上游忽略该字段取值）。tools 消失后模型会把调用写成正文标记，
+	// 此时两个选择都错：还原成 tool_calls 违背客户端指令；原样透出则让客户端
+	// 收到一坨自己看不懂的标记（正是本文件要消灭的现象）。抑制模式取第三条路：
+	// 块被吃掉、不产出调用、也不留原文，客户端拿到干净的（可能为空的）正文。
+	suppress   bool
+	hold       string // 已确认可能属于标记、但还不足以判定的尾部缓冲
+	inBlock    bool   // 已消费掉 markupOpen，正在块内部累积
+	seen       int    // 识别到的标记块数（含被拒绝的）
+	rejected   int    // 识别到但未转换的块数（观测/排障用）
+	converted  int    // 已还原的调用数（观测用）
+	suppressed int    // 抑制模式下被吞掉的块数（观测用）
 }
 
 // NewMarkupRepair 按客户端声明的工具名构造修复器。
@@ -111,9 +120,29 @@ func NewMarkupRepair(allowed map[string]bool, allowUnknown bool) *MarkupRepair {
 	return &MarkupRepair{allowed: allowed, allowUnknown: allowUnknown}
 }
 
+// NewMarkupSuppressor 构造抑制模式的修复器：识别标记块并吞掉，但不产出 tool_calls。
+// 供 tool_choice=none 使用——那是客户端明确要求「本轮不调工具」的唯一可行兑现方式
+// （上游忽略该字段，只能靠不声明工具；而模型仍会写标记，必须吞掉才不留乱码）。
+//
+// allowed/allowUnknown 与 NewMarkupRepair 完全同参、同判定：抑制与修复对「什么算
+// 一个真实调用块」必须用同一把尺子。名单仍来自**剥离 tools 之前**的原始 body
+// （含历史 tool_calls 里的名字），所以 none + 有工具历史的会话照样能识别出块。
+// 不给名单会让判定退化成"永不命中"，抑制随之失效（踩过：标记原样漏给客户端）。
+func NewMarkupSuppressor(allowed map[string]bool, allowUnknown bool) *MarkupRepair {
+	return &MarkupRepair{allowed: allowed, allowUnknown: allowUnknown, suppress: true}
+}
+
 // Enabled 报告修复器是否启用。
 func (r *MarkupRepair) Enabled() bool {
-	return r != nil && (len(r.allowed) > 0 || r.allowUnknown)
+	return r != nil && (r.suppress || len(r.allowed) > 0 || r.allowUnknown)
+}
+
+// Suppressed 返回被抑制（吞掉且未产出调用）的标记块数，与 Converted 对称。
+func (r *MarkupRepair) Suppressed() int {
+	if r == nil {
+		return 0
+	}
+	return r.suppressed
 }
 
 // Converted 返回本次流里已还原的工具调用总数（观测用）。
@@ -189,6 +218,12 @@ func (r *MarkupRepair) Feed(text string) (string, []MarkupCall) {
 		r.inBlock = false
 		r.seen++
 		if got, ok := parseMarkupBlock(inner, r.allowed); ok {
+			if r.suppress {
+				// 抑制模式：块被吞掉但不出调用。仍计 seen，便于观测「模型本轮
+				// 想调多少次工具、全被 none 挡下了」。
+				r.suppressed++
+				continue
+			}
 			calls = append(calls, got...)
 			r.converted += len(got)
 			continue
@@ -443,6 +478,44 @@ func RepairAggregatedResponse(resp map[string]any, allowed map[string]bool, allo
 		msg["content"] = emit
 		msg["tool_calls"] = markupMessageToolCalls(calls)
 		c["finish_reason"] = "tool_calls"
+	}
+	return r
+}
+
+// SuppressAggregatedMarkup 非流式版的抑制：把正文里的标记块吞掉，**不**产出
+// tool_calls。与 RepairAggregatedResponse 的区别是「没有调用也要回写正文」——
+// 抑制模式的全部意义就在于不给客户端留标记原文，漏回写等于白做。
+//
+// 只处理 message.content 里含标记且该 choice 尚无结构化 tool_calls 的情形；
+// 已有结构化 tool_calls 时不动（真实调用不该被抑制逻辑碰）。
+func SuppressAggregatedMarkup(resp map[string]any, allowed map[string]bool, allowUnknown bool) *MarkupRepair {
+	r := NewMarkupSuppressor(allowed, allowUnknown)
+	choices, ok := resp["choices"].([]any)
+	if !ok {
+		return r
+	}
+	for _, ci := range choices {
+		c, ok := ci.(map[string]any)
+		if !ok {
+			continue
+		}
+		msg, ok := c["message"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if tcs, ok := msg["tool_calls"].([]any); ok && len(tcs) > 0 {
+			continue
+		}
+		text, _ := msg["content"].(string)
+		if text == "" || !strings.Contains(text, markupPipe) {
+			continue
+		}
+		emit, _ := r.Feed(text)
+		emit += r.Flush()
+		if emit == text {
+			continue // 没有可吞的块，一个字节都不动
+		}
+		msg["content"] = strings.TrimSpace(emit)
 	}
 	return r
 }

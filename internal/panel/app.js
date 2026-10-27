@@ -1418,6 +1418,75 @@ function cacheRateText(hit, miss) {
   return String(Math.round(h / total * 1000) / 10) + '%';
 }
 
+/* cacheRateClass 命中率的语义色档：≥90% 绿 / 80–90% 黄 / <80% 红 / 无样本灰。
+   阈值必须与表内 cacheCell、积分表 cacheRateCell 完全一致——同一个数字在总览
+   显示绿色、在明细显示黄色，会被读成"两张表口径不同"，实际只是阈值漂了。 */
+function cacheRateClass(hit, miss) {
+  const h = Number(hit || 0), m = Number(miss || 0), tot = h + m;
+  if (!tot) return 'c-mute';
+  const pct = h / tot * 100;
+  return pct >= 90 ? 'c-ok' : (pct >= 80 ? 'c-warn' : 'c-bad');
+}
+
+/* CACHE_BLOCK_TOKENS 上游前缀缓存的块大小（token 对齐粒度）。
+   实测口径（2026-10-27，池内 577 条「本就有命中」的请求）：568 条命中量是 128 的
+   整数倍，%256 只有 271 条 —— 缓存按 128 tok 对齐，prompt 不足一个块时没有任何可
+   命中的单元，命中率必然是 0，且与路由/账号完全无关。
+   面板据此区分「缓存没在工作」和「这批请求本来就没得缓存」：后者常常是探活/短问答
+   打满请求数，按条数算出来的命中率会低到 20%，而 token 加权是 90%+。 */
+const CACHE_BLOCK_TOKENS = 128;
+
+/* cacheCell 用量明细表的「缓存命中」单元格：命中率（语义色）+ 命中/未命中占比条。
+   分母是 token 而不是请求数 —— 见 CACHE_BLOCK_TOKENS 的注释。
+   平均 prompt 低于一个缓存块时，把「物理不可命中」写进 tooltip：一排 0% 很容易被
+   读成故障，实际是请求太短，此时优化路由没有意义。 */
+function cacheCell(a) {
+  const hit = Number(a && a.cache_hit_tokens || 0);
+  const miss = Number(a && a.cache_miss_tokens || 0);
+  const tot = hit + miss;
+  if (!tot) return '<span class="muted">—</span>';
+  const pct = hit / tot * 100;
+  const color = pct >= 90 ? 'var(--ok)' : (pct >= 80 ? 'var(--warn)' : 'var(--bad)');
+  const reqs = Number(a && a.requests || 0);
+  const avgP = reqs ? Number(a.prompt_tokens || 0) / reqs : 0;
+  let tip = '命中 ' + fmtTok(hit) + ' / 未命中 ' + fmtTok(miss) + ' tok';
+  if (avgP && avgP < CACHE_BLOCK_TOKENS) {
+    tip += ' · 平均 prompt 仅 ' + Math.round(avgP) + ' tok，低于 ' + CACHE_BLOCK_TOKENS +
+      ' tok 缓存块，这部分请求物理上不可能命中';
+  }
+  return '<span style="color:' + color + '" title="' + esc(tip) + '">' +
+    trimFixed(pct.toFixed(1)) + '%</span>' +
+    '<span class="us-mix" title="' + esc(tip) + '">' +
+    '<i class="h" style="width:' + pct.toFixed(2) + '%"></i>' +
+    '<i class="m" style="width:' + (100 - pct).toFixed(2) + '%"></i></span>';
+}
+
+/* toolSkipCell 「模型跳过工具」单元格：对话已建立工具使用模式，本轮却一次都没调用。
+ *
+ * 为什么值得单独一列：这是判断"某个模型值不值得继续用"最直接的证据。声明了 tools、
+ * 历史里明明用过工具，本轮却直接改口答文本——通常是模型答非所问或开始幻觉
+ * （实测 kimi-k3.1-pro 有 1/4 轮把"北京天气"直接编成"晴 25°C"，一次工具都没调）。
+ *
+ * 口径（见 upstream.InspectTools）：分母 = 本次**显式声明了 tools** 的请求；
+ * 分子 = 其中「历史里有工具痕迹 + 本轮 0 调用」的次数。三个条件缺一不可，
+ * 首轮不调工具是模型的正常判断，绝不能计入。
+ *
+ * 分母为 0（该模型从没被给过工具）显示 "—"：0% 会被读成"从不跳过"，是反向误导。 */
+function toolSkipCell(a) {
+  const reqs = Number(a && a.tool_requests || 0);
+  const skipped = Number(a && a.tool_skipped || 0);
+  if (!reqs) return '<span class="muted" title="窗口内该维度没有带 tools 的请求">—</span>';
+  const pct = skipped / reqs * 100;
+  // 与缓存列相反：这里是**越低越好**。超过 5% 就该看是哪几轮、什么模型。
+  const color = pct <= 2 ? 'var(--ok)' : (pct <= 8 ? 'var(--warn)' : 'var(--bad)');
+  const tip = '声明 tools 的请求 ' + reqs + ' 次，其中 ' + skipped +
+    ' 次「对话已用过工具却本轮 0 调用」(' + trimFixed(pct.toFixed(1)) + '%)';
+  const txt = skipped ? trimFixed(pct.toFixed(1)) + '%' : '0%';
+  return '<span style="color:' + (skipped ? color : 'var(--ok)') + '" title="' + esc(tip) + '">' +
+    txt + '</span>' +
+    '<span class="note">' + skipped + '/' + reqs + '</span>';
+}
+
 function fmtBytes(bytes) {
   const n = Number(bytes || 0);
   if (n < 1024) return n + ' B';
@@ -2544,6 +2613,8 @@ function usRow(name, sub, a, mid, withPerf, nameHtml) {
     '<td class="num">' + fmtTok(a.completion_tokens) + '</td>' +
     '<td class="num">' + fmtTok(a.total_tokens) +
       usMixBar(a.prompt_tokens, a.completion_tokens, a.total_tokens) + '</td>' +
+    '<td class="num">' + cacheCell(a) + '</td>' +
+    '<td class="num">' + toolSkipCell(a) + '</td>' +
     (withPerf
       ? '<td class="num">' + fmtMs(a.avg_latency_ms) + '</td>' +
         '<td class="num">' + fmtRate(a.avg_tokens_per_second) + '</td>'
@@ -2555,9 +2626,9 @@ function usRow(name, sub, a, mid, withPerf, nameHtml) {
    账号 / 模型 / 域三张表此前各自占一个 box，页面纵向拉得很长且表头结构几乎一样。
    现在合成一个 box：表头由维度定义生成，行渲染复用 usRow，切换零请求。 */
 const US_DIMS = {
-  account: { key: 'by_account', title: '账号', withRealm: true, withPerf: true, span: 10 },
-  model: { key: 'by_model', title: '模型', withRealm: false, withPerf: false, span: 7 },
-  realm: { key: 'by_realm', title: 'realm', withRealm: false, withPerf: false, span: 7 },
+  account: { key: 'by_account', title: '账号', withRealm: true, withPerf: true, span: 12 },
+  model: { key: 'by_model', title: '模型', withRealm: false, withPerf: false, span: 9 },
+  realm: { key: 'by_realm', title: 'realm', withRealm: false, withPerf: false, span: 9 },
 };
 
 // usSortRows 按当前排序字段降序（默认合计 Token，最大者最相关）。
@@ -2578,6 +2649,8 @@ function usDimHead(dim) {
     (m.withRealm ? '<th>域</th>' : '') +
     '<th class="num">请求</th><th class="num">失败</th>' +
     '<th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>' +
+    '<th class="num">缓存命中</th>' +
+    '<th class="num">工具跳过</th>' +
     (m.withPerf ? '<th class="num">均延迟</th><th class="num">均速率</th>' : '') +
     '</tr>';
 }
@@ -2696,7 +2769,7 @@ function renderUsage(d) {
     usKpi(fmtTok(reqs), '请求数', 'c-accent',
       errs ? '其中失败 ' + errs + ' 次' : '全部成功') +
     usKpi(fmtTok(total), '总 token', 'c-accent',
-      'prompt ' + usPct(pt, total) + ' · completion ' + usPct(ct, total),
+      'prompt ' + usPct(pt, total) + ' · 输出 ' + usPct(ct, total),
       '<div class="kbar"><i style="width:' + pctW(pt) + ';background:var(--accent)"></i>' +
       '<i style="width:' + pctW(ct) + ';background:var(--ok)"></i></div>') +
     usKpi(fmtTok(pt), 'prompt', 'c-soft', '占比 ' + usPct(pt, total)) +
@@ -2704,7 +2777,14 @@ function renderUsage(d) {
     usKpi(String(errs), '失败尝试', errs ? 'c-warn' : 'c-mute',
       okRate == null ? '—' : (errs ? '成功率 ' + okRate.toFixed(1) + '%' : '成功率 100%')) +
     usKpi(fmtMs(t.avg_latency_ms), '平均延迟', 'c-soft',
-      t.avg_tokens_per_second ? '吐字 ' + fmtRate(t.avg_tokens_per_second) : '无速率样本');
+      t.avg_tokens_per_second ? '吐字 ' + fmtRate(t.avg_tokens_per_second) : '无速率样本') +
+    // 缓存命中率进总览：它是和请求数/延迟同级的运行指标。口径是 token 加权，
+    // 详细拆解（以及"为什么低"的结构性解释）在下方「缓存效率」区。
+    usKpi(cacheRateText(t.cache_hit_tokens, t.cache_miss_tokens), '缓存命中率',
+      cacheRateClass(t.cache_hit_tokens, t.cache_miss_tokens),
+      t.cache_hit_tokens || t.cache_miss_tokens
+        ? '命中 ' + fmtTok(t.cache_hit_tokens) + ' · 未命中 ' + fmtTok(t.cache_miss_tokens)
+        : '上游未返回缓存字段');
 
   // 卡片、明细表与时序图全部按所选窗口统计（切窗口数字随之变化）；
   // 「全部历史」含 90 天前折叠出的日桶。这里标注当前口径与数据起点。
@@ -2728,15 +2808,14 @@ function renderUsage(d) {
     usKpi(fmtTok(t.credit_tokens), '匹配 Token', 'c-mute', '与积分同时观测到的 Token') +
     usKpi(fmtCreditRatio(t.credits_per_1m_tokens, t.credit_samples, t.credit_tokens),
       '平均积分 / 1M Token', 'c-ok', '越低越划算') +
-    usKpi(String(t.credit_samples || 0), '有效积分样本', 'c-mute', '缺字段的历史不参与折算') +
-    usKpi(cacheRateText(t.cache_hit_tokens, t.cache_miss_tokens), '缓存命中率', 'c-mute',
-      '上游前缀缓存命中 / (命中+未命中)；低命中意味着费用数倍放大');
+    usKpi(String(t.credit_samples || 0), '有效积分样本', 'c-mute', '缺字段的历史不参与折算');
   $('usCreditNote').textContent =
     (usageData.credit_by_account || []).length + ' 个账号 · ' +
     (usageData.credit_by_model || []).length + ' 个模型倍率分组 · 仅统计与积分同时观测到的 Token';
 
   renderUsageDim();
   renderCreditDim();
+  renderCacheBox(d);
   renderUsageChart(usageData.series || []);
 }
 
@@ -2950,6 +3029,194 @@ function renderUsageChart(series) {
   host.innerHTML = out;
 }
 
+/* renderCacheBox 缓存效率区（四张 KPI + 一张时序图）。
+ *
+ * 为什么单开一块而不是并进「用量总览」那六张卡：缓存要回答三个不同层次的问题——
+ * ① 命中率多少；② 命中/未命中各多少 token；③ 这个命中率是不是**结构性**的。
+ * 前两个塞得进卡片，第三个只能靠解释性文案；混在一排运行指标里会被直接扫过去，
+ * 于是「kimi-k3.1-pro 命中率 19%」这种采样错觉又会被当成故障来查。
+ *
+ * 口径：命中率 = 命中 / (命中 + 未命中)，**token 加权**。绝不按请求条数——
+ * 短请求（< 128 tok 一个缓存块）物理不可命中，条数口径会被它们整体拉低
+ * （实测同一模型两种口径能差 70 个百分点）。
+ */
+function renderCacheBox(d) {
+  const t = (d && d.totals) || {};
+  const hit = Number(t.cache_hit_tokens || 0);
+  const miss = Number(t.cache_miss_tokens || 0);
+  const tot = hit + miss;
+  const reqs = Number(t.requests || 0);
+  const pt = Number(t.prompt_tokens || 0);
+  const avgP = reqs ? pt / reqs : 0;
+  const pct = tot ? hit / tot * 100 : 0;
+  const cls = !tot ? 'c-mute' : (pct >= 90 ? 'c-ok' : (pct >= 80 ? 'c-warn' : 'c-bad'));
+
+  // 平均 prompt 不足一个缓存块时，低命中率是结构性的、不是故障：把结论直接写进
+  // 副标题，用户不必悬停也能读对。反之才提示口径本身。
+  const sub = avgP && avgP < CACHE_BLOCK_TOKENS
+    ? '平均 prompt ' + Math.round(avgP) + ' tok < ' + CACHE_BLOCK_TOKENS + ' tok 缓存块，结构性不可命中'
+    : 'token 加权，非请求条数';
+
+  $('usCacheStats').innerHTML =
+    usKpi(tot ? trimFixed(pct.toFixed(1)) + '%' : '—', '缓存命中率', cls, sub,
+      '<div class="kbar"><i style="width:' + (tot ? pct.toFixed(2) : 0) + '%;background:var(--ok)"></i>' +
+      '<i style="width:' + (tot ? (100 - pct).toFixed(2) : 0) + '%;background:var(--bad)"></i></div>') +
+    usKpi(fmtTok(hit), '命中 token', 'c-ok',
+      tot ? '占缓存观测 ' + usPct(hit, tot) : '无缓存观测') +
+    usKpi(fmtTok(miss), '未命中 token', miss ? 'c-bad' : 'c-mute',
+      miss ? '按未命中单价计费' : (tot ? '全部命中' : '无缓存观测')) +
+    usKpi(fmtTok(pt), 'prompt 总量', 'c-soft',
+      tot ? '观测覆盖 ' + usPct(tot, pt) : '上游未返回缓存字段');
+
+  const nc = $('usCacheNote');
+  nc.textContent = '命中率 = 命中 / (命中 + 未命中) token · 含失败尝试';
+  nc.title = nc.textContent;
+
+  renderCacheChart((d && d.series) || []);
+}
+
+/* renderCacheChart 缓存的时序视图：柱 = 命中/未命中 token（左轴），折线 = 命中率（右轴）。
+ *
+ * 双轴的理由：柱高读**绝对量**（这小时用了多少 token），折线读**比例**（这小时有多少
+ * 是复用的）。只看柱高看不出退化——请求量下降时 miss 也下降，柱子变矮但命中率可能
+ * 是 0；只看折线又分不清「90% 命中」是 10 tok 还是 10M tok，而这两者的费用差着量级。
+ *
+ * 没有缓存观测的桶直接跳过而不是按 0% 画：那段时间多半是失败/探活请求（上游连 usage
+ * 都没回），画成 0% 会凭空造出一段「命中率崩了」的假信号。
+ */
+function renderCacheChart(series) {
+  const host = $('usCacheChart');
+  if (!host) return;
+  const pts = [];
+  for (const p of series || []) {
+    const t = parsePointTime(p);
+    if (t === null) continue;
+    const hit = Number(p.cache_hit_tokens || 0);
+    const miss = Number(p.cache_miss_tokens || 0);
+    const tot = hit + miss;
+    if (!tot) continue;
+    pts.push({ t: t, raw: p.t, scope: p.scope, hit: hit, miss: miss, tot: tot,
+               rate: hit / tot * 100, req: p.requests || 0 });
+  }
+  if (!pts.length) {
+    host.innerHTML = '<div class="us-empty">窗口内没有缓存观测记录。上游不返回 prompt_cache_hit_tokens 时此图留空。</div>';
+    $('usCacheChartNote').textContent = '—';
+    return;
+  }
+
+  const W = 1200, H = 200, PL = 58, PR = 46, PT = 18, PB = 30;
+  const iw = W - PL - PR, ih = H - PT - PB, yBase = PT + ih;
+  const t0 = pts[0].t, t1 = pts[pts.length - 1].t;
+  const span = Math.max(1, t1 - t0);
+  const max = Math.max(1, ...pts.map(p => p.tot));
+  const peak = pts.reduce((a, b) => (b.tot > a.tot ? b : a), pts[0]);
+  const sumHit = pts.reduce((s, p) => s + p.hit, 0);
+  const sumTot = pts.reduce((s, p) => s + p.tot, 0);
+  $('usCacheChartNote').textContent =
+    pts.length + ' 个点 · 整体 ' + trimFixed((sumHit / sumTot * 100).toFixed(1)) + '%' +
+    ' · 峰值 ' + fmtTok(peak.tot) + ' @ ' + fmtTokTimeLabel(peak);
+
+  let minGap = Infinity;
+  for (let i = 1; i < pts.length; i++) minGap = Math.min(minGap, pts[i].t - pts[i - 1].t);
+  if (!isFinite(minGap) || minGap <= 0) minGap = span;
+  const slot = iw * (minGap / span);
+  const bw = Math.max(2, Math.min(30, slot * 0.7));
+  const xOf = t => PL + bw / 2 + (t - t0) / span * Math.max(1, iw - bw);
+  const yTok = v => PT + ih - ih * (v / max);
+  const yRate = v => PT + ih - ih * (v / 100);
+
+  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" preserveAspectRatio="xMidYMid meet">';
+  // 渐变走 style 而不是 presentation 属性：Blink/WebKit 不解析属性里的 var()，
+  // 写成 stop-color="var(--ok)" 会让整条渐变失效（柱子全透明，踩过）。
+  out += '<defs>' +
+    '<linearGradient id="usCGradH" x1="0" y1="0" x2="0" y2="1">' +
+    '<stop offset="0" style="stop-color:var(--ok);stop-opacity:1"/>' +
+    '<stop offset="1" style="stop-color:var(--ok);stop-opacity:.55"/></linearGradient>' +
+    '<linearGradient id="usCGradM" x1="0" y1="0" x2="0" y2="1">' +
+    '<stop offset="0" style="stop-color:var(--bad);stop-opacity:1"/>' +
+    '<stop offset="1" style="stop-color:var(--bad);stop-opacity:.55"/></linearGradient>' +
+    '</defs>';
+
+  for (let i = 0; i <= 4; i++) {
+    const y = PT + ih - (ih * i / 4);
+    out += '<line class="gl" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) +
+           '" y2="' + y.toFixed(1) + '"/>';
+    out += '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 3.5).toFixed(1) +
+           '" text-anchor="end">' + fmtTok(max * i / 4) + '</text>';
+  }
+  // 右轴只标 0/50/100%：五个百分比刻度和左轴的 token 刻度会在同一水平线上打架。
+  for (const r of [0, 50, 100]) {
+    out += '<text class="tk" x="' + (W - PR + 7) + '" y="' + (yRate(r) + 3.5).toFixed(1) +
+           '" text-anchor="start">' + r + '%</text>';
+  }
+
+  for (const p of pts) {
+    const x = xOf(p.t) - bw / 2;
+    const hTot = ih * (p.tot / max);
+    const hH = p.tot ? hTot * (p.hit / p.tot) : 0;
+    const hM = Math.max(p.tot && p.miss ? 1 : 0, hTot - hH);
+    // <title> 必须包在柱子的 <g> 里：SVG 的 title 描述父元素，平铺到根下会让整张图
+    // 共用一个 tooltip（悬停哪根都显示第一根的数据，issue #128）。
+    out += '<g><title>' + esc(p.raw) + '  命中 ' + fmtTok(p.hit) + ' / 未命中 ' + fmtTok(p.miss) +
+           ' = ' + trimFixed(p.rate.toFixed(1)) + '% · ' + p.req + ' 次</title>';
+    if (hH > 0) out += '<rect class="usbar" x="' + x.toFixed(2) + '" y="' + (yBase - hH).toFixed(2) +
+      '" width="' + bw.toFixed(2) + '" height="' + hH.toFixed(2) +
+      '" fill="url(#usCGradH)"' + (hM > 0 ? '' : ' rx="1.5"') + '/>';
+    if (hM > 0) out += '<rect class="usbar" x="' + x.toFixed(2) + '" y="' + (yBase - hH - hM).toFixed(2) +
+      '" width="' + bw.toFixed(2) + '" height="' + hM.toFixed(2) +
+      '" fill="url(#usCGradM)" rx="1.5"/>';
+    out += '</g>';
+  }
+
+  // 命中率折线画在柱子之上（否则被柱体遮住），点太密时省掉圆点只留折线。
+  let line = '';
+  for (const p of pts) {
+    line += (line ? ' ' : '') + xOf(p.t).toFixed(1) + ',' + yRate(p.rate).toFixed(1);
+  }
+  out += '<polyline class="rt" points="' + line + '"/>';
+  if (pts.length <= 80) {
+    for (const p of pts) {
+      out += '<circle class="rt-dot" cx="' + xOf(p.t).toFixed(1) + '" cy="' +
+             yRate(p.rate).toFixed(1) + '" r="2"/>';
+    }
+  }
+
+  out += '<line class="ax" x1="' + PL + '" y1="' + yBase + '" x2="' + (W - PR) +
+         '" y2="' + yBase + '"/>';
+
+  const TICKS = Math.min(6, pts.length);
+  const usedLabel = new Set();
+  for (let k = 0; k < TICKS; k++) {
+    const target = t0 + span * (TICKS === 1 ? 0.5 : k / (TICKS - 1));
+    let bi = 0, best = Infinity;
+    for (let i = 0; i < pts.length; i++) {
+      const dd = Math.abs(pts[i].t - target);
+      if (dd < best) { best = dd; bi = i; }
+    }
+    if (usedLabel.has(bi)) continue;
+    usedLabel.add(bi);
+    const p = pts[bi], cx = xOf(p.t);
+    const anchor = cx < PL + 14 ? 'start' : (cx > W - PR - 14 ? 'end' : 'middle');
+    out += '<text class="tk" x="' + Math.max(PL, Math.min(W - PR, cx)).toFixed(1) +
+           '" y="' + (PT + ih + 15) + '" text-anchor="' + anchor + '">' +
+           esc(fmtTokTimeLabel(p)) + '</text>';
+  }
+
+  let prevDay = null;
+  for (const p of pts) {
+    const dd = new Date(p.t).getDate();
+    if (prevDay !== null && dd !== prevDay) {
+      const x = xOf(p.t).toFixed(1);
+      out += '<line class="gl" x1="' + x + '" y1="' + PT + '" x2="' + x + '" y2="' +
+             (PT + ih) + '" style="opacity:.45"/>';
+    }
+    prevDay = dd;
+  }
+
+  out += '</svg>';
+  host.innerHTML = out;
+}
+
 function fmtTokTip(v) { return fmtTok(v); }
 
 let usageRateWarmAt = 0;
@@ -2975,6 +3242,10 @@ async function loadUsage() {
     $('usChart').innerHTML = '<div class="us-empty">读取用量失败：' + esc(e.message) + '</div>';
     $('usChartNote').textContent = '—';
     $('usStats').innerHTML = '';
+    $('usCacheStats').innerHTML = '';
+    $('usCacheChart').innerHTML = '<div class="us-empty">读取用量失败</div>';
+    $('usCacheChartNote').textContent = '—';
+    $('usCacheNote').textContent = '—';
     $('usCreditStats').innerHTML = '';
     $('usNote').textContent = '—';
     $('usCreditNote').textContent = '—';
@@ -2983,7 +3254,7 @@ async function loadUsage() {
     $('usCreditHead').innerHTML = '';
     $('usDimTabs').innerHTML = usTabsHtml(US_DIM_TABS, usDim, null);
     $('usCreditTabs').innerHTML = usTabsHtml([['account', '按账号'], ['model', '按模型']], usCreditDim, null);
-    $('usDimBody').innerHTML = '<tr><td colspan="10" class="empty">读取用量失败</td></tr>';
+    $('usDimBody').innerHTML = '<tr><td colspan="12" class="empty">读取用量失败</td></tr>';
     $('usCreditBody').innerHTML = '<tr><td colspan="7" class="empty">读取用量失败</td></tr>';
   }
 }

@@ -871,6 +871,28 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 只认前者会让修复层在最需要它的场景下失效。
 	// 在提示词/模型名改写之前取（那些改写不动 tools / messages[].tool_calls 子树）。
 	declaredTools := upstream.ToolNameAllowlist(body)
+	// 工具使用上下文：「本次给了几个工具」与「历史里用过工具吗」必须分开取
+	// （ToolNameAllowlist 把两者混在一起，不能用来判断本次是否声明）。
+	// 供用量桶统计「模型跳过工具」的比例——判断一个模型值不值得用的直接依据。
+	toolCtx := upstream.InspectTools(body)
+	// tool_choice=none / required 的入站标记：
+	//   none     → 兑现它只能剥掉 tools（上游忽略该字段取值），且必须同时抑制标记修复
+	//   required → 只做观测（客户端要求必调却 0 调用时告警，见 requiredIgnoredSignal）
+	choiceNone := upstream.ToolChoiceNone(body)
+	choiceRequired := upstream.ToolChoiceRequired(body)
+	// 🔴 tool_choice=none 必须同时切到「抑制模式」。
+	//
+	// 兑现 none 的唯一手段是剥掉 tools（上游忽略该字段取值，见 normalizeToolChoice）。
+	// 但 tools 消失后模型若仍想调工具，就会把调用写成正文里的原生标记，而修复层
+	// 会把它还原成 tool_calls——客户端明明说了"本轮不要调工具"却收到一次调用。
+	// 实测（2026-10-28，历史里调过该工具的会话 + none）：不处理则 2/2 轮都拿到调用。
+	//
+	// 处置必须是「抑制」而不是「禁用修复」：全禁用会让标记原文直接漏给客户端
+	//（实测客户端收到 `<｜｜DSML｜｜ calls>` 乱码，比多一次调用更糟）。
+	repairAllowed, repairUnknown := declaredTools, true
+	if choiceNone {
+		repairAllowed, repairUnknown = nil, false
+	}
 
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
@@ -908,6 +930,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
+	st.toolsDeclared = toolCtx.Declared
+	st.toolHistory = toolCtx.History
+	st.choiceNone = choiceNone
+	st.choiceRequired = choiceRequired
 	if tr := requestTraceFrom(r); tr != nil {
 		tr.stat = st
 		// 来源在 ServeHTTP 入口采集（此时才知道开关与请求头），此处转交给统计对象，
@@ -1134,14 +1160,23 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				HasTotal:         delta.HasTotalTokens,
 				Credit:           credit,
 				HasCredit:        hasCredit,
-				HasCacheTokens:   st.hasCache,
-				CacheHitTokens:   st.cacheHit,
-				CacheMissTokens:  st.cacheMiss,
-				ModelRate:        modelRate,
-				LatencyMs:        delta.LatencyMs,
-				HasLatency:       delta.HasLatencyMs,
-				TokensPerSecond:  delta.TokensPerSecond,
-				HasTPS:           delta.HasTokensPerSecond,
+				HasTools:         st.toolsDeclared > 0,
+				ToolsDeclared:    int64(st.toolsDeclared),
+				// 跳过判据：本次**声明了工具** + 历史**已用过工具** + 本轮**0 调用**。
+				// 三个条件缺一不可：
+				//   · 不要求声明 → 客户端没给工具时的 0 调用会被误算
+				//   · 不要求历史 → 首轮模型判断"不需要工具"被误算（噪音最大的一类）
+				//   · 不要求 0 调用 → 正常调用也进分子
+				// 只抓"对话已建立工具模式却中途放弃"，那是模型能力/遵循度的真实退化。
+				ToolSkipped:     st.toolsDeclared > 0 && st.toolHistory && st.toolCalls == 0,
+				HasCacheTokens:  st.hasCache,
+				CacheHitTokens:  st.cacheHit,
+				CacheMissTokens: st.cacheMiss,
+				ModelRate:       modelRate,
+				LatencyMs:       delta.LatencyMs,
+				HasLatency:      delta.HasLatencyMs,
+				TokensPerSecond: delta.TokensPerSecond,
+				HasTPS:          delta.HasTokensPerSecond,
 			}, delta.HasTotalTokens || delta.HasCompletionTokens || delta.HasPromptTokens)
 		}
 	}
@@ -1568,7 +1603,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 这里在透传前还原成 delta.tool_calls（见 upstream/dsml.go）。
 			// 第二个参数为 true = 名单为空时启用弱判定——tools 声明在链路上丢失是
 			// 实测最常见的泄漏成因，只做严格判定等于对主场景不设防。
-			repair := upstream.NewMarkupRepair(declaredTools, true)
+			repair := upstream.NewMarkupRepair(repairAllowed, repairUnknown)
+			if choiceNone {
+				// none：识别标记但不出调用（见入口处 repairAllowed 注释）。
+				repair = upstream.NewMarkupSuppressor(repairAllowed, repairUnknown)
+			}
 			sErr := upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
 				return h.hintContext(bareModel, reqHasImage)
 			}), upstream.WithErrorFrameObserver(func(payload string) { errFrame = payload }),
@@ -1625,10 +1664,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if hit, miss, ok := stats.CacheTokens(); ok {
 				st.cacheHit, st.cacheMiss, st.hasCache = hit, miss, true
 			}
+			// 🔴 tool_calls 必须在 recordAttempt **之前**算好：recordAttempt 内部的
+			// Usage.Add 会读 st.toolCalls 判「模型是否跳过工具」，放后面会让它恒读到 0
+			//（实测 2026-10-28：三个场景里两个被误判成跳过）。
+			// 计数 = 上游结构化帧里的 + 标记修复还原的。前者由 stats 在读上游流时数
+			//（那时标记还没被还原），漏掉后者会把「修复救回来的调用」误判成 0 调用。
+			st.toolCalls = stats.ToolCalls() + repair.Converted()
 			recordAttempt(acct.UID, stats.Usage(), credit, hasCredit, attemptStarted, stats.TTFB())
 			// WARN 信号放 recordAttempt 之后：st.promptTokens 此时才是本次的观测值。
 			if st.hasCache {
 				cacheMissWarn.noteCacheTokens(bareModel, st.promptTokens, st.cacheHit, st.cacheMiss)
+			}
+			if n := repair.Suppressed(); n > 0 {
+				// 抑制命中：模型本轮想调工具，被 tool_choice=none 挡下（标记已吞）。
+				// 单独立一行，便于区分「模型没想调」与「想调但客户端不让」。
+				log.Printf("INFO: [server] stream acct=%s model=%s: suppressed %d native tool call block(s) by tool_choice=none",
+					logfmt.Label(acct.UID, acct.Nickname), bareModel, n)
 			}
 			if n := repair.Converted(); n > 0 {
 				// 修复命中：上游本来会把工具调用吐成正文标记，这里已还原成 tool_calls。
@@ -1673,7 +1724,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 标记修复（非流式）：把正文里的原生工具调用标记还原成 message.tool_calls。
 		// 只在「没有结构化 tool_calls」且「finish_reason 为 stop」时生效（见 dsml.go）；
 		// 名单为空时走弱判定（tools 声明在中转环节丢失是常态）。
-		mrepair := upstream.RepairAggregatedResponse(resp, declaredTools, true)
+		var mrepair *upstream.MarkupRepair
+		if choiceNone {
+			// none：抑制标记、不产出调用（见入口处 repairAllowed 注释）。
+			mrepair = upstream.SuppressAggregatedMarkup(resp, repairAllowed, repairUnknown)
+		} else {
+			mrepair = upstream.RepairAggregatedResponse(resp, repairAllowed, repairUnknown)
+		}
+		// 非流式响应已被修复层就地改写，直接数 choices[].message.tool_calls 即可
+		// （含标记还原的部分），不需要再叠加 Converted。
+		st.toolCalls = responseToolCallCount(resp)
+		if n := mrepair.Suppressed(); n > 0 {
+			log.Printf("INFO: [server] non-stream model=%s: suppressed %d native tool call block(s) by tool_choice=none",
+				bareModel, n)
+		}
 		if n := mrepair.Converted(); n > 0 {
 			log.Printf("INFO: [server] non-stream model=%s: repaired %d native tool call(s) from assistant text (tool names known=%d)",
 				bareModel, n, len(declaredTools))
