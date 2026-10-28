@@ -9,6 +9,11 @@ let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
 let logPin = true, loginState = null, loginTimer = null;
 let refTimer = null;
+/* 账号行增量更新用的 DOM 索引（uid → { el, sig }）。模块级声明放顶部，避开 TDZ
+   ——renderAccounts 被 go()/轮询调用时，这个区的脚本早已求值完毕。 */
+let accRows = new Map();
+/* 通用折叠的真值源：Map<key, bool>，null 表示还没从 localStorage 载入。 */
+let foldState = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
 let mdFilter = { q: '', realm: '', type: '', cap: '', effort: '', promo: '', sort: 'default' };
 // 会拦成长任务的只有「真绑定租户 / 企业版」这一种（概览接口的 enterprise_session）。
@@ -55,22 +60,72 @@ $('btnTheme').onclick = () => {
 applyTheme();
 
 /* ── 请求 ─────────────────────────────────────────────────────────── */
+/* 两个防护，都是为了「5 秒轮询 + 公网抖动」这个组合：
+   1) 超时。裸 fetch 在链路半死时会挂几分钟，既不报错也不返回，界面就永远停在旧值上，
+      也没有任何提示。但**超时值必须按方法分档**：POST 里有跑完整条行为链的长任务
+      （accounts/{uid}/tasks/auto_all 实测 ~124 秒、批量导入 + onboard 更久），给 POST
+      挂 8 秒会把「还在正常跑」误报成「请求超时」——服务端还在消耗真实对话配额，
+      比不设超时更糟。
+   2) 同路径防重入。上次没回来就跳过本轮（**不排队**）——排队只会让数据更旧，而
+      乱序返回会让旧响应盖掉新响应；seq 只认最新一次。
+   两条都只对 GET 生效：POST 是用户动作或改状态，跳过等于「点了没反应」。 */
+const API_TIMEOUT_MS = 8000;         // GET（轮询）：8 秒不回就当这轮失败，5 秒后再来
+/* 逐账号打上游的 GET 另给一档：packages 是 130 个号 / 服务端并发 3 逐个查上游，
+   十几到几十秒是常态（见 panel.go 的 sem := make(chan struct{}, 3)），8 秒必假阳性。
+   这类慢查询由**调用方**显式 opt-in，比在 api() 里维护路径白名单稳：新接口忘记
+   声明只会退回 8 秒并报错，不会悄悄把长任务截断。 */
+const API_SLOW_GET_TIMEOUT_MS = 60000;
+/* 再上一档：capacity 要重算全池消耗速率 + 预测曲线，线上实测首次调用 8.2 秒（此时 5
+   分钟缓存是空的，而「首次进容量页 / 缓存过期」是稳定会撞上的场景），并发时更慢。
+   给 90 秒留量：超时只该兜「真挂了」，不该兜「正在正常算」。 */
+const API_HEAVY_TIMEOUT_MS = 90000;
+const API_POST_TIMEOUT_MS = 300000;  // POST：5 分钟，覆盖 auto_all(~124s)/批量导入
+let apiSeq = 0;
+const apiLatestSeq = new Map();   // path → 最近一次发出的请求序号
+const apiInflight = new Map();    // path → true（GET 在途标记）
+
 async function api(path, opts = {}) {
+  const method = String(opts.method || 'GET').toUpperCase();
+  const polling = method === 'GET';
+  // 调用方可用 opts.timeoutMs 覆盖（慢 GET 见 API_SLOW_GET_TIMEOUT_MS 的说明）
+  const timeoutMs = Number(opts.timeoutMs) > 0
+    ? Number(opts.timeoutMs)
+    : (polling ? API_TIMEOUT_MS : API_POST_TIMEOUT_MS);
+  if (polling && apiInflight.has(path)) throw new Error('上一次请求仍在进行中，本轮跳过');
   const h = Object.assign({}, opts.headers || {});
   const k = localStorage.getItem(LS_KEY);
   if (k) h['Authorization'] = 'Bearer ' + k;
   if (opts.body) h['Content-Type'] = 'application/json';
-  const r = await fetch('/panel/api/' + path, Object.assign({}, opts, { headers: h }));
-  if (r.status === 401) { openKey(); throw new Error('密钥无效或未填写'); }
-  const d = await r.json().catch(() => ({}));
-  if (!r.ok) {
-    // 带上状态码：409 有两种语义（任务锁冲突 / 新号静默期拦截），只有后者允许
-    // 带 force=1 重试（见 retryForced）。混为一谈会把互斥锁也一起绕过去。
-    const err = new Error(d.error || ('HTTP ' + r.status));
-    err.status = r.status;
-    throw err;
+  const init = Object.assign({}, opts, { headers: h });
+  delete init.timeoutMs;   // 只是给 api() 看的，不能漏进 fetch 的 init
+  const ctl = typeof AbortController === 'function' ? new AbortController() : null;
+  let timer = null;
+  if (ctl) {
+    init.signal = ctl.signal;
+    timer = setTimeout(() => ctl.abort(), timeoutMs);
   }
-  return d;
+  const seq = ++apiSeq;
+  if (polling) { apiLatestSeq.set(path, seq); apiInflight.set(path, true); }
+  try {
+    const r = await fetch('/panel/api/' + path, init);
+    if (polling && apiLatestSeq.get(path) !== seq) throw new Error('响应已过期（有更新的请求）');
+    if (r.status === 401) { openKey(); throw new Error('密钥无效或未填写'); }
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      // 带上状态码：409 有两种语义（任务锁冲突 / 新号静默期拦截），只有后者允许
+      // 带 force=1 重试（见 retryForced）。混为一谈会把互斥锁也一起绕过去。
+      const err = new Error(d.error || ('HTTP ' + r.status));
+      err.status = r.status;
+      throw err;
+    }
+    return d;
+  } catch (e) {
+    if (e && e.name === 'AbortError') throw new Error('请求超时（' + (timeoutMs / 1000) + ' 秒无响应）');
+    throw e;
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (polling) apiInflight.delete(path);
+  }
 }
 // retryForced 新号静默期 409 的显式越权重试：只在用户二次确认后带 ?force=1 重放一次。
 // 判据必须同时满足「409 + 文案含静默期」——任务锁冲突也是 409，重试它等于破坏互斥。
@@ -433,95 +488,194 @@ setTimeout(() => {
 }, 0);
 
 /* ── 账号池 ───────────────────────────────────────────────────────── */
+/* 账号的冷却态：cool 取「账号级 / 熔断 / 连败降权」三种截止里最晚的那个。
+   bucket 是倒计时在**行签名**里的粒度：秒级入签名 = 每轮（5 秒）重建整表，白干；
+   完全不入签名又会让「熔断 · 12分30秒」冻在首次渲染那一刻。按分钟入签名后，只有
+   冷却中的行会重画、且每分钟最多一次（最后一分钟内才按秒，那时确实该一秒一跳）。 */
+function accCool(s) {
+  const rest = s.cool_remaining_sec || 0;
+  const bl = (new Date(s.breaker_until || 0) - Date.now()) / 1000;
+  const dg = (new Date(s.degrade_until || 0) - Date.now()) / 1000;
+  const cool = Math.max(rest, bl > 0 ? bl : 0, dg > 0 ? dg : 0);
+  const kind = cool <= 0 ? ''
+    : bl > Math.max(rest, dg > 0 ? dg : 0) ? '熔断'
+      : (dg > rest ? '连败降权' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却'));
+  const bucket = cool <= 0 ? '' : (cool > 60 ? 'm' + Math.ceil(cool / 60) : 's' + Math.ceil(cool));
+  return { cool, kind, bucket };
+}
+/* 积分条百分比：有总额度按自身 剩余/总额；旧数据无总额 → 退回池内最高=100%。
+   企业版不限量（credits_total=-1）恒满格。 */
+function accCredPct(s, maxCred) {
+  if (s.credits_total === -1) return 100;
+  if (s.credits_total > 0) return Math.min(100, Math.round((s.credits || 0) / s.credits_total * 100));
+  return Math.round((s.credits || 0) / maxCred * 100);
+}
+/* accRowSig 行签名：只收「变了就必须重画这一行」的字段。
+   **绝不含秒级倒计时**——cool_remaining_sec 每轮都在变，放进来等于每轮全表重建。
+   poolMax 也不能直接入签名：它是全池最大值，任何一个号掉分都会把所有行的签名打穿；
+   这里放本行算好的百分比，只有真正影响进度条的行才重画。
+   两处倒计时（账号冷却、模型级限流）只按分钟桶入签名：完全不收又会让「剩余 5分30秒」
+   冻在首次渲染那一刻，那比多画几次更糟。
+   ⚠ 已知限制（**不是 bug，别去「修」**）：「最近成功」用 ago()、「导入」用
+   importedAtText()，都是随墙上时钟变的相对文案，而签名里只有 last_success/imported_at
+   的原值 ⇒ 完全静止的行会停在「5 分钟前」，直到该行别的字段变化才跟着刷新。给时间加
+   桶等于每几分钟全表重画，把增量更新的收益吃回去；而真正会冻的只有「既无流量又不在
+   冷却」的行，那种行运维看的是绝对值。 */
+function accRowSig(s, maxCred) {
+  const c = accCool(s);
+  const tu = s.token_usage || {};
+  const costs = (s.model_costs || []).map(x => x.model + ':' + x.cost_per_1k).join(',');
+  const now = Date.now();
+  const rateSig = (s.rate_limited_models || []).map(r => {
+    const d = parseAPITime(r.until) || parseAPITime(r.reset_at);
+    return r.model + '/' + r.kind + '/' + (r.reason || '') + '/' + (d > now ? Math.ceil((d - now) / 60000) : 0);
+  }).join(',');
+  return [
+    s.disabled ? 1 : 0, s.paused ? 1 : 0,
+    s.credits, s.credits_total, accCredPct(s, maxCred),
+    s.in_flight, s.last_success, s.consecutive_fails, s.success_count, s.err_total,
+    rateSig,
+    remarkOf(s.uid), c.kind, c.bucket,
+    s.nickname, s.realm, s.enterprise, entSession.has(s.uid), s.egress,
+    s.checkin_done, s.imported_at, s.reason, costs,
+    tu.request_count, tu.total_tokens, tu.last_latency_ms, tu.last_tokens_per_second,
+  ].join('\u0001');
+}
+/* 单行 HTML：首次建表与「这一行确实变了」时各走一次。模板与原实现逐字一致。 */
+function accRowHtml(s, maxCred) {
+  const { cool, kind } = accCool(s);
+  let cls = '', tag;
+  if (s.disabled) { cls = 'off'; tag = '<span class="tag bad">已禁用</span>'; }
+  else if (s.paused) { cls = 'off'; tag = '<span class="tag warn">已暂停选号</span>'; }
+  else if (cool > 0) {
+    cls = 'cool';
+    tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
+  } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
+  const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
+  const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now());
+  const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
+  // 企业版不限量：上游 limitNum == -1，网关以 credits_total=-1 透出（见 upstream
+  // enterpriseUnlimitedTotal）。此时剩余额度不参与展示，直接标「不限」。
+  const unlimited = s.credits_total === -1;
+  const cred = unlimited ? '不限'
+    : (s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits)));
+  const pct = accCredPct(s, maxCred);
+  // 成本台账 tooltip（model_costs）：每模型实测单价（≤0 = 实测免费），运维据此
+  // 看「为什么总选它」——免费号垄断 / 单价排序一眼可见。
+  let credTip;
+  if (unlimited) credTip = '企业版不限量（上游 limitNum=-1）';
+  else if (s.credits_total > 0) {
+    credTip = (s.enterprise ? '企业版剩余额度 ' : '剩余 ')
+      + s.credits + ' / ' + (s.enterprise ? '分配 ' : '总额 ') + s.credits_total + '（' + pct + '%）';
+  } else credTip = '积分（相对池内最高）';
+  const costs = (s.model_costs || []).filter(c => c.model);
+  if (costs.length) {
+    credTip += '\n实测单价（credits/1K）：\n' + costs.map(c =>
+      '  ' + c.model + '：' + (c.cost_per_1k <= 0 ? '免费' : c.cost_per_1k)).join('\n');
+  }
+  const frozen = s.disabled || cool > 0;
+  const tu = s.token_usage || {};
+  const req = tu.request_count || 0;
+  const totalTok = formatTokenCount(tu.total_tokens);
+  const totalTokUnit = totalTok === '—' ? '' : '<em>tok</em>';
+  const latency = formatLatency(tu.last_latency_ms);
+  const rate = formatRate(tu.last_tokens_per_second);
+  const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
+  // data-uid 是增量更新的地基：行级 diff 靠它找回同一行，移动/替换时不用重建整表。
+  return '<tr class="' + cls + '" data-uid="' + esc(s.uid) + '" title="uid: ' + esc(s.uid) + '">' +
+    '<td class="mark" aria-hidden="true"><i></i></td>' +
+    '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') +
+      (entSession.has(s.uid) ? ' <span class="realm-tag warn" title="该凭证绑定企业租户/企业版：行为事件被上游静默丢弃（200 不计分），成长任务与签到不会入账，面板会拦截任务动作。修法：在浏览器退出企业空间，以个人身份重新登录后重新导入。">企业会话·不计分</span>' : '') + '</div><div class="id">' + esc(short) + '</div>' + (s.egress ? '<div class="id egress" title="出口 ' + esc(s.egress) + '">出口 ' + esc(s.egress) + '</div>' : '') + '</td>' +
+    '<td>' + tag + note + rateLimits + '</td>' +
+    '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
+    '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
+    '<td class="num">' + (s.in_flight || 0) + '</td>' +
+    '<td class="num usage-cell" title="' + esc(usageTitle) + '"><span class="usage-line" aria-label="' + esc(usageTitle) + '">' +
+      '<span class="usage-item usage-count"><b>' + req + '</b><em>次</em></span>' +
+      '<span class="usage-item usage-total"><b>' + totalTok + '</b>' + totalTokUnit + '</span>' +
+      '<span class="usage-item usage-latency"><b>' + latency + '</b></span>' +
+      '<span class="usage-item usage-rate"><b>' + rate + '</b></span>' +
+    '</span></td>' +
+    '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
+    '<td class="num" style="color:var(--ink-3)" title="' + esc(importedAtTitle(s.imported_at)) + '">' + importedAtText(s.imported_at) + '</td>' +
+    '<td class="acts">' +
+      // 企业版无个人成长体系（签到 400「企业账号不支持该操作」/ 成长任务 403）：
+      // 不渲染「签到」「任务」按钮，只留「额度」——点它走 /balance，企业额度由
+      // upstream 的 get-enterprise-user-usage 口径填充。
+      (s.enterprise ? '' :
+        '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>') +
+      '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>' +
+      (s.enterprise ? '' :
+        '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>') +
+      (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
+              : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
+                          : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="' + (s.enterprise ? '退出选号，但照常保活 / 刷新额度' : '退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额') + '">暂停选号</button>')) +
+      (s.disabled ? '' : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
+      '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
+    '</td></tr>';
+}
+
+/* 账号表的 keyed 增量更新。
+   原来是每 5 秒一次 `innerHTML =` 全量重建 130 行、几千个节点，后果：滚动位置回弹、
+   hover 的 title tooltip 消失、正在看的行跳到别处、选中的文本被清空、主线程卡顿。
+   现在：
+     首次      → 仍然一次性 innerHTML 建全表（比逐行 append 快）；
+     之后      → 行签名相同就一个字节都不写，不同才重建那一行；新 uid 建行，消失的删行；
+     顺序变化  → insertBefore 移动节点（保留节点身份，滚动/选中/tooltip 都不受影响）。
+   行内按钮走 accBody 的事件委托 + data-u，所以重建单行不会丢事件绑定。 */
 function renderAccounts(list) {
   // 按导入时间倒排：刚导进来的号排在最上面，便于确认「刚才那批进去了没有」。
   // 无 imported_at 的旧凭证 parseAPITime=0，自然沉到末尾（顺序稳定）。
   list = list.slice().sort((a, b) => parseAPITime(b.imported_at) - parseAPITime(a.imported_at));
   const tb = $('accBody');
+  if (!tb) return;
   if (!list.length) {
+    accRows.clear();
     tb.innerHTML = '<tr><td colspan="10"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+    applyFolds();
     return;
   }
-  // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
   const maxCred = Math.max(1, ...list.map(s => s.credits || 0));
-  tb.innerHTML = list.map(s => {
-    const bl = (new Date(s.breaker_until || 0) - Date.now()) / 1000;
-    const dg = (new Date(s.degrade_until || 0) - Date.now()) / 1000;
-    const cool = Math.max(s.cool_remaining_sec || 0, bl > 0 ? bl : 0, dg > 0 ? dg : 0);
-    let cls = '', tag;
-    if (s.disabled) { cls = 'off'; tag = '<span class="tag bad">已禁用</span>'; }
-    else if (s.paused) { cls = 'off'; tag = '<span class="tag warn">已暂停选号</span>'; }
-    else if (cool > 0) {
-      cls = 'cool';
-      const kind = bl > Math.max(s.cool_remaining_sec || 0, dg > 0 ? dg : 0) ? '熔断'
-        : (dg > (s.cool_remaining_sec || 0) ? '连败降权' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却'));
-      tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
-    } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
-    const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
-    const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now());
-    const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
-    // 企业版不限量：上游 limitNum == -1，网关以 credits_total=-1 透出（见 upstream
-    // enterpriseUnlimitedTotal）。此时剩余额度不参与展示，直接标「不限」。
-    const unlimited = s.credits_total === -1;
-    const cred = unlimited ? '不限'
-      : (s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits)));
-    const pct = unlimited ? 100
-      : (s.credits_total > 0
-        ? Math.min(100, Math.round((s.credits || 0) / s.credits_total * 100))
-        : Math.round((s.credits || 0) / maxCred * 100));
-    // 成本台账 tooltip（model_costs）：每模型实测单价（≤0 = 实测免费），运维据此
-    // 看「为什么总选它」——免费号垄断 / 单价排序一眼可见。
-    let credTip;
-    if (unlimited) credTip = '企业版不限量（上游 limitNum=-1）';
-    else if (s.credits_total > 0) {
-      credTip = (s.enterprise ? '企业版剩余额度 ' : '剩余 ')
-        + s.credits + ' / ' + (s.enterprise ? '分配 ' : '总额 ') + s.credits_total + '（' + pct + '%）';
-    } else credTip = '积分（相对池内最高）';
-    const costs = (s.model_costs || []).filter(c => c.model);
-    if (costs.length) {
-      credTip += '\n实测单价（credits/1K）：\n' + costs.map(c =>
-        '  ' + c.model + '：' + (c.cost_per_1k <= 0 ? '免费' : c.cost_per_1k)).join('\n');
+  if (!accRows.size) {
+    tb.innerHTML = list.map(s => accRowHtml(s, maxCred)).join('');
+    list.forEach((s, i) => accRows.set(s.uid, { el: tb.children[i], sig: accRowSig(s, maxCred) }));
+    applyFolds();
+    return;
+  }
+  const seen = new Set(list.map(s => s.uid));
+  for (const [uid, row] of accRows) {
+    if (seen.has(uid)) continue;
+    row.el.remove();
+    accRows.delete(uid);
+  }
+  // 一个游标走完新顺序：对得上就不动，对不上就 insertBefore 拽过来（移动保留节点身份）。
+  // 处理过的行总在游标之前，所以游标之后剩下的必然是这轮不该存在的节点。
+  let cursor = tb.firstElementChild;
+  for (const s of list) {
+    let row = accRows.get(s.uid);
+    const atCursor = !!row && row.el === cursor;
+    const sig = accRowSig(s, maxCred);
+    if (!row) {
+      row = { el: trFromHtml(accRowHtml(s, maxCred)), sig };
+      accRows.set(s.uid, row);
+    } else if (row.sig !== sig) {
+      const fresh = trFromHtml(accRowHtml(s, maxCred));
+      row.el.replaceWith(fresh);
+      row.el = fresh;
+      row.sig = sig;
     }
-    const frozen = s.disabled || cool > 0;
-    const tu = s.token_usage || {};
-    const req = tu.request_count || 0;
-    const totalTok = formatTokenCount(tu.total_tokens);
-    const totalTokUnit = totalTok === '—' ? '' : '<em>tok</em>';
-    const latency = formatLatency(tu.last_latency_ms);
-    const rate = formatRate(tu.last_tokens_per_second);
-    const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
-    return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
-      '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') +
-        (entSession.has(s.uid) ? ' <span class="realm-tag warn" title="该凭证绑定企业租户/企业版：行为事件被上游静默丢弃（200 不计分），成长任务与签到不会入账，面板会拦截任务动作。修法：在浏览器退出企业空间，以个人身份重新登录后重新导入。">企业会话·不计分</span>' : '') + '</div><div class="id">' + esc(short) + '</div>' + (s.egress ? '<div class="id egress" title="出口 ' + esc(s.egress) + '">出口 ' + esc(s.egress) + '</div>' : '') + '</td>' +
-      '<td>' + tag + note + rateLimits + '</td>' +
-      '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
-      '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
-      '<td class="num">' + (s.in_flight || 0) + '</td>' +
-      '<td class="num usage-cell" title="' + esc(usageTitle) + '"><span class="usage-line" aria-label="' + esc(usageTitle) + '">' +
-        '<span class="usage-item usage-count"><b>' + req + '</b><em>次</em></span>' +
-        '<span class="usage-item usage-total"><b>' + totalTok + '</b>' + totalTokUnit + '</span>' +
-        '<span class="usage-item usage-latency"><b>' + latency + '</b></span>' +
-        '<span class="usage-item usage-rate"><b>' + rate + '</b></span>' +
-      '</span></td>' +
-      '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
-      '<td class="num" style="color:var(--ink-3)" title="' + esc(importedAtTitle(s.imported_at)) + '">' + importedAtText(s.imported_at) + '</td>' +
-      '<td class="acts">' +
-        // 企业版无个人成长体系（签到 400「企业账号不支持该操作」/ 成长任务 403）：
-        // 不渲染「签到」「任务」按钮，只留「额度」——点它走 /balance，企业额度由
-        // upstream 的 get-enterprise-user-usage 口径填充。
-        (s.enterprise ? '' :
-          '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>') +
-        '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>' +
-        (s.enterprise ? '' :
-          '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>') +
-        (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
-                : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
-                            : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="' + (s.enterprise ? '退出选号，但照常保活 / 刷新额度' : '退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额') + '">暂停选号</button>')) +
-        (s.disabled ? '' : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
-        '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
-      '</td></tr>';
-  }).join('');
+    if (atCursor) cursor = row.el.nextElementSibling;
+    else tb.insertBefore(row.el, cursor);
+  }
+  while (cursor) { const next = cursor.nextElementSibling; cursor.remove(); cursor = next; }
+  applyFolds();
+}
+/* trFromHtml 用 <template> 解析成节点：不执行脚本、不加载资源，也不像写活 DOM 那样
+   让整张表重排重绘。 */
+function trFromHtml(html) {
+  const tpl = document.createElement('template');
+  tpl.innerHTML = html;
+  return tpl.content.firstElementChild;
 }
 
 // renderModelLocks 模型锁池：哪些模型不能用、锁了几个号、还要锁多久。
@@ -3815,7 +3969,7 @@ async function loadPackages(force) {
   $('pkExpiry').innerHTML = '<div class="pk-expiry-empty">查询中…</div>';
   try {
     const [d, c] = await Promise.all([
-      api('packages'),
+      api('packages', { timeoutMs: API_SLOW_GET_TIMEOUT_MS }),   // 逐账号查上游，慢
       api('config').catch(() => null),
     ]);
     lastPackages = d;                            // 缓存供首页到期卡片与排序切换复用
@@ -4054,7 +4208,7 @@ async function loadExpiry(force) {
   if (!$('expList').children.length) $('expList').innerHTML = '<div class="empty">查询中…（逐账号向上游实时查询）</div>';
   $('expNote').textContent = '查询中…';
   try {
-    const d = await api('packages');
+    const d = await api('packages', { timeoutMs: API_SLOW_GET_TIMEOUT_MS });   // 逐账号查上游，慢
     lastPackages = d;                            // 与「积分构成」视图共用同一份缓存
     lastPackagesAt = Date.now();
     renderExpiry(d);
@@ -4137,6 +4291,53 @@ if ($('btnRemarkClose')) $('btnRemarkClose').onclick = closeRemarks;
 if ($('btnRemarkClear')) $('btnRemarkClear').onclick = () => { storeRemarks({}); renderRemarkBody(); };
 if ($('btnRemarkSave')) $('btnRemarkSave').onclick = saveRemarkForm;
 
+/* ══ 通用折叠引擎 ═════════════════════════════════════════════════════════
+   声明式接线：按钮写 data-fold="key"，容器写 data-fold-body="key"，键名对上即生效。
+   真值源是内存里的 foldState（Map），localStorage 只是持久化副本 —— 渲染路径
+   （每 5 秒的 applyFolds 重放）不能有 IO，两边只在用户点击时同步。
+   ⚠ 折叠容器与组头必须是**静态 HTML**：由 innerHTML 生成的容器会被下一轮重绘
+   整个抹掉，展开态随之丢失。renderAccounts 末尾统一调 applyFolds() 重放，
+   重建行之后仍在的折叠区会恢复成用户上次的选择。
+   按钮契约与首页「积分到期提醒」保持一致：aria-expanded + 文案「收起 / 展开」。 */
+const FOLD_LS = 'wb2api.folds.v1';
+function foldAll() {
+  if (foldState) return foldState;
+  foldState = new Map();
+  try {
+    const raw = JSON.parse(localStorage.getItem(FOLD_LS) || '{}');
+    if (raw && typeof raw === 'object') Object.keys(raw).forEach(k => foldState.set(k, raw[k] === true));
+  } catch (e) {}
+  return foldState;
+}
+function foldSet(key, folded) {
+  foldAll().set(key, !!folded);
+  const o = {};
+  foldState.forEach((v, k) => { o[k] = v; });
+  try { localStorage.setItem(FOLD_LS, JSON.stringify(o)); } catch (e) {}
+  applyFolds();
+}
+function applyFolds() {
+  const st = foldAll();
+  const bodies = new Map();
+  document.querySelectorAll('[data-fold-body]').forEach(el => bodies.set(el.getAttribute('data-fold-body'), el));
+  document.querySelectorAll('[data-fold]').forEach(btn => {
+    const key = btn.getAttribute('data-fold');
+    const folded = st.get(key) === true;
+    const body = bodies.get(key);
+    if (body) body.hidden = folded;
+    btn.textContent = folded ? '展开' : '收起';
+    btn.setAttribute('aria-expanded', folded ? 'false' : 'true');
+  });
+}
+document.addEventListener('click', ev => {
+  const btn = ev.target && ev.target.closest ? ev.target.closest('[data-fold]') : null;
+  if (!btn) return;
+  ev.preventDefault();
+  const key = btn.getAttribute('data-fold');
+  foldSet(key, foldAll().get(key) !== true);
+});
+applyFolds();
+
 /* ══ 首页「积分到期提醒」折叠（选择记在本机，默认展开）═════════════════════
    展开态是原行为：点「检查」就要能立刻看到结果，所以默认不折叠；用户收起一次后
    由 localStorage 记住。折叠只作用于列表容器，卡片标题与「检查」按钮始终可见。 */
@@ -4176,7 +4377,9 @@ async function loadCapacity(force = false) {
   try {
     const q = new URLSearchParams({ days: $('capDays').value, hours: $('capHours').value });
     if (force) q.set('refresh', '1');
-    const d = await api('capacity?' + q.toString());
+    // 缓存未命中时会真的重算全池（实测 8.2s），必须挂重档超时；force 的 refresh=1
+    // 走的是同一条调用，所以一处覆盖两种入口。
+    const d = await api('capacity?' + q.toString(), { timeoutMs: API_HEAVY_TIMEOUT_MS });
     if (seq !== capacityRequestSeq) return; // 旧响应不得覆盖较新的筛选条件。
     capacityData = d;
     renderCapacity(d);
