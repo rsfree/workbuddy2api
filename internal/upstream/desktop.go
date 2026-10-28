@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 )
 
 const (
@@ -46,11 +47,23 @@ const (
 // desktopBase 桌面端 /v2/report 与 user-asset 走 chatBase（copilot.tencent.com）。
 func (c *Client) desktopBase(a *auth.Auth) string { return c.chatBase(a) }
 
-// deriveID 由 uid 稳定派生一个 36 位 hex 设备标识（machineId/qimei36 复用），
-// 幂等：同一账号每次生成相同值，模拟固定设备。
-func deriveID(a *auth.Auth, salt string) string {
+// deriveUUID 由 uid + salt 稳定派生一个 **UUIDv4 形状**的设备标识。
+//
+// 形态对齐真机（5.8.4 抓包）：官方 Desktop 的 machineId / sessionId 都是带连字符
+// 的 UUID（8-4-4-4-12），版本位 4、变体位 8/9/a/b。此前这里输出的是 36 位
+// **无连字符** hex——长度像 qimei、形状既不是 UUID 也不是 qimei，本身就是一条
+// 「网关特征」（同批修正里 X-Request-ID 也从「派生前缀+微秒」改成 32 hex 随机）。
+//
+// 取值必须按账号派生：官方是「一个进程 = 一台设备」，而网关一个长驻进程要冒充
+// 几十台设备；照进程维度取一次会让所有账号共用同一个 machineId，反而把它们
+// 关联到同一台机器上。派生保证同一账号恒定、账号之间互不相同。
+func deriveUUID(a *auth.Auth, salt string) string {
 	sum := sha256.Sum256([]byte(salt + ":" + a.UID))
-	return hex.EncodeToString(sum[:18]) // 36 hex chars
+	b := []byte(hex.EncodeToString(sum[:16])) // 32 hex
+	b[12] = '4'                               // version 4
+	b[16] = "89ab"[sum[8]&0x03]               // RFC 4122 variant
+	h := string(b)
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
 }
 
 // DesktopEvent 桌面端事件：业务字段任意（map），公共指纹由 ReportDesktopEvent 注入。
@@ -71,8 +84,8 @@ func desktopFingerprint(a *auth.Auth) map[string]any {
 		"ideName":      "WorkBuddy",
 		"ideType":      "WorkBuddy",
 		"ideVersion":   "5.5.6",
-		"machineId":    deriveID(a, "machine"),
-		"sessionId":    deriveID(a, "session"),
+		"machineId":    deriveUUID(a, "machine"),
+		"sessionId":    deriveUUID(a, "session"),
 		"extName":      "workbuddy-desktop",
 		"extVersion":   "5.5.6",
 		"os":           "win32",
@@ -118,7 +131,9 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	req.Header.Set("User-Agent", desktopUA)
 	req.Header.Set("X-Domain", c.desktopBase(a))
 	req.Header.Set("X-Product", "SaaS")
-	req.Header.Set("X-Request-ID", deriveID(a, "req")+fmt.Sprintf("%d", time.Now().UnixNano()%1e6))
+	// 32 位无连字符 hex、每条随机（真客户端的请求 id 与账号无关）。
+	// 旧的「派生前缀 + 微秒」是一条稳定可识别的网关特征。
+	req.Header.Set("X-Request-ID", session.NewMessageID())
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
@@ -269,7 +284,7 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 		"eventCode": eventCode, "timestamp": time.Now().UnixMilli(), "reportDelay": 0,
 		"pageURL": pageURL, "elementId": elementID, "elementName": elementName,
 		"os": "Win32", "arch": "", "osVersion": "10.0", "userAgent": ua,
-		"machineId": deriveID(a, "webmachine"), "userId": a.UID,
+		"machineId": deriveUUID(a, "webmachine"), "userId": a.UID,
 		"userNickname": a.Nickname, "enterpriseId": a.EnterpriseID,
 	}
 	raw, err := json.Marshal([]map[string]any{ev})
@@ -459,7 +474,7 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	h.Set("X-Product", "SaaS")
 	h.Set("X-User-Id", a.UID)
 	h.Set("X-Conversation-ID", conversationID)
-	h.Set("X-Request-ID", fmt.Sprintf("%d", time.Now().UnixNano()))
+	h.Set("X-Request-ID", session.NewMessageID())
 	h.Set("X-Agent-Intent", "craft")
 	h.Set("X-Agent-Type", "main")
 	h.Set("X-IDE-Name", "WorkBuddy")
