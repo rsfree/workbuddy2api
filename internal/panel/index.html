@@ -926,12 +926,32 @@ input:focus, select:focus, textarea:focus { box-shadow: 0 0 0 3px var(--accent-s
    复选框随之隐藏，正是想要的（批量勾选是桌面操作）。 */
 .acc .mark { width: 26px; min-width: 26px; padding: 0; position: relative; }
 .acc .mark i { position: absolute; left: 0; top: 0; bottom: 0; width: 3px; min-height: 0; }
+/* 复选框自绘：原生控件在深色底上是一块纯黑方块，边框几乎看不见（实测线上）。
+   appearance:none 后自己画框与勾，明暗两套色都从 token 取，勾用 10px SVG 背景图
+   （不用 ::after——appearance:none 的 input 是替换元素，伪元素支持不可靠）。 */
+.acc .row-chk, .acc th.c-chk input {
+  appearance: none; -webkit-appearance: none;
+  width: 13px; height: 13px; margin: 0; cursor: pointer;
+  border: 1.5px solid var(--line); border-radius: 4px;
+  background: var(--surface-2);
+  transition: background var(--dur-1) ease, border-color var(--dur-1) ease, transform var(--dur-1) var(--spring-snap);
+}
+.acc .row-chk:hover, .acc th.c-chk input:hover { border-color: var(--ink-3); }
+.acc .row-chk:active, .acc th.c-chk input:active { transform: scale(.9); }
+.acc .row-chk:checked, .acc th.c-chk input:checked {
+  background: var(--accent) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.6 6.3l2.3 2.3L9.4 3.9' fill='none' stroke='%23fff' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center / 10px 10px no-repeat;
+  border-color: var(--accent);
+}
+.acc .row-chk:indeterminate, .acc th.c-chk input:indeterminate {
+  background: var(--accent) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M3 6h6' fill='none' stroke='%23fff' stroke-width='1.7' stroke-linecap='round'/%3E%3C/svg%3E") center / 10px 10px no-repeat;
+  border-color: var(--accent);
+}
 .acc .mark .row-chk {
   position: absolute; left: 9px; top: 50%; transform: translateY(-50%);
-  width: 13px; height: 13px; margin: 0; cursor: pointer;
 }
-.acc th.c-chk { width: 26px; min-width: 26px; padding-left: 9px; padding-right: 0; }
-.acc th.c-chk input { width: 13px; height: 13px; cursor: pointer; display: block; }
+.acc .mark .row-chk:active { transform: translateY(-50%) scale(.9); }
+.acc th.c-chk { width: 26px; min-width: 26px; padding: 0 0 0 9px; }
+.acc th.c-chk input { display: block; }
 .acc tbody tr.sel { background: var(--accent-soft); box-shadow: inset 3px 0 var(--accent); }
 .acc tbody tr.sel:hover { background: color-mix(in srgb, var(--accent) 16%, transparent); }
 
