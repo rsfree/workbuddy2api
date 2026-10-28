@@ -189,8 +189,10 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 |---|---|
 | **内容净化** | `tool_calls.arguments` 盲区修复（`content=null` 的工具调用轮此前完全漏净化）、裸 `11128` 反探测改写、桌面版身份句（逗号形态）漏网修复、反馈句整句改写 |
 | **出站头族** | UA 对齐官方三段式 `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<ver>`（默认 5.5.4/2.137.1，可配）；`X-IDE-*` 用量归属四头 + `X-Agent-Purpose`（`client_name` 配 `WorkBuddy` 即对齐官方桌面端）；`X-Device-Token` 设备风控头（auth 每号 / config / 文件三源）；`X-IDE-Version` 补齐 |
+| **设备指纹形态** | `machineId` / `sessionId` 按账号派生**带连字符的 UUIDv4**（8-4-4-4-12，版本位 4、变体位 8/9/a/b），同号恒定、跨号互不关联；`X-Request-ID` 为 32 位随机 hex（与账号无关）。此前是 36 位无连字符 hex 与「派生前缀+微秒」串——取值再稳，形状本身就是网关特征 |
+| **流式保活** | 三条流式路径（chat / Responses / Anthropic）在上游静默 15s 后向客户端补心跳：chat 与 Responses 发 SSE 注释 `: keepalive`，Anthropic 发官方 `event: ping`；心跳与业务帧共用一把写锁（不会把一帧劈成两半），流结束即停。没有它，上游长思考时先断的是客户端（空闲阈值 60–120s），而那一轮额度已经烧掉 |
 | **并发安全** | 客户端 IP 按请求参数传递（消除共享字段竞态）；billing 单段 UA 形态 |
-| **签到幂等** | `IsAlreadyCheckin` 识别「今天已签到」（`code=10001/14001`），调度日志不再把重复签到当失败 |
+| **签到回执四态** | `checked / already / pending / failed` 分类（`internal/upstream/checkin.go`），**只有前两态写 `lastCheckinDay`**。裸子串 "已签到" 会把「签到失败，已签到天数不足 7 天」读成幂等成功、当天不再重试、面板还显示已签；`code=0` 的成功信封里挂着失败文案同样归 `failed`。`pending`（上游「请勿重复操作」）留待下一轮重试 |
 | **粘性按模型判活** | 会话绑定的账号被 6004 模型级限额后，换模型请求自动解绑重分配（治「限额后换不动号」）；`/healthz` 探活计入模型豁免形态（治「全号被单模型限流探活误报 503」） |
 | **活动上报** | `ReportChatActivity` 支持独立 `requestID`（同会话多轮上报各条可区分） |
 
