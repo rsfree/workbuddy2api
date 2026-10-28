@@ -18,6 +18,50 @@ let accRows = new Map();
    异常号排查时会反复进这个页面，每次都要重新点一遍筛选是纯摩擦。 */
 let accFilter = 'all';
 try { accFilter = localStorage.getItem(LS_ACC_FILTER) || 'all'; } catch (e) {}
+
+/* 账号池视图状态（搜索 / 状态筛选 / 标签筛选 / 排序 / 分页）。
+   全部是**内存运算**：数据源仍是 overview 的 5 秒快照，筛选与翻页只重渲染表格，
+   不触发任何 api() 调用，也不改轮询节奏——这是「不影响 api 调用性能」的硬约束。
+   标签只写 localStorage（wb2api.acctags.v1），不进凭证文件、不上传。 */
+const LS_ACC_TAGS = 'wb2api.acctags.v1';
+const LS_ACC_VIEW = 'wb2api.accview.v1';
+const ACC_STATUS = ['all', 'issue', 'ok', 'cool', 'paused', 'off', 'ent', 'global'];
+const ACC_STATUS_LABEL = {
+  all: '全部', issue: '需处理', ok: '可用', cool: '冷却',
+  paused: '暂停', off: '禁用', ent: '企业版', global: '国际版',
+};
+/* 排序表：每个比较器都以「导入时间倒序」做二级键，保证同值时顺序稳定
+   （不稳定排序会让表格每 5 秒抖一次，运维以为数据在变）。 */
+const ACC_SORTS = {
+  default: (a, b) => (accRank(a) - accRank(b)) || (parseAPITime(b.imported_at) || 0) - (parseAPITime(a.imported_at) || 0),
+  credits_desc: (a, b) => ((b.credits || 0) - (a.credits || 0)) || (parseAPITime(b.imported_at) || 0) - (parseAPITime(a.imported_at) || 0),
+  credits_asc: (a, b) => ((a.credits || 0) - (b.credits || 0)) || (parseAPITime(b.imported_at) || 0) - (parseAPITime(a.imported_at) || 0),
+  fails_desc: (a, b) => ((b.err_total || 0) - (a.err_total || 0)) || (parseAPITime(b.imported_at) || 0) - (parseAPITime(a.imported_at) || 0),
+  success_desc: (a, b) => ((b.success_count || 0) - (a.success_count || 0)) || (parseAPITime(b.imported_at) || 0) - (parseAPITime(a.imported_at) || 0),
+  last_success: (a, b) => (parseAPITime(b.last_success) || 0) - (parseAPITime(a.last_success) || 0),
+  imported: (a, b) => (parseAPITime(b.imported_at) || 0) - (parseAPITime(a.imported_at) || 0),
+  name: (a, b) => String(a.nickname || a.uid).localeCompare(String(b.nickname || b.uid), 'zh-CN'),
+};
+
+let accTags = {};
+try { accTags = JSON.parse(localStorage.getItem(LS_ACC_TAGS) || '{}') || {}; } catch (e) { accTags = {}; }
+if (!accTags || typeof accTags !== 'object' || Array.isArray(accTags)) accTags = {};
+
+let accView = { q: '', status: 'all', tags: [], sort: 'default', size: 50, page: 1 };
+try {
+  const v = JSON.parse(localStorage.getItem(LS_ACC_VIEW) || '{}') || {};
+  if (typeof v.q === 'string') accView.q = v.q;
+  if (ACC_STATUS.indexOf(v.status) >= 0) accView.status = v.status;
+  if (Array.isArray(v.tags)) accView.tags = v.tags.filter(x => typeof x === 'string');
+  if (typeof v.sort === 'string' && ACC_SORTS[v.sort]) accView.sort = v.sort;
+  // 分页大小只认白名单：localStorage 被手改成 1 会让表格变成一页一行。
+  if ([0, 20, 50, 100, 200].indexOf(Number(v.size)) >= 0) accView.size = Number(v.size);
+} catch (e) {}
+
+/* 选中集合只存 uid：切筛选、翻页都不清空，批量操作才能跨页累积。 */
+let accSel = new Set();
+let tagEditingUid = null;
+let tagDraft = [];
 /* 通用折叠的真值源：Map<key, bool>，null 表示还没从 localStorage 载入。 */
 let foldState = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
@@ -545,6 +589,9 @@ function accRowSig(s, maxCred) {
     s.nickname, s.realm, s.enterprise, entSession.has(s.uid), s.egress,
     s.checkin_done, s.imported_at, s.reason, costs,
     tu.request_count, tu.total_tokens, tu.last_latency_ms, tu.last_tokens_per_second,
+    // 标签与选中态必须进签名：它们决定行内色点与 .sel 底色，
+    // 不进签名就会出现「标签存进去了但那一行没变」。
+    tagsOf(s.uid).join('+'), accSel.has(s.uid) ? 1 : 0,
   ].join('\u0001');
 }
 /* 单行 HTML：首次建表与「这一行确实变了」时各走一次。模板与原实现逐字一致。 */
@@ -590,10 +637,18 @@ function accRowHtml(s, maxCred) {
   // data-uid 是增量更新的地基：行级 diff 靠它找回同一行，移动/替换时不用重建整表。
   // 出口串并进 title：密集态里 .id.egress 不占列宽（第三个 inline-block 必折行），
   // 但信息不能丢——悬停整行即可看到。
+  const tl = tagsOf(s.uid);
+  // 标签用 6px 色点而不是文字：密集态的 .nm 宽度是「昵称 + uid」算死的，
+  // 塞进标签文字必折行，行高会从 38px 弹回去。完整标签在 title 里。
+  const tagDot = tl.length ? '<i class="acc-tagdot" title="标签：' + esc(tl.join('、')) + '"></i>' : '';
+  if (accSel.has(s.uid)) cls += ' sel';
   return '<tr class="' + cls + '" data-uid="' + esc(s.uid) + '" title="uid: ' + esc(s.uid) +
-    (s.egress ? ' · 出口: ' + esc(s.egress) : '') + '">' +
-    '<td class="mark" aria-hidden="true"><i></i></td>' +
-    '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') +
+    (s.egress ? ' · 出口: ' + esc(s.egress) : '') + (tl.length ? ' · 标签: ' + esc(tl.join('、')) : '') +
+    ' · 双击可编辑标签">' +
+    // 色条与复选框同一列：列数恒为 10，mobile.css 的 nth-child 映射才不会错位。
+    '<td class="mark"><i aria-hidden="true"></i><input type="checkbox" class="row-chk" data-chk="' +
+      esc(s.uid) + '"' + (accSel.has(s.uid) ? ' checked' : '') + ' aria-label="选择该账号"></td>' +
+    '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + tagDot + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') +
       (entSession.has(s.uid) ? ' <span class="realm-tag warn" title="该凭证绑定企业租户/企业版：行为事件被上游静默丢弃（200 不计分），成长任务与签到不会入账，面板会拦截任务动作。修法：在浏览器退出企业空间，以个人身份重新登录后重新导入。">企业会话·不计分</span>' : '') + '</div><div class="id">' + esc(short) + '</div>' + (s.egress ? '<div class="id egress" title="出口 ' + esc(s.egress) + '">出口 ' + esc(s.egress) + '</div>' : '') + '</td>' +
     '<td>' + tag + note + rateLimits + '</td>' +
     '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
@@ -638,9 +693,9 @@ function accRank(s) {
 /* 当前筛选是否命中。口径必须与 accRank / 汇总条一致，否则「条上数了 3 个冷却、
    点进去只有 2 行」这种自相矛盾会立刻被运维当成 bug。 */
 function accMatchFilter(s) {
-  if (accFilter === 'off') return !!s.disabled;
-  if (accFilter === 'cool') return !s.disabled && accCool(s).cool > 0;
-  return true;
+  // 兼容旧调用点（异常汇总条）：真正的筛选口径统一在 accMatches 里，
+  // 两处各写一份必然漂移——「条上数了 3 个冷却、点进去只有 2 行」就是这么来的。
+  return accMatches(s);
 }
 /* 异常组 / 正常组的分界哨兵。它带 data-uid 且纳入 accRows 托管——这是硬要求：
    renderAccounts 收尾那句 `while (cursor) remove()` 会把所有非 accRows 管理的节点
@@ -669,30 +724,48 @@ function renderAccounts(list) {
   // 运维会把「筛到只剩低分号时显示满格」误读成「额度很健康」。
   // 顺带一个好处：切筛选时行的 pct 不变，签名也就不会整批失效。
   const maxCred = Math.max(1, ...all.map(s => s.credits || 0));
-  const shown = accFilter === 'all' ? all.slice() : all.filter(accMatchFilter);
-  if (!shown.length) {
+  // ① 过滤 → ② 排序 → ③ 分页，全在内存里完成（数据源仍是 overview 快照）。
+  // 顺序不能换：先分页再排序会让「第 2 页」的含义随排序变，翻页时内容乱跳。
+  const shown = all.filter(accMatches);
+  const ranked = accSortList(shown);
+  const total = ranked.length;
+  const size = accView.size > 0 ? accView.size : Math.max(1, total);
+  const pages = Math.max(1, Math.ceil(total / size));
+  // 页码夹紧：筛选后总数变少时，原来停在第 5 页会看到空表（最容易被当成 bug）。
+  if (accView.page > pages) accView.page = pages;
+  if (accView.page < 1) accView.page = 1;
+  const start = (accView.page - 1) * size;
+  const pageRows = ranked.slice(start, start + size);
+
+  // 工具栏与分页器每次都刷（计数随快照变），内部用 dataset.sig 比对，没变就不写 DOM。
+  renderAccStatusChips(all);
+  renderAccTagChips();
+  renderAccPager(total, pages, start, pageRows.length);
+  syncAccChkAll(pageRows);
+  renderBulkBar();
+
+  if (!pageRows.length) {
     accRows.clear();
     // 两种空态要分开：「池子空」和「筛选没命中」的下一步动作完全不同。
     tb.innerHTML = all.length
-      ? '<tr><td colspan="10"><div class="empty"><div class="big">没有符合「需处理」的账号</div>' +
-        '当前只看' + (accFilter === 'off' ? '已禁用' : '冷却中') + '的号，' +
-        '<button class="xs ghost" data-filter="all">显示全部</button></div></td></tr>'
+      ? '<tr><td colspan="10"><div class="empty"><div class="big">没有匹配的账号</div>' +
+        esc(accFilterHint()) + '，' +
+        '<button class="xs ghost" data-filter="all">清除全部筛选</button></div></td></tr>'
       : '<tr><td colspan="10"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
     applyFolds();
     return;
   }
-  // 排序：异常组在前（已禁用 → 冷却中），组内按导入时间倒排；无 imported_at 的旧凭证
-  // parseAPITime=0，自然沉到组末尾（顺序稳定）。
-  const ranked = shown.map(s => ({ s, r: accRank(s), t: parseAPITime(s.imported_at) }));
-  ranked.sort((a, b) => (a.r - b.r) || (b.t - a.t));
-  const abnN = ranked.reduce((n, x) => n + (x.r < 2 ? 1 : 0), 0);
-  // 分界行只在「不筛选 + 两组都非空」时出现：筛选态下只显示一类号，插入分界毫无意义。
-  const sepN = (accFilter === 'all' && abnN > 0 && abnN < ranked.length) ? ranked.length - abnN : 0;
+  // 分界哨兵只在「默认排序 + 未筛选 + 单页」时出现：分页后插入分界会随页码漂移，
+  // 反而制造「上一页末尾也有个分界」的错觉。异常汇总条始终在，信息不会丢。
+  const abnN = ranked.reduce((n, x) => n + (accRank(x) < 2 ? 1 : 0), 0);
+  const sepN = (accView.sort === 'default' && accView.status === 'all' && !accView.q &&
+                !accView.tags.length && size >= total && abnN > 0 && abnN < ranked.length)
+    ? ranked.length - abnN : 0;
   // items 是本轮期望的完整行序（账号行 + 可能的哨兵）。html 走惰性求值：
   // 签名没变的行连字符串都不拼，这是增量更新省下来的主要成本。
   const items = [];
-  ranked.forEach((x, i) => {
-    items.push({ key: x.s.uid, sig: accRowSig(x.s, maxCred), html: () => accRowHtml(x.s, maxCred) });
+  pageRows.forEach((s, i) => {
+    items.push({ key: s.uid, sig: accRowSig(s, maxCred), html: () => accRowHtml(s, maxCred) });
     if (sepN && i === abnN - 1) {
       items.push({ key: ACC_SEP_KEY, sig: ACC_SEP_KEY + ':' + sepN, html: () => accSepHtml(sepN) });
     }
@@ -779,10 +852,22 @@ function renderAlertBar(accounts) {
    只能刷新页面（汇总条本身在筛选态下仍然显示，不构成 issue #137 那种死锁）。 */
 function setAccFilter(f) {
   accFilter = (f === 'cool' || f === 'off') ? f : 'all';
+  accView.status = accFilter;
+  // 'all' 语义是「清除全部筛选」：搜索词和标签一起清，否则点了「显示全部」
+  // 还留着搜索词，屏幕上依然只有几行——那是最容易被当成 bug 的交互。
+  if (f === 'all') {
+    accView.q = '';
+    accView.tags = [];
+    if ($('accQ')) $('accQ').value = '';
+    syncAccSearchCls();
+  }
+  accView.page = 1;
+  saveAccView();
   try { localStorage.setItem(LS_ACC_FILTER, accFilter); } catch (e) {}
   const accounts = (overviewData && overviewData.accounts) || [];
   renderAccounts(accounts);
   renderAlertBar(accounts);
+  syncAccControls();
 }
 if ($('alertChips')) {
   $('alertChips').addEventListener('click', ev => {
@@ -4628,7 +4713,12 @@ const GROW_AUTO_KEY = 'wb2api.growAutoAt';
 const GROW_AUTO_GAP_MS = 30 * 60 * 1000;   // 同一个会话里半小时内不重复自动拉
 let growFetching = false;
 
-function growFolded() { return localStorage.getItem(LS_GROW_FOLD) === '1'; }
+function growFolded() {
+  // 默认**收起**：账号池是主视图，这张卡展开时空态要占 120px，把表格推到首屏外。
+  // 用户展开过一次后按 localStorage 记住（没存过 → 收起）。
+  const v = localStorage.getItem(LS_GROW_FOLD);
+  return v === null ? true : v === '1';
+}
 function applyGrowFold() {
   const pad = $('growPad'), btn = $('btnGrowFold');
   if (!pad || !btn) return;
@@ -4691,7 +4781,375 @@ if ($('btnGrowFold')) {
 applyGrowFold();
 // 进页面自动拉一次：延迟 3 秒让首屏先渲染，避免和 overview 抢带宽。
 setTimeout(() => {
+  // 收起状态不自动拉：拉起 60 个号 = 120 次上游请求，用户根本没在看这张卡时不该花。
+  if (growFolded()) return;
   let seen = 0;
   try { seen = Number(sessionStorage.getItem(GROW_AUTO_KEY) || 0); } catch (e) {}
   if (Date.now() - seen > GROW_AUTO_GAP_MS) loadGrowthAssets();
 }, 3000);
+
+
+/* ══ 账号池：筛选 / 排序 / 分页 / 标签 ═══════════════════════════════════
+   设计约束（用户明确要求「不影响 api 调用性能」）：
+     · 数据源只有 overview 的 5 秒快照，这里一行网络请求都没有；
+     · 过滤/排序/分页是纯数组运算，225 个号一轮 < 1ms；
+     · 标签写 localStorage，与凭证、后端状态完全解耦。
+
+   口径纪律：状态判定统一走 accCool / accRank，不再另写一份，
+   否则「汇总条说有 3 个冷却、表里只有 2 行」这种自相矛盾立刻会被当成 bug。 */
+
+/* 单账号是否命中当前筛选（状态 + 标签 + 搜索）。 */
+function accMatches(s) {
+  const cool = accCool(s).cool;
+  switch (accView.status) {
+    case 'issue': if (!(s.disabled || cool > 0)) return false; break;
+    case 'ok': if (s.disabled || s.paused || cool > 0) return false; break;
+    case 'cool': if (s.disabled || !(cool > 0)) return false; break;
+    case 'paused': if (!s.paused) return false; break;
+    case 'off': if (!s.disabled) return false; break;
+    case 'ent': if (!s.enterprise) return false; break;
+    case 'global': if (s.realm !== 'global') return false; break;
+    default: break;
+  }
+  if (accView.tags.length) {
+    const t = tagsOf(s.uid);
+    // 多个标签之间是「或」：选了「主力」+「备用」应该看到两拨号，不是交集。
+    if (!accView.tags.some(x => t.indexOf(x) >= 0)) return false;
+  }
+  if (accView.q) {
+    const q = accView.q.toLowerCase();
+    const hay = ((s.nickname || '') + ' ' + s.uid + ' ' + (remarkOf(s.uid) || '') + ' ' +
+      tagsOf(s.uid).join(' ')).toLowerCase();
+    if (hay.indexOf(q) < 0) return false;
+  }
+  return true;
+}
+
+function accSortList(list) {
+  const f = ACC_SORTS[accView.sort] || ACC_SORTS.default;
+  return list.slice().sort(f);
+}
+
+function accFilterHint() {
+  const parts = [];
+  if (accView.status !== 'all') parts.push('状态=' + (ACC_STATUS_LABEL[accView.status] || accView.status));
+  if (accView.tags.length) parts.push('标签=' + accView.tags.join('/'));
+  if (accView.q) parts.push('搜索「' + accView.q + '」');
+  return parts.length ? ('当前筛选：' + parts.join(' · ')) : '当前没有筛选条件';
+}
+
+function saveAccView() {
+  try {
+    localStorage.setItem(LS_ACC_VIEW, JSON.stringify({
+      q: accView.q, status: accView.status, tags: accView.tags,
+      sort: accView.sort, size: accView.size,
+    }));
+  } catch (e) {}
+}
+function saveAccTags() { try { localStorage.setItem(LS_ACC_TAGS, JSON.stringify(accTags)); } catch (e) {} }
+function tagsOf(uid) { return (accTags[uid] || []).slice(); }
+function setAccTags(uid, list) {
+  // 去重 + 去空 + 上限 6：标签是「分类」不是「备注」，多了反而没法筛。
+  const v = Array.from(new Set((list || []).map(x => String(x).trim()).filter(Boolean))).slice(0, 6);
+  if (v.length) accTags[uid] = v; else delete accTags[uid];
+  saveAccTags();
+}
+/* 全部标签及使用次数，按次数倒序（最常用的排最前，打标签时一眼可选）。 */
+function allAccTags() {
+  const m = {};
+  Object.keys(accTags).forEach(uid => {
+    (accTags[uid] || []).forEach(t => { m[t] = (m[t] || 0) + 1; });
+  });
+  return Object.keys(m).map(t => [t, m[t]]).sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0], 'zh-CN'));
+}
+
+function syncAccSearchCls() {
+  const box = $('accSearch');
+  if (box) box.classList.toggle('has-q', !!accView.q);
+}
+/* 把状态写回控件（初始化、点击 chip、清除筛选后都要同步，否则控件显示与实际不符）。 */
+function syncAccControls() {
+  if ($('accQ')) $('accQ').value = accView.q;
+  if ($('accSort')) $('accSort').value = accView.sort;
+  if ($('accSize')) $('accSize').value = String(accView.size);
+  syncAccSearchCls();
+}
+
+function renderAccStatusChips(all) {
+  const box = $('accStatusChips');
+  if (!box) return;
+  const cnt = { all: all.length, issue: 0, ok: 0, cool: 0, paused: 0, off: 0, ent: 0, global: 0 };
+  all.forEach(s => {
+    const cool = accCool(s).cool;
+    // 计数口径与行内状态标签一致：已禁用优先（禁用的号即使还在冷却也只算禁用）。
+    if (s.disabled) cnt.off++;
+    else if (s.paused) cnt.paused++;
+    else if (cool > 0) cnt.cool++;
+    else cnt.ok++;
+    if (s.disabled || cool > 0) cnt.issue++;
+    if (s.enterprise) cnt.ent++;
+    if (s.realm === 'global') cnt.global++;
+  });
+  const html = ACC_STATUS.filter(k => k === 'all' || cnt[k] > 0).map(k =>
+    '<button type="button" class="xs chip' + (accView.status === k ? ' on' : '') +
+    '" data-st="' + k + '">' + ACC_STATUS_LABEL[k] +
+    (k === 'all' ? '' : '<span class="n">' + cnt[k] + '</span>') + '</button>').join('');
+  if (box.dataset.sig !== html) { box.innerHTML = html; box.dataset.sig = html; }
+}
+
+function renderAccTagChips() {
+  const row = $('accTagRow'), box = $('accTagChips');
+  if (!row || !box) return;
+  const list = allAccTags();
+  row.hidden = !list.length;
+  if (!list.length) { box.innerHTML = ''; box.dataset.sig = ''; return; }
+  const html = list.map(([t, n]) =>
+    '<button type="button" class="xs chip' + (accView.tags.indexOf(t) >= 0 ? ' on' : '') +
+    '" data-tag="' + esc(t) + '">' + esc(t) + '<span class="n">' + n + '</span></button>').join('');
+  if (box.dataset.sig !== html) { box.innerHTML = html; box.dataset.sig = html; }
+}
+
+function renderAccPager(total, pages, start, n) {
+  const info = $('accPageInfo'), num = $('accPageNum');
+  const prev = $('accPrev'), next = $('accNext');
+  if (!info) return;
+  info.textContent = total
+    ? ('第 ' + (start + 1) + '–' + (start + n) + ' 条 · 共 ' + total + ' 个号')
+    : '没有匹配的账号';
+  if (num) num.textContent = pages > 1 ? (accView.page + ' / ' + pages) : '';
+  if (prev) prev.disabled = accView.page <= 1;
+  if (next) next.disabled = accView.page >= pages;
+}
+
+function syncAccChkAll(pageRows) {
+  const all = $('accChkAll');
+  if (!all) return;
+  const n = pageRows.length;
+  const sel = pageRows.filter(s => accSel.has(s.uid)).length;
+  all.checked = n > 0 && sel === n;
+  // indeterminate 必须显式给：只设 checked 会让「选了 3/50」看起来像「一个都没选」。
+  all.indeterminate = sel > 0 && sel < n;
+  all.title = '全选当前页（' + n + ' 个）';
+}
+
+function renderBulkBar() {
+  const bar = $('bulkbar'), n = $('bulkN');
+  if (!bar) return;
+  const on = accSel.size > 0;
+  bar.classList.toggle('on', on);
+  // body 留白与浮层同源：只加一次类，避免每条 5 秒快照都写 style。
+  document.body.classList.toggle('bulk-on', on);
+  if (n) n.textContent = '已选 ' + accSel.size;
+}
+
+function refreshAccTable() {
+  const accounts = (overviewData && overviewData.accounts) || [];
+  renderAccounts(accounts);
+  renderAlertBar(accounts);
+}
+
+function goAccPage(p) {
+  const accounts = (overviewData && overviewData.accounts) || [];
+  const total = accounts.filter(accMatches).length;
+  const size = accView.size > 0 ? accView.size : Math.max(1, total);
+  const pages = Math.max(1, Math.ceil(total / size));
+  const next = Math.min(Math.max(1, p), pages);
+  if (next === accView.page) return;
+  accView.page = next;
+  refreshAccTable();
+  // 翻页后表格顶部可能已在视口外：此时才滚，避免每次翻页都强制滚动。
+  const box = $('accBody') && $('accBody').closest('.box');
+  if (box && box.getBoundingClientRect().top < 0) box.scrollIntoView({ block: 'start', behavior: 'smooth' });
+}
+
+/* ── 标签浮层（单账号）────────────────────────────────────────────── */
+function openTagSheet(uid) {
+  const list = (overviewData && overviewData.accounts) || [];
+  const s = list.find(x => x.uid === uid);
+  tagEditingUid = uid;
+  tagDraft = tagsOf(uid);
+  if ($('tagWho')) {
+    $('tagWho').textContent = (s ? (s.nickname || '未命名') : uid.slice(0, 8)) + ' · ' + uid.slice(0, 8);
+  }
+  if ($('tagInput')) $('tagInput').value = '';
+  renderTagPool();
+  const sheet = $('tagSheet'), mask = $('tagMask');
+  if (!sheet || !mask) return;
+  sheet.hidden = false; mask.hidden = false;
+  // 先显示再下一帧加 .on，transition 才有起点（同帧加类会被合并成无动画）。
+  requestAnimationFrame(() => { mask.classList.add('on'); sheet.classList.add('on'); });
+  setTimeout(() => { if ($('tagInput')) $('tagInput').focus(); }, 60);
+}
+function closeTagSheet() {
+  const sheet = $('tagSheet'), mask = $('tagMask');
+  if (!sheet || !mask) return;
+  sheet.classList.remove('on'); mask.classList.remove('on');
+  setTimeout(() => { sheet.hidden = true; mask.hidden = true; }, 240);
+  tagEditingUid = null;
+  tagDraft = [];
+}
+function renderTagPool() {
+  const pool = $('tagPool');
+  if (!pool) return;
+  const known = allAccTags().map(x => x[0]).filter(t => tagDraft.indexOf(t) < 0).slice(0, 8);
+  pool.innerHTML =
+    tagDraft.map(t => '<button type="button" class="xs chip on" data-un="' + esc(t) + '">' + esc(t) + ' ✕</button>').join('') +
+    known.map(t => '<button type="button" class="xs chip" data-addtag="' + esc(t) + '">+ ' + esc(t) + '</button>').join('');
+}
+function addTagDraft(v) {
+  const t = String(v || '').trim();
+  if (!t) return;
+  if (tagDraft.indexOf(t) < 0 && tagDraft.length < 6) tagDraft.push(t);
+  renderTagPool();
+}
+function saveTagSheet() {
+  if (!tagEditingUid) return;
+  setAccTags(tagEditingUid, tagDraft);
+  closeTagSheet();
+  refreshAccTable();
+  toast('标签已保存（只存本机）', 'ok');
+}
+
+/* ── 事件绑定 ─────────────────────────────────────────────────────── */
+let accQTimer = 0;
+if ($('accQ')) {
+  // 防抖 140ms：225 个号过滤一次不到 1ms，防抖只是为了不在输入法组词时反复重排表格。
+  $('accQ').addEventListener('input', ev => {
+    const v = ev.target.value || '';
+    clearTimeout(accQTimer);
+    accQTimer = setTimeout(() => {
+      accView.q = v.trim();
+      accView.page = 1;
+      syncAccSearchCls();
+      saveAccView();
+      refreshAccTable();
+    }, 140);
+  });
+}
+if ($('accQClear')) {
+  $('accQClear').onclick = () => {
+    accView.q = ''; accView.page = 1;
+    if ($('accQ')) $('accQ').value = '';
+    syncAccSearchCls(); saveAccView(); refreshAccTable();
+  };
+}
+if ($('accStatusChips')) {
+  $('accStatusChips').addEventListener('click', ev => {
+    const b = ev.target.closest('[data-st]');
+    if (!b) return;
+    const k = b.getAttribute('data-st');
+    accView.status = ACC_STATUS.indexOf(k) >= 0 ? k : 'all';
+    accFilter = (accView.status === 'cool' || accView.status === 'off') ? accView.status : 'all';
+    try { localStorage.setItem(LS_ACC_FILTER, accFilter); } catch (e) {}
+    accView.page = 1;
+    saveAccView(); refreshAccTable();
+  });
+}
+if ($('accTagChips')) {
+  $('accTagChips').addEventListener('click', ev => {
+    const b = ev.target.closest('[data-tag]');
+    if (!b) return;
+    const t = b.getAttribute('data-tag');
+    const i = accView.tags.indexOf(t);
+    if (i >= 0) accView.tags.splice(i, 1); else accView.tags.push(t);
+    accView.page = 1;
+    saveAccView(); refreshAccTable();
+  });
+}
+if ($('accSort')) {
+  $('accSort').onchange = ev => {
+    const v = ev.target.value;
+    accView.sort = ACC_SORTS[v] ? v : 'default';
+    accView.page = 1;
+    saveAccView(); refreshAccTable();
+  };
+}
+if ($('accSize')) {
+  $('accSize').onchange = ev => {
+    const n = Number(ev.target.value);
+    accView.size = [0, 20, 50, 100, 200].indexOf(n) >= 0 ? n : 50;
+    accView.page = 1;
+    saveAccView(); refreshAccTable();
+  };
+}
+if ($('accPrev')) $('accPrev').onclick = () => goAccPage(accView.page - 1);
+if ($('accNext')) $('accNext').onclick = () => goAccPage(accView.page + 1);
+
+if ($('accChkAll')) {
+  $('accChkAll').onchange = ev => {
+    const accounts = (overviewData && overviewData.accounts) || [];
+    const ranked = accSortList(accounts.filter(accMatches));
+    const size = accView.size > 0 ? accView.size : Math.max(1, ranked.length);
+    const start = (accView.page - 1) * size;
+    const pageRows = ranked.slice(start, start + size);
+    if (ev.target.checked) pageRows.forEach(s => accSel.add(s.uid));
+    else pageRows.forEach(s => accSel.delete(s.uid));
+    refreshAccTable();
+  };
+}
+// 行内复选框：**不手动切 class**，交给 renderAccounts 的 keyed 增量。
+// 手动 toggle 会让 DOM 与「行签名缓存」不一致：勾选时手动加 .sel，清除选择时
+// 签名回到旧值（与缓存相同）→ 那一行不会被重建 → 高亮永远擦不掉（实测踩到）。
+// 签名里含 accSel，所以重渲染只会替换**变化的那一行**，不是整表。
+$('accBody').addEventListener('change', ev => {
+  const box = ev.target.closest('[data-chk]');
+  if (!box) return;
+  const uid = box.getAttribute('data-chk');
+  if (box.checked) accSel.add(uid); else accSel.delete(uid);
+  renderAccounts((overviewData && overviewData.accounts) || []);
+});
+// 双击行编辑标签：不占操作列宽度，也不影响行内其它按钮的点击。
+$('accBody').addEventListener('dblclick', ev => {
+  const tr = ev.target.closest('tr[data-uid]');
+  if (!tr) return;
+  const uid = tr.getAttribute('data-uid');
+  if (!uid || uid === ACC_SEP_KEY) return;
+  openTagSheet(uid);
+});
+
+if ($('bulkApply')) {
+  $('bulkApply').onclick = () => {
+    const v = $('bulkTag') ? $('bulkTag').value.trim() : '';
+    if (!v) { toast('先输入标签名', 'warn'); return; }
+    accSel.forEach(uid => setAccTags(uid, tagsOf(uid).concat([v])));
+    if ($('bulkTag')) $('bulkTag').value = '';
+    refreshAccTable();
+    toast('已给 ' + accSel.size + ' 个号加上「' + v + '」', 'ok');
+  };
+}
+if ($('bulkTag')) {
+  $('bulkTag').addEventListener('keydown', ev => {
+    if (ev.key === 'Enter' && $('bulkApply')) $('bulkApply').click();
+  });
+}
+if ($('bulkClear')) {
+  $('bulkClear').onclick = () => { accSel.clear(); refreshAccTable(); };
+}
+
+if ($('tagAdd')) $('tagAdd').onclick = () => { addTagDraft($('tagInput').value); if ($('tagInput')) $('tagInput').value = ''; };
+if ($('tagInput')) {
+  $('tagInput').addEventListener('keydown', ev => {
+    if (ev.key === 'Enter') { ev.preventDefault(); addTagDraft(ev.target.value); ev.target.value = ''; }
+  });
+}
+if ($('tagPool')) {
+  $('tagPool').addEventListener('click', ev => {
+    const un = ev.target.closest('[data-un]');
+    if (un) {
+      const t = un.getAttribute('data-un');
+      tagDraft = tagDraft.filter(x => x !== t);
+      renderTagPool();
+      return;
+    }
+    const add = ev.target.closest('[data-addtag]');
+    if (add) addTagDraft(add.getAttribute('data-addtag'));
+  });
+}
+if ($('tagSave')) $('tagSave').onclick = saveTagSheet;
+if ($('tagCancel')) $('tagCancel').onclick = closeTagSheet;
+if ($('tagMask')) $('tagMask').onclick = closeTagSheet;
+document.addEventListener('keydown', ev => {
+  if (ev.key === 'Escape' && tagEditingUid) closeTagSheet();
+});
+
+syncAccControls();

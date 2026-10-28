@@ -811,6 +811,199 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     color: var(--ink-2); font-size: 12.5px; }
   .rm-row input { flex: 1; }
 
+
+/* ══ 流体动效层（Apple 交互规范）══════════════════════════════════════════
+   物理参数对齐 WWDC：普通 UI damping 1.0 / response 0.4s，抽屉与 sheet
+   damping 0.8 / response 0.3s，手势抛动用 0.8 + 动量投射。
+   Web 里跑常驻弹簧要逐帧 JS，会和 5 秒轮询、表格增量渲染抢主线程；这里用
+   cubic-bezier 逼近同一条曲线，全部只动 transform/opacity/filter（合成层），
+   不触发 layout —— 滚动位置、行签名 diff、滚动锚定都不受影响。
+     --spring-soft  ≈ 临界阻尼（damping 1.0，无回弹）
+     --spring-snap  ≈ 短响应（按压与状态切换）
+     --spring-pop   ≈ damping 0.8 的轻微过冲（选中态、浮层进入）
+   全局 reduced-motion 已在上方统一关闭动画，此处不再重复。 */
+:root {
+  --spring-soft: cubic-bezier(.32,.72,0,1);
+  --spring-snap: cubic-bezier(.2,.9,.1,1);
+  --spring-pop: cubic-bezier(.34,1.56,.64,1);
+  --dur-1: .14s; --dur-2: .22s; --dur-3: .34s;
+  --glass-bg: rgba(20,23,31,.72);
+  /* 弹层需要比页面明确高一档：纯半透明玻璃叠在同色背景上等于没有边界。 */
+  --glass-sheet: rgba(38,44,58,.92);
+  --glass-line: rgba(255,255,255,.06);
+  --elev-1: 0 1px 2px rgba(0,0,0,.24);
+  --elev-2: 0 2px 8px -2px rgba(0,0,0,.3), 0 16px 40px -20px rgba(0,0,0,.45);
+}
+[data-theme="light"] {
+  --glass-bg: rgba(255,255,255,.74);
+  --glass-sheet: rgba(255,255,255,.96);
+  --glass-line: rgba(16,20,32,.06);
+  --elev-1: 0 1px 2px rgba(16,20,32,.08);
+  --elev-2: 0 2px 8px -2px rgba(16,20,32,.1), 0 16px 40px -18px rgba(16,20,32,.18);
+}
+
+/* 按压反馈：scale 而非改 padding/尺寸，零回流。0.97 是 iOS 图标按下的量级，
+   再小就有「塌陷」感；hover 只抬 1px，避免整屏按钮跳动。 */
+button, .chip, .tag, .nav a, .stat {
+  transition: transform var(--dur-1) var(--spring-snap),
+              border-color var(--dur-1) ease, background var(--dur-1) ease,
+              box-shadow var(--dur-2) var(--spring-soft), color var(--dur-1) ease;
+}
+button:not(:disabled):active { transform: scale(.97); }
+button.primary:not(:disabled):active { transform: scale(.97); }
+button:hover:not(:disabled) { box-shadow: 0 0 0 3px var(--accent-soft); }
+button.primary:hover:not(:disabled) { box-shadow: 0 4px 14px -6px var(--accent); }
+.chip { transition: transform var(--dur-2) var(--spring-pop), background var(--dur-1) ease, color var(--dur-1) ease; }
+.chip:active { transform: scale(.94); }
+.chip.on { transform: translateZ(0); }
+
+/* 输入：focus 加一圈柔和光晕（border 变色保留），读起来像「被点亮的表面」。 */
+input, select, textarea { transition: border-color var(--dur-1) ease, box-shadow var(--dur-2) var(--spring-soft); }
+input:focus, select:focus, textarea:focus { box-shadow: 0 0 0 3px var(--accent-soft); }
+
+/* 卡片：hover 只改边框与投影，不改尺寸（改 padding 会让整表重排）。 */
+.box { transition: border-color var(--dur-2) ease, box-shadow var(--dur-2) var(--spring-soft); }
+.box:hover { border-color: color-mix(in srgb, var(--accent) 18%, var(--line)); }
+
+/* 行 hover：背景过渡而不是瞬变，扫视长表时不会「闪」。 */
+.acc tbody tr { transition: background var(--dur-1) ease; }
+
+/* 导航选中项：左侧指示条用伪元素滑入（不占列宽，不引起文字位移）。 */
+.nav a { position: relative; }
+.nav a::before {
+  content: ''; position: absolute; left: 3px; top: 50%; width: 2px; height: 0;
+  background: var(--accent); border-radius: 2px; transform: translateY(-50%);
+  transition: height var(--dur-2) var(--spring-snap);
+}
+.nav a.on::before { height: 16px; }
+
+/* 视图切换：淡入 + 4px 上浮。只在 hidden 切换时触发一次，轮询刷新不会重播。 */
+@keyframes viewIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.view:not([hidden]) { animation: viewIn var(--dur-3) var(--spring-soft); }
+
+/* 顶栏与移动端抽屉用毛玻璃：两者都可能盖在滚动内容上，模糊才有「层级」感。
+   不支持 backdrop-filter 时回落为不透明底色（上方已有 background），不做假模糊。 */
+@supports (backdrop-filter: blur(12px)) or (-webkit-backdrop-filter: blur(12px)) {
+  .topbar {
+    background: var(--glass-bg);
+    -webkit-backdrop-filter: saturate(1.6) blur(14px);
+    backdrop-filter: saturate(1.6) blur(14px);
+    border-bottom-color: var(--glass-line);
+  }
+}
+
+/* 滚动条：默认的粗灰条在深色仪表盘上很突兀，收细并降低对比。 */
+* { scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-thumb { background: var(--line); border-radius: 999px; border: 2px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: var(--ink-3); background-clip: padding-box; }
+
+/* ── 账号池工具栏（搜索 / 筛选 / 排序 / 分页）─────────────────────────
+   纯前端：所有过滤排序分页都在已有的 overview 快照上做内存运算，
+   不发任何新请求，也不改 5 秒轮询节奏。 */
+.acc-tools { padding: 10px 14px; border-bottom: 1px solid var(--line-soft); display: flex; flex-direction: column; gap: 8px; }
+.acc-tools .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.acc-tools .grow { flex: 1; }
+.acc-search { position: relative; display: flex; align-items: center; min-width: 210px; flex: 0 1 260px; }
+.acc-search svg { position: absolute; left: 9px; width: 14px; height: 14px; color: var(--ink-3); pointer-events: none; }
+.acc-search input { padding-left: 29px; padding-right: 26px; height: 30px; font-size: 12.5px; border-radius: 8px; }
+.acc-search .clr {
+  position: absolute; right: 6px; width: 18px; height: 18px; padding: 0; border: none;
+  background: none; color: var(--ink-3); font-size: 15px; line-height: 1; cursor: pointer;
+  display: none; align-items: center; justify-content: center;
+}
+.acc-search.has-q .clr { display: flex; }
+.acc-tools .sel-note { gap: 5px; }
+.acc-tools select { height: 30px; border-radius: 8px; }
+/* 状态 chip 上的计数：等宽数字，避免 3 位与 2 位切换时 chip 抖动。 */
+.acc-tools .chip .n { font-family: var(--mono); font-variant-numeric: tabular-nums; margin-left: 4px; opacity: .8; }
+.acc-tools .chip.mute-on { border-style: dashed; }
+
+/* 复选框复用第一列（状态色条那一列），**不新增 td**。
+   原因：mobile.css 用 #accBody tr > nth-child(N) 给卡片模式的每一格定 grid-column，
+   多插一个 td 会让 who/cred/usage 全部后移一位（实测昵称被挤到行尾）。
+   复用该列后列数恒为 10，nth-child 映射完全不变；移动端 .mark 本来就是 display:none，
+   复选框随之隐藏，正是想要的（批量勾选是桌面操作）。 */
+.acc .mark { width: 26px; min-width: 26px; padding: 0; position: relative; }
+.acc .mark i { position: absolute; left: 0; top: 0; bottom: 0; width: 3px; min-height: 0; }
+.acc .mark .row-chk {
+  position: absolute; left: 9px; top: 50%; transform: translateY(-50%);
+  width: 13px; height: 13px; margin: 0; cursor: pointer;
+}
+.acc th.c-chk { width: 26px; min-width: 26px; padding-left: 9px; padding-right: 0; }
+.acc th.c-chk input { width: 13px; height: 13px; cursor: pointer; display: block; }
+.acc tbody tr.sel { background: var(--accent-soft); box-shadow: inset 3px 0 var(--accent); }
+.acc tbody tr.sel:hover { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+
+/* 标签点：有标签才出现，6px，跟在昵称后。用点而不是文字是为了不动密集态的
+   宽度预算（.nm 的 max-width 是按「昵称 + uid」算死的）。完整标签在 title 里。 */
+.acc-tagdot {
+  display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent); margin-left: 5px; vertical-align: 2px;
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+/* ── 批量操作条：选中账号后从底部浮起（sheet 式，damping 0.8 / 0.3s）── */
+.bulkbar {
+  position: fixed; left: 50%; bottom: 18px; z-index: 60;
+  display: flex; align-items: center; gap: 10px; padding: 9px 12px 9px 14px;
+  background: var(--glass-bg); border: 1px solid var(--line); border-radius: 14px;
+  box-shadow: var(--elev-2);
+  -webkit-backdrop-filter: saturate(1.7) blur(16px); backdrop-filter: saturate(1.7) blur(16px);
+  transform: translate(-50%, 120%); opacity: 0;
+  transition: transform var(--dur-3) var(--spring-pop), opacity var(--dur-2) ease;
+  max-width: calc(100vw - 24px); flex-wrap: wrap;
+}
+.bulkbar.on { transform: translate(-50%, 0); opacity: 1; }
+.bulkbar .n { font: 600 12.5px var(--mono); color: var(--accent); white-space: nowrap; }
+.bulkbar input { width: 150px; height: 28px; font-size: 12.5px; border-radius: 7px; }
+.bulkbar .hint { font-size: 11.5px; color: var(--ink-3); white-space: nowrap; }
+
+/* 批量条出现时给 body 留出底部空间：它是 fixed 浮层，不留白就永远压住最后一行。
+   88px = 条高 52 + 边距 18 + 余量 18，滚动到底时最后一行能完整露出。 */
+body.bulk-on { padding-bottom: 88px; }
+
+/* ── 分页器 ───────────────────────────────────────────────────────── */
+.pager { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--line-soft); }
+.pager .grow { flex: 1; }
+.pager .info { font: 12px var(--mono); color: var(--ink-3); white-space: nowrap; }
+.pager button { padding: 4px 10px; font-size: 12.5px; }
+.pager .num { font-family: var(--mono); }
+
+/* ── 标签编辑浮层（sheet）───────────────────────────────────────── */
+.tagsheet {
+  position: fixed; z-index: 80; left: 50%; top: 50%;
+  transform: translate(-50%, -46%) scale(.97); opacity: 0;
+  width: min(420px, calc(100vw - 32px));
+  background: var(--glass-sheet); border: 1px solid color-mix(in srgb, var(--line) 70%, var(--ink-3));
+  border-radius: 16px; box-shadow: var(--elev-2); padding: 16px;
+  -webkit-backdrop-filter: saturate(1.7) blur(20px); backdrop-filter: saturate(1.7) blur(20px);
+  transition: transform var(--dur-3) var(--spring-pop), opacity var(--dur-2) ease;
+}
+.tagsheet.on { transform: translate(-50%, -50%) scale(1); opacity: 1; }
+.tagsheet h4 { font-size: 13.5px; font-weight: 620; margin-bottom: 3px; }
+.tagsheet .sub { font-size: 11.5px; color: var(--ink-3); margin-bottom: 12px; word-break: break-all; }
+.tagsheet .field { display: flex; gap: 8px; }
+.tagsheet .field input { height: 32px; }
+.tagsheet .pool { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.tagsheet .pool .chip { cursor: pointer; font-size: 11.5px; }
+.tagsheet .foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+.tagsheet-mask {
+  position: fixed; inset: 0; z-index: 79; background: rgba(0,0,0,.58);
+  opacity: 0; transition: opacity var(--dur-2) ease;
+  -webkit-backdrop-filter: blur(2px); backdrop-filter: blur(2px);
+}
+.tagsheet-mask.on { opacity: 1; }
+
+/* 窄屏：工具栏换行、搜索占满、分页器精简。表格本身的卡片化在 mobile.css。 */
+@media (max-width: 760px) {
+  .acc-tools { padding: 9px 10px; }
+  .acc-search { flex: 1 1 100%; order: -1; }
+  .bulkbar { bottom: 10px; left: 10px; right: 10px; transform: translateY(120%); border-radius: 12px; }
+  .bulkbar.on { transform: translateY(0); }
+  .bulkbar input { flex: 1; min-width: 80px; }
+  .pager { flex-wrap: wrap; }
+}
 </style>
 <!-- 移动端适配：独立文件，必须在主 <style> 之后（@media 覆盖依赖层叠顺序） -->
 <link rel="stylesheet" href="mobile.css">
@@ -925,20 +1118,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="pad"><div id="compList"></div></div>
       </div>
 
-      <!-- 成长资产（签到活动 + 能量）：赛季/主题/截止日、今日未签名单、能量合计。
-           这两组数据每个账号要各打一次上游（60 号 ≈ 120 个请求），不能挂在
-           /overview 热路径上，所以按需拉取；卡片本身常驻，入口不藏在隐藏容器里
-           （issue #137 的教训：入口藏在自己的隐藏卡片里 = 永远点不到）。 -->
-      <div class="box" id="growBox">
-        <header>
-          <h3>成长资产<span class="hint">签到活动（赛季制）· 连签天数 · 能量余额 · 按需查询，约 10~20 秒</span></h3>
-          <span class="grow"></span>
-          <span class="note" id="growNote"></span>
-          <button class="xs" id="btnGrowFold" aria-expanded="true">收起</button>
-          <button class="xs" id="btnGrow">检查</button>
-        </header>
-        <div class="pad" id="growPad"><div id="growList"><div class="empty">点「检查」拉取：赛季与截止日、今日未签名单、能量合计</div></div></div>
-      </div>
 
       <div class="box">
         <header>
@@ -955,16 +1134,72 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button class="xs" id="btnActivityAll">活跃上报</button>
           <button class="xs" id="btnKeepaliveAll">全部保活</button>
         </header>
+        <!-- 工具栏：全部是内存运算（在已有的 overview 快照上过滤/排序/分页），
+             不发新请求，也不改 5 秒轮询节奏。 -->
+        <div class="acc-tools">
+          <div class="row">
+            <div class="acc-search" id="accSearch">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="7" cy="7" r="4.4"/><path d="M10.4 10.4L14 14" stroke-linecap="round"/></svg>
+              <input id="accQ" type="search" placeholder="搜索昵称 / uid / 备注 / 标签" autocomplete="off" spellcheck="false" aria-label="搜索账号">
+              <button class="clr" id="accQClear" type="button" title="清空搜索" aria-label="清空搜索">×</button>
+            </div>
+            <div class="chips" id="accStatusChips"></div>
+            <span class="grow"></span>
+            <label class="sel-note">排序<select id="accSort" aria-label="排序方式">
+              <option value="default">异常优先</option>
+              <option value="credits_desc">积分 ↓</option>
+              <option value="credits_asc">积分 ↑</option>
+              <option value="fails_desc">失败次数 ↓</option>
+              <option value="success_desc">成功次数 ↓</option>
+              <option value="last_success">最近成功</option>
+              <option value="imported">导入时间</option>
+              <option value="name">昵称</option>
+            </select></label>
+            <label class="sel-note">每页<select id="accSize" aria-label="每页条数">
+              <option value="20">20</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+              <option value="200">200</option>
+              <option value="0">全部</option>
+            </select></label>
+          </div>
+          <div class="row" id="accTagRow" hidden>
+            <span class="sel-note">标签</span>
+            <div class="chips" id="accTagChips"></div>
+          </div>
+        </div>
         <div class="tbl-wrap">
         <table class="acc dense">
           <thead><tr>
-            <th class="mark" aria-hidden="true"></th>
+            <th class="c-chk"><input type="checkbox" id="accChkAll" title="全选当前页（批量打标签用）" aria-label="全选当前页"></th>
             <th>账号</th><th>状态</th><th>积分</th>
             <th>成功 / 失败</th><th>在途</th><th>用量</th><th>最近成功</th><th>导入</th><th class="c-acts"></th>
           </tr></thead>
           <tbody id="accBody"></tbody>
         </table>
         </div>
+        <div class="pager" id="accPager">
+          <span class="info" id="accPageInfo"></span>
+          <span class="grow"></span>
+          <button class="xs ghost" id="accPrev" type="button">上一页</button>
+          <span class="info num" id="accPageNum"></span>
+          <button class="xs ghost" id="accNext" type="button">下一页</button>
+        </div>
+      </div>
+
+      <!-- 成长资产（签到活动 + 能量）：赛季/主题/截止日、今日未签名单、能量合计。
+           这两组数据每个账号要各打一次上游（60 号 ≈ 120 个请求），不能挂在
+           /overview 热路径上，所以按需拉取；卡片本身常驻，入口不藏在隐藏容器里
+           （issue #137 的教训：入口藏在自己的隐藏卡片里 = 永远点不到）。 -->
+      <div class="box" id="growBox">
+        <header>
+          <h3>成长资产<span class="hint">签到活动（赛季制）· 连签天数 · 能量余额 · 按需查询，约 10~20 秒</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="growNote"></span>
+          <button class="xs" id="btnGrowFold" aria-expanded="true">收起</button>
+          <button class="xs" id="btnGrow">检查</button>
+        </header>
+        <div class="pad" id="growPad"><div id="growList"><div class="empty">点「检查」拉取：赛季与截止日、今日未签名单、能量合计</div></div></div>
       </div>
 
       <div class="box">
@@ -1736,6 +1971,31 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 </div>
 
 <div id="toasts"></div>
+
+<!-- 批量操作条：选中账号后从底部浮起。只有选中态才 .on（不占位、不挡表格）。 -->
+<div class="bulkbar" id="bulkbar" role="region" aria-label="批量操作">
+  <span class="n" id="bulkN">已选 0</span>
+  <input id="bulkTag" placeholder="标签名，回车应用" autocomplete="off" aria-label="批量标签">
+  <button class="xs primary" id="bulkApply" type="button">打标签</button>
+  <button class="xs ghost" id="bulkClear" type="button">清除选择</button>
+  <span class="hint">标签只存本机，不上传</span>
+</div>
+
+<!-- 标签编辑浮层（单账号）：毛玻璃 sheet，进入用 damping 0.8 的轻微过冲。 -->
+<div class="tagsheet-mask" id="tagMask" hidden></div>
+<div class="tagsheet" id="tagSheet" role="dialog" aria-modal="true" aria-labelledby="tagTitle" hidden>
+  <h4 id="tagTitle">编辑标签</h4>
+  <div class="sub" id="tagWho"></div>
+  <div class="field">
+    <input id="tagInput" placeholder="输入标签后回车，例：主力 / 备用 / 试用" autocomplete="off">
+    <button class="xs" id="tagAdd" type="button">添加</button>
+  </div>
+  <div class="pool" id="tagPool"></div>
+  <div class="foot">
+    <button class="xs ghost" id="tagCancel" type="button">取消</button>
+    <button class="xs primary" id="tagSave" type="button">保存</button>
+  </div>
+</div>
 
 <script src="app.js"></script>
 <script src="mobile.js"></script>
