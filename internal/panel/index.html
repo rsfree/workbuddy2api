@@ -213,6 +213,22 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .stats.s3 .stat { border-bottom: none; }
 .stats.s3 .stat:last-child { border-right: none; }
 
+/* 异常汇总条。健康态靠 hidden 整条脱离 flow（0 高 0 边距），不预留高度——预留等于永远空一条。
+   左条用 inset shadow 而非 border-left：后者与 9px 圆角在拐角处错位（同 .cap-rec 的 idiom）。 */
+#alertBar {
+  display: flex; align-items: center; gap: 10px;
+  height: 44px; padding: 0 14px; margin: 0 0 12px;
+  background: var(--surface); border: 1px solid var(--line); border-radius: 9px;
+  box-shadow: inset 3px 0 var(--warn);
+}
+#alertBar .pulse { flex: none; }          /* 7px 点，复用现有 .pulse / .pulse.bad */
+/* 有已禁用号时整条转红：规格只说「切 sev-bad 类」，没有这条规则类就是个空壳，
+   左条仍停在 warn 色，与红点自相矛盾。 */
+#alertBar.sev-bad { box-shadow: inset 3px 0 var(--bad); }
+#alertText { font-size: 13px; font-weight: 600; color: var(--ink); }
+#alertChips .chip { cursor: pointer; }     /* 样式继承 .chips .chip，选中态用 .chip.on */
+#alertChips .chip .n { font-family: var(--mono); font-weight: 600; margin-left: 4px; }
+
 /* ── 面板块 ───────────────────────────────────────────────────────── */
 .box { background: var(--surface); border: 1px solid var(--line); border-radius: 11px; box-shadow: var(--shadow); margin-bottom: 20px; overflow: hidden; }
 .box > header { display: flex; align-items: center; gap: 12px; padding: 12px 17px; border-bottom: 1px solid var(--line-soft); }
@@ -251,6 +267,14 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .acc .mark i { display: block; width: 3px; height: 100%; min-height: 36px; background: transparent; }
 .acc tbody tr.cool .mark i { background: var(--warn); }
 .acc tbody tr.off .mark i { background: var(--bad); }
+/* 异常组 / 正常组的分界哨兵行。它由 accRows 托管（data-uid="__sep__"），
+   不是每轮重建的装饰节点——否则会被增量渲染的收尾清理删掉。
+   12px 只当一条分隔带用，故行高写死、字号压到 11px、去掉 .acc td 的 11px 内边距。 */
+.acc tbody tr.acc-sep td {
+  height: 12px; padding: 0 11px; line-height: 12px; font-size: 11px;
+  color: var(--ink-3); background: var(--surface-2);
+  border-top: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft);
+}
 /* 模型表无色条（健康指示只属于账号表）。 */
 .acc.md .mark { display: none; }
 /* 操作列用 width:1px + nowrap 的经典技巧：列宽恰为内容宽，其余列按内容自适应 */
@@ -783,6 +807,14 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
              不是「池子现在能不能扛」，与上面 7 个容量指标不是同一个决策，故移到
              「用量 → 路由诊断」。7 项正好填满 .stats 的 7 列一行，不再出现
              第二行只有 3 项、右侧空出 4/7 的错位。 -->
+      </div>
+
+      <!-- 异常汇总条：全池健康时用 hidden 属性整条不占位（[hidden]{display:none!important} 已在:34）。
+           内容由 renderAlertBar() 填充，chips 是动态生成的计数按钮。 -->
+      <div id="alertBar" hidden>
+        <span class="pulse warn" id="alertDot"></span>
+        <span id="alertText"></span>
+        <span class="chips" id="alertChips"></span>
       </div>
 
       <!-- 卡片默认可见：此前 hidden + 「仅点检查才渲染」形成死锁（按钮藏在隐藏卡片里，

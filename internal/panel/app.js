@@ -3,6 +3,8 @@
 const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme';
 /* 账号备注与「积分到期提醒」折叠的本机键（同上：模块级声明放顶部，避开 TDZ）。 */
 const LS_REMARKS = 'wb2api.remarks.v1', LS_EXP_FOLD = 'wb2api.expfold.v1';
+/* 账号池「只看异常」筛选的本机键（all | cool | off）。 */
+const LS_ACC_FILTER = 'wb2api.accfilter.v1';
 let remarksCache = null;
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
@@ -12,6 +14,10 @@ let refTimer = null;
 /* 账号行增量更新用的 DOM 索引（uid → { el, sig }）。模块级声明放顶部，避开 TDZ
    ——renderAccounts 被 go()/轮询调用时，这个区的脚本早已求值完毕。 */
 let accRows = new Map();
+/* 账号池的「只看异常」筛选：all | cool | off。本机记住上次的选择——运维盯着某类
+   异常号排查时会反复进这个页面，每次都要重新点一遍筛选是纯摩擦。 */
+let accFilter = 'all';
+try { accFilter = localStorage.getItem(LS_ACC_FILTER) || 'all'; } catch (e) {}
 /* 通用折叠的真值源：Map<key, bool>，null 表示还没从 localStorage 载入。 */
 let foldState = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
@@ -615,6 +621,30 @@ function accRowHtml(s, maxCred) {
     '</td></tr>';
 }
 
+/* 分组键：异常优先。0 = 已禁用，1 = 冷却中，2 = 正常；组内仍按导入时间倒排。
+   与行内状态标签同一套判定（disabled 先于 cool），所以「排在上面的」和「标着异常的」
+   永远一致——否则会出现一行标着「可用」却夹在冷却号中间。 */
+function accRank(s) {
+  if (s.disabled) return 0;
+  return accCool(s).cool > 0 ? 1 : 2;
+}
+/* 当前筛选是否命中。口径必须与 accRank / 汇总条一致，否则「条上数了 3 个冷却、
+   点进去只有 2 行」这种自相矛盾会立刻被运维当成 bug。 */
+function accMatchFilter(s) {
+  if (accFilter === 'off') return !!s.disabled;
+  if (accFilter === 'cool') return !s.disabled && accCool(s).cool > 0;
+  return true;
+}
+/* 异常组 / 正常组的分界哨兵。它带 data-uid 且纳入 accRows 托管——这是硬要求：
+   renderAccounts 收尾那句 `while (cursor) remove()` 会把所有非 accRows 管理的节点
+   清掉，装饰性节点放进来活不过一轮。 */
+const ACC_SEP_KEY = '__sep__';
+function accSepHtml(n) {
+  // 「其余 N 个号」而不是「正常号」：暂停选号的号既不属于异常组、也不是真正「正常」，
+  // 叫「正常」等于给它盖了个错帽子。
+  return '<tr class="acc-sep" data-uid="' + ACC_SEP_KEY + '"><td colspan="10">其余 ' + n + ' 个号</td></tr>';
+}
+
 /* 账号表的 keyed 增量更新。
    原来是每 5 秒一次 `innerHTML =` 全量重建 130 行、几千个节点，后果：滚动位置回弹、
    hover 的 title tooltip 消失、正在看的行跳到别处、选中的文本被清空、主线程卡顿。
@@ -624,45 +654,68 @@ function accRowHtml(s, maxCred) {
      顺序变化  → insertBefore 移动节点（保留节点身份，滚动/选中/tooltip 都不受影响）。
    行内按钮走 accBody 的事件委托 + data-u，所以重建单行不会丢事件绑定。 */
 function renderAccounts(list) {
-  // 按导入时间倒排：刚导进来的号排在最上面，便于确认「刚才那批进去了没有」。
-  // 无 imported_at 的旧凭证 parseAPITime=0，自然沉到末尾（顺序稳定）。
-  list = list.slice().sort((a, b) => parseAPITime(b.imported_at) - parseAPITime(a.imported_at));
   const tb = $('accBody');
   if (!tb) return;
-  if (!list.length) {
+  const all = list || [];
+  // 积分条基准必须取**全池**最大值，与筛选无关：进度条表达的是「这个号还剩多少额度」
+  // 的绝对量，基准跟着筛选走就变成相对排名——同一个号切筛选前后百分比会变，
+  // 运维会把「筛到只剩低分号时显示满格」误读成「额度很健康」。
+  // 顺带一个好处：切筛选时行的 pct 不变，签名也就不会整批失效。
+  const maxCred = Math.max(1, ...all.map(s => s.credits || 0));
+  const shown = accFilter === 'all' ? all.slice() : all.filter(accMatchFilter);
+  if (!shown.length) {
     accRows.clear();
-    tb.innerHTML = '<tr><td colspan="10"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+    // 两种空态要分开：「池子空」和「筛选没命中」的下一步动作完全不同。
+    tb.innerHTML = all.length
+      ? '<tr><td colspan="10"><div class="empty"><div class="big">没有符合「需处理」的账号</div>' +
+        '当前只看' + (accFilter === 'off' ? '已禁用' : '冷却中') + '的号，' +
+        '<button class="xs ghost" data-filter="all">显示全部</button></div></td></tr>'
+      : '<tr><td colspan="10"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
     applyFolds();
     return;
   }
-  const maxCred = Math.max(1, ...list.map(s => s.credits || 0));
+  // 排序：异常组在前（已禁用 → 冷却中），组内按导入时间倒排；无 imported_at 的旧凭证
+  // parseAPITime=0，自然沉到组末尾（顺序稳定）。
+  const ranked = shown.map(s => ({ s, r: accRank(s), t: parseAPITime(s.imported_at) }));
+  ranked.sort((a, b) => (a.r - b.r) || (b.t - a.t));
+  const abnN = ranked.reduce((n, x) => n + (x.r < 2 ? 1 : 0), 0);
+  // 分界行只在「不筛选 + 两组都非空」时出现：筛选态下只显示一类号，插入分界毫无意义。
+  const sepN = (accFilter === 'all' && abnN > 0 && abnN < ranked.length) ? ranked.length - abnN : 0;
+  // items 是本轮期望的完整行序（账号行 + 可能的哨兵）。html 走惰性求值：
+  // 签名没变的行连字符串都不拼，这是增量更新省下来的主要成本。
+  const items = [];
+  ranked.forEach((x, i) => {
+    items.push({ key: x.s.uid, sig: accRowSig(x.s, maxCred), html: () => accRowHtml(x.s, maxCred) });
+    if (sepN && i === abnN - 1) {
+      items.push({ key: ACC_SEP_KEY, sig: ACC_SEP_KEY + ':' + sepN, html: () => accSepHtml(sepN) });
+    }
+  });
   if (!accRows.size) {
-    tb.innerHTML = list.map(s => accRowHtml(s, maxCred)).join('');
-    list.forEach((s, i) => accRows.set(s.uid, { el: tb.children[i], sig: accRowSig(s, maxCred) }));
+    tb.innerHTML = items.map(it => it.html()).join('');
+    items.forEach((it, i) => accRows.set(it.key, { el: tb.children[i], sig: it.sig }));
     applyFolds();
     return;
   }
-  const seen = new Set(list.map(s => s.uid));
-  for (const [uid, row] of accRows) {
-    if (seen.has(uid)) continue;
+  const seen = new Set(items.map(it => it.key));
+  for (const [key, row] of accRows) {
+    if (seen.has(key)) continue;
     row.el.remove();
-    accRows.delete(uid);
+    accRows.delete(key);
   }
   // 一个游标走完新顺序：对得上就不动，对不上就 insertBefore 拽过来（移动保留节点身份）。
   // 处理过的行总在游标之前，所以游标之后剩下的必然是这轮不该存在的节点。
   let cursor = tb.firstElementChild;
-  for (const s of list) {
-    let row = accRows.get(s.uid);
+  for (const it of items) {
+    let row = accRows.get(it.key);
     const atCursor = !!row && row.el === cursor;
-    const sig = accRowSig(s, maxCred);
     if (!row) {
-      row = { el: trFromHtml(accRowHtml(s, maxCred)), sig };
-      accRows.set(s.uid, row);
-    } else if (row.sig !== sig) {
-      const fresh = trFromHtml(accRowHtml(s, maxCred));
+      row = { el: trFromHtml(it.html()), sig: it.sig };
+      accRows.set(it.key, row);
+    } else if (row.sig !== it.sig) {
+      const fresh = trFromHtml(it.html());
       row.el.replaceWith(fresh);
       row.el = fresh;
-      row.sig = sig;
+      row.sig = it.sig;
     }
     if (atCursor) cursor = row.el.nextElementSibling;
     else tb.insertBefore(row.el, cursor);
@@ -677,6 +730,67 @@ function trFromHtml(html) {
   tpl.innerHTML = html;
   return tpl.content.firstElementChild;
 }
+
+/* ── 异常汇总条 ───────────────────────────────────────────────────── */
+/* 全池健康时整条 hidden（[hidden] 是 display:none!important，0 高 0 边距，不占位）——
+   留一条常驻的空条等于永远浪费 44px，而且「空条」会被读成「一切正常」的装饰，
+   反而弱化了异常时的存在感。
+   计数口径与 accRank / 行内标签完全一致：已禁用优先（禁用的号即使还在冷却也只算
+   「已禁用」），否则看 accCool().cool。 */
+function renderAlertBar(accounts) {
+  const bar = $('alertBar');
+  if (!bar) return;
+  let offN = 0, coolN = 0;
+  (accounts || []).forEach(s => {
+    if (s.disabled) offN++;
+    else if (accCool(s).cool > 0) coolN++;
+  });
+  const total = offN + coolN;
+  if (!total) { bar.hidden = true; return; }
+  bar.hidden = false;
+  // 有点「已禁用」就整条转红：禁用是终态（要人工解冻），冷却会自己好，两者不该同色。
+  bar.classList.toggle('sev-bad', offN > 0);
+  const dot = $('alertDot');
+  if (dot) {
+    dot.classList.toggle('bad', offN > 0);
+    dot.classList.toggle('warn', offN === 0);
+  }
+  $('alertText').textContent = total + ' 个号需处理';
+  // 计数为 0 的 chip 不渲染：0 是噪声，还会让人以为「点进去有东西」。
+  const chips = [];
+  if (coolN) chips.push('<button class="xs chip' + (accFilter === 'cool' ? ' on' : '') + '" data-filter="cool">冷却<span class="n">' + coolN + '</span></button>');
+  if (offN) chips.push('<button class="xs chip' + (accFilter === 'off' ? ' on' : '') + '" data-filter="off">已禁用<span class="n">' + offN + '</span></button>');
+  // 内容没变就不写：每 5 秒重写 innerHTML 会把鼠标正悬停的 chip 的 :hover 态闪掉。
+  const box = $('alertChips');
+  const html = chips.join('');
+  if (box.dataset.sig !== html) {
+    box.innerHTML = html;
+    box.dataset.sig = html;
+  }
+}
+/* 切换筛选。同一个 chip 再点一次回到 all——否则进了「只看冷却」就没有出口，
+   只能刷新页面（汇总条本身在筛选态下仍然显示，不构成 issue #137 那种死锁）。 */
+function setAccFilter(f) {
+  accFilter = (f === 'cool' || f === 'off') ? f : 'all';
+  try { localStorage.setItem(LS_ACC_FILTER, accFilter); } catch (e) {}
+  const accounts = (overviewData && overviewData.accounts) || [];
+  renderAccounts(accounts);
+  renderAlertBar(accounts);
+}
+if ($('alertChips')) {
+  $('alertChips').addEventListener('click', ev => {
+    const chip = ev.target.closest('[data-filter]');
+    if (!chip) return;
+    const f = chip.getAttribute('data-filter');
+    setAccFilter(accFilter === f ? 'all' : f);
+  });
+}
+/* 筛选空态里那个「显示全部」按钮。单独挂一个委托（现有 accBody 监听只认
+   button[data-a]，不会误吞它）。 */
+$('accBody').addEventListener('click', ev => {
+  const b = ev.target.closest('[data-filter]');
+  if (b) setAccFilter(b.getAttribute('data-filter'));
+});
 
 // renderModelLocks 模型锁池：哪些模型不能用、锁了几个号、还要锁多久。
 // 后端 model_locks 已按「整池不可用 → 没号可用 → 部分限流」排好序，这里只做展示。
@@ -714,6 +828,34 @@ function renderModelLocks(rows) {
   }
 }
 
+/* fmtCredShort 积分量缩写，专供 .stats 的「积分剩余 / 总额」用。
+   与 fmtK 的区别：fmtK 是整千取整 + 不带 M（用在模型成本等处，别把两者合并，
+   改 fmtK 会连锁到那些地方）。
+   精度是被**版面**逼出来的，不是审美：26px 等宽字宽约 15.1px，而 .stats 在 1280px
+   下把 7 格均分到 145px（内边距 17×2 后内容区只有 ~111px），一格里要放"剩余 / 总额"
+   两个数。所以每个数字压到 ≤4 字符：12480 → 12K（1 位小数会变成 12.5K，两个数加
+   斜杠共 11 字符 ≈ 166px，仍然撑爆）。精确值始终挂在 title 上。 */
+function fmtCredShort(n) {
+  n = Number(n || 0);
+  const short = v => (v >= 10 ? String(Math.round(v)) : String(Math.round(v * 10) / 10));
+  if (n >= 1e6) return short(n / 1e6) + 'M';
+  if (n >= 1e3) return short(n / 1e3) + 'K';
+  return String(n);
+}
+/* fmtCredPair 「剩余/总额」的紧凑写法：两个数**共享单位**，单位只写一次
+   （1.6/5.2M，而不是 1.6M/5.2M）。
+   为什么非要省这两个字符：26px 等宽下 9 字符 ≈ 136px，而 .stats 的单元格最窄只有
+   132px（auto-fit 的 132px 下限，窗口 ≈1190 时命中），136px 会直接顶到右邻
+   「粘性会话」的「1」上（截图实测两者贴在一起）；8 字符 ≈ 121px 才留得出缝隙。 */
+function fmtCredPair(rem, tot) {
+  rem = Number(rem || 0);
+  tot = Number(tot || 0);
+  const short = v => (v >= 10 ? String(Math.round(v)) : String(Math.round(v * 10) / 10));
+  if (tot >= 1e6) return short(rem / 1e6) + '/' + short(tot / 1e6) + 'M';
+  if (tot >= 1e3) return short(rem / 1e3) + '/' + short(tot / 1e3) + 'K';
+  return String(Math.round(rem)) + '/' + String(Math.round(tot));
+}
+
 /* loadOverview(quiet, metricsOnly)
    quiet       — 失败不弹 toast（轮询/切视图用）。
    metricsOnly — 只更新顶部与统计量，跳过账号表 / 模型锁池 / 到期卡的重建。用量页
@@ -737,8 +879,12 @@ async function loadOverview(quiet, metricsOnly) {
     // 暂停选号单列（issue #125）：它只关选号、照常签到保活，与禁用是两种状态。
     if ($('sPaused')) $('sPaused').textContent = d.paused == null ? '-' : d.paused;
     const remSum = (d.accounts || []).reduce((a, s) => a + (s.credits || 0), 0);
-  const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
-  $('sCredits').textContent = totSum > 0 ? remSum + ' / ' + totSum : remSum;
+    const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
+    // 全值（如 12,480 / 40,000 ≈ 227px）会撑破 .stats 的单元格（auto-fit 在 1280px 下
+    // 把 7 格均分到 145px，内容区只有 ~111px），溢出后压在右邻「粘性会话」上。
+    // 用共享单位的 K/M 缩写压到 ~121px，精确值挂 title。不改 .stats 列宽——7 视图共用。
+    $('sCredits').textContent = totSum > 0 ? fmtCredPair(remSum, totSum) : fmtCredShort(remSum);
+    $('sCredits').parentNode.title = '剩余 ' + remSum + ' / 总额 ' + totSum;
     $('sSticky').textContent = d.sticky_sessions;
     // 缓存命中率 / 粘性命中率：分母为 0 时显示 "-"（不是 0%——0% 会被误读成
     // "缓存完全不工作"，而实际只是还没有带 cache 维度的请求）。
@@ -789,7 +935,11 @@ async function loadOverview(quiet, metricsOnly) {
     const up = Math.floor(d.uptime_sec);
     $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
     if (!metricsOnly) {
-      renderAccounts(d.accounts || []);
+      // 同一份 accounts 既喂表格也喂汇总条：两个视图的数字必须来自同一次快照，
+      // 否则会看到「条上 3 个需处理、表里 2 行异常」这种自相矛盾。
+      const accs = d.accounts || [];
+      renderAccounts(accs);
+      renderAlertBar(accs);
       renderModelLocks(d.model_locks);
       // 到期卡片跟随首页统计同步刷新（用同一份响应里的按日批次，不额外发请求）。
       // 2 分钟内的实时明细最新且更全，保留；过期后由 state 快照接管，避免点过一次
