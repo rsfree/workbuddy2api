@@ -3073,6 +3073,110 @@ function renderCacheBox(d) {
   nc.title = nc.textContent;
 
   renderCacheChart((d && d.series) || []);
+  renderCacheModels((d && d.by_model) || []);
+}
+
+/* renderCacheModels 按模型的缓存排行。
+ *
+ * 🔴 排序键是**未命中 token**，不是命中率。这是实测数据给出的结论（2026-10-28，
+ * 线上 6 小时窗口）：
+ *
+ *	deepseek-v4.1-flash   命中率 94.6%   未命中 58.2M tok   ← 率最高，浪费却最多
+ *	glm-5.3               命中率 26.5%   未命中  3.1M tok   ← 率最低，浪费只有前者的 5%
+ *	kimi-k3.1-pro         命中率 66.8%   未命中 11.0M tok
+ *
+ * 单看命中率会把 glm-5.3 判成"最差的模型"，实际上它重算的 token 连 deepseek 的
+ * 零头都不到；而 deepseek 的 94.6% 一眼看过去像"没问题"，它的绝对重算量却是
+ * 全场第一。命中率低的模型如果量小，管它没有收益。
+ *
+ * 所以：**条形长度 = 命中/未命中的构成，右侧数字 = 未命中绝对量，颜色 = 命中率档位**。
+ * 三个维度一起看才不会误判——这也和面板别处"命中率 × 前缀占比一起看"的口径一致。
+ *
+ * 只列有缓存观测的模型（hit+miss>0）：没有观测的模型画成 0% 会凭空造出"崩了"的假信号。
+ */
+function renderCacheModels(rows) {
+  const host = $('usCacheModels');
+  if (!host) return;
+  const note = $('usCacheModelNote');
+
+  const list = (rows || []).map(x => {
+    const hit = Number(x.cache_hit_tokens || 0);
+    const miss = Number(x.cache_miss_tokens || 0);
+    const tot = hit + miss;
+    const reqs = Number(x.requests || 0);
+    const pt = Number(x.prompt_tokens || 0);
+    // 平均 prompt = 该模型的典型上下文长度。不足一个缓存块时低命中率是结构性的
+    //（上游按 128 tok 对齐，物理上凑不满一块），不是模型表现差。
+    const avgP = reqs ? pt / reqs : 0;
+    return {
+      key: String(x.key || ''),
+      hit: hit, miss: miss, tot: tot, reqs: reqs,
+      rate: tot ? hit / tot * 100 : 0,
+      avgP: avgP,
+      structural: avgP > 0 && avgP < CACHE_BLOCK_TOKENS,
+    };
+  }).filter(x => x.tot > 0);
+
+  if (!list.length) {
+    host.innerHTML = '<div class="us-empty">窗口内没有可归因到模型的缓存观测。</div>';
+    if (note) note.textContent = '—';
+    return;
+  }
+
+  list.sort((a, b) => b.miss - a.miss);
+  const totalMiss = list.reduce((s, x) => s + x.miss, 0);
+  // 只画前 8 个，其余合并成一行：超过 8 行就开始需要滚动，纵向比较反而失效。
+  const TOP = 8;
+  const shown = list.slice(0, TOP);
+  const rest = list.slice(TOP);
+
+  const rateCls = p => (p >= 90 ? 'c-ok' : (p >= 80 ? 'c-warn' : 'c-bad'));
+  const pctStr = p => trimFixed(p.toFixed(1)) + '%';
+
+  let html = '<div class="cm-row cm-head">' +
+    '<span>模型</span><span>命中 / 未命中</span>' +
+    '<span style="text-align:right">命中率</span>' +
+    '<span style="text-align:right">未命中</span></div>';
+
+  for (const x of shown) {
+    const hp = x.hit / x.tot * 100;
+    const tip = x.key + '\n' +
+      '命中 ' + fmtTok(x.hit) + ' tok · 未命中 ' + fmtTok(x.miss) + ' tok\n' +
+      '命中率 ' + pctStr(x.rate) + '（' + x.reqs + ' 次请求）\n' +
+      '平均 prompt ' + Math.round(x.avgP) + ' tok' +
+      (x.structural ? '（低于 ' + CACHE_BLOCK_TOKENS + ' tok 缓存块，结构性不可命中）' : '');
+    html += '<div class="cm-row" title="' + esc(tip) + '">' +
+      '<span class="cm-name">' + esc(x.key) +
+        (x.structural ? '<span class="mk" title="平均 prompt 不足一个缓存块">结构</span>' : '') +
+      '</span>' +
+      '<span class="cm-bar"><i class="h" style="width:' + hp.toFixed(2) + '%"></i>' +
+        '<i class="m" style="width:' + (100 - hp).toFixed(2) + '%"></i></span>' +
+      '<span class="cm-rate ' + rateCls(x.rate) + '">' + pctStr(x.rate) + '</span>' +
+      '<span class="cm-miss">' + fmtTok(x.miss) + '</span>' +
+      '</div>';
+  }
+
+  if (rest.length) {
+    const rh = rest.reduce((s, x) => s + x.hit, 0);
+    const rm = rest.reduce((s, x) => s + x.miss, 0);
+    const rt = rh + rm;
+    const rp = rt ? rh / rt * 100 : 0;
+    html += '<div class="cm-row cm-rest" title="' +
+      esc('其余 ' + rest.length + ' 个模型合计（汇总行，不参与排名）') + '">' +
+      '<span class="cm-name">其余 ' + rest.length + ' 个（合计）</span>' +
+      '<span class="cm-bar"><i class="h" style="width:' + (rt ? rp.toFixed(2) : 0) + '%"></i>' +
+        '<i class="m" style="width:' + (rt ? (100 - rp).toFixed(2) : 0) + '%"></i></span>' +
+      '<span class="cm-rate ' + rateCls(rp) + '">' + (rt ? pctStr(rp) : '—') + '</span>' +
+      '<span class="cm-miss">' + fmtTok(rm) + '</span></div>';
+  }
+
+  host.innerHTML = html;
+  if (note) {
+    const topMiss = shown.reduce((s, x) => s + x.miss, 0);
+    note.textContent = list.length + ' 个模型有缓存观测 · 前 ' + shown.length +
+      ' 个占未命中 ' + usPct(topMiss, totalMiss);
+    note.title = '未命中 token = 本可复用却重新计算的量，直接按未命中单价计费';
+  }
 }
 
 /* renderCacheChart 缓存的时序视图：柱 = 命中/未命中 token（左轴），折线 = 命中率（右轴）。
@@ -3245,6 +3349,8 @@ async function loadUsage() {
     $('usCacheStats').innerHTML = '';
     $('usCacheChart').innerHTML = '<div class="us-empty">读取用量失败</div>';
     $('usCacheChartNote').textContent = '—';
+    if ($('usCacheModels')) $('usCacheModels').innerHTML = '';
+    if ($('usCacheModelNote')) $('usCacheModelNote').textContent = '—';
     $('usCacheNote').textContent = '—';
     $('usCreditStats').innerHTML = '';
     $('usNote').textContent = '—';

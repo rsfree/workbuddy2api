@@ -1771,3 +1771,135 @@ process.stdout.write(JSON.stringify(out));`
 		t.Errorf("提示应说明分母口径: %s", got.Tip)
 	}
 }
+
+// TestAppJSRenderCacheModels 按模型的缓存排行：**排序键必须是未命中 token，不是命中率**。
+//
+// 这条断言方向看似违反直觉（"排行不该按命中率吗"），但它是实测数据打出来的
+// （2026-10-28 线上 6 小时窗口）：
+//
+//	deepseek-v4.1-flash   命中率 94.6%   未命中 58.2M tok   ← 率最高，重算量却最大
+//	glm-5.3               命中率 26.5%   未命中  3.1M tok   ← 率最低，重算量只有 1/19
+//
+// 按命中率排会把 glm-5.3 顶到第一（看着最该管），而它实际浪费的 token 连 deepseek
+// 的零头都不到；同时 deepseek 的 94.6% 会让人以为"没问题"。命中率低但量小的模型，
+// 优化它没有收益。所以排序键是**未命中绝对量**，命中率只做颜色分档。
+func TestAppJSRenderCacheModels(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+
+const a = src.indexOf('const CACHE_BLOCK_TOKENS');
+const b = src.indexOf('function cacheCell');        // 只要常量，不要 cacheCell
+const c = src.indexOf('/* renderCacheModels');
+const d = src.indexOf('/* renderCacheChart');
+
+const els = {};
+const mk = () => ({ innerHTML: '', textContent: '', title: '' });
+const ctx = {
+  $: id => (els[id] || (els[id] = mk())),
+  esc: s => String(s == null ? '' : s),
+  // fmtTok 保留 B/M/k 单位，测试里要能反解出大小关系
+  fmtTok: v => {
+    const n = Number(v || 0);
+    if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+    if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+    return String(n);
+  },
+  trimFixed: s => String(s),
+  usPct: (x, y) => (Number(y) ? (Number(x) / Number(y) * 100).toFixed(1) : '0.0') + '%',
+  Number, String, Math, isFinite,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(a, b), ctx);
+vm.runInContext(src.slice(c, d) + '\nthis.renderCacheModels = renderCacheModels;', ctx);
+
+const rows = [
+  // 命中率最高、未命中绝对量最大 —— 必须排第一
+  { key: 'deepseek-v4.1-flash', cache_hit_tokens: 1025307862, cache_miss_tokens: 58165282,
+    prompt_tokens: 1083473144, requests: 400 },
+  // 命中率最低、未命中量小 —— 必须排在后面
+  { key: 'glm-5.3', cache_hit_tokens: 1130496, cache_miss_tokens: 3137455,
+    prompt_tokens: 4267951, requests: 300 },
+  { key: 'kimi-k3.1-pro', cache_hit_tokens: 22147072, cache_miss_tokens: 10990564,
+    prompt_tokens: 33137636, requests: 200 },
+  // 短请求模型：平均 prompt 78 < 128，应打「结构」标记
+  { key: 'short-model', cache_hit_tokens: 0, cache_miss_tokens: 78000,
+    prompt_tokens: 78000, requests: 1000 },
+  // 无缓存观测：必须被过滤掉（画成 0% 会造假信号）
+  { key: 'no-obs', cache_hit_tokens: 0, cache_miss_tokens: 0, prompt_tokens: 500, requests: 5 },
+];
+ctx.renderCacheModels(rows);
+
+const html = els['usCacheModels'] ? els['usCacheModels'].innerHTML : '';
+const note = els['usCacheModelNote'] ? els['usCacheModelNote'].textContent : '';
+const order = [...html.matchAll(/class="cm-name">([^<]+)</g)].map(m => m[1].trim());
+process.stdout.write(JSON.stringify({
+  order: order,
+  hasNoObs: html.indexOf('no-obs') >= 0,
+  hasStructural: html.indexOf('>结构<') >= 0 || html.indexOf('结构</span>') >= 0,
+  note: note,
+  hasHeader: html.indexOf('cm-head') >= 0,
+  // 空输入不应崩
+}));`
+
+	f, err := os.CreateTemp(t.TempDir(), "cachemodels-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	raw, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("cache models node test failed: %v\n%s", err, raw)
+	}
+	var got struct {
+		Order         []string `json:"order"`
+		HasNoObs      bool     `json:"hasNoObs"`
+		HasStructural bool     `json:"hasStructural"`
+		Note          string   `json:"note"`
+		HasHeader     bool     `json:"hasHeader"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("解析输出失败: %v\n%s", err, raw)
+	}
+
+	// 🔴 核心断言：未命中量最大的排第一（它的命中率是全场最高的 94.6%）
+	if len(got.Order) < 3 {
+		t.Fatalf("渲染行数不足: %v", got.Order)
+	}
+	if got.Order[0] != "deepseek-v4.1-flash" {
+		t.Errorf("首行应为未命中最多的 deepseek-v4.1-flash（命中率 94.6%% 但重算 58M），实际 %v", got.Order)
+	}
+	// glm-5.3 命中率最低（26.5%）但未命中只有 3.1M，必须排在 kimi 之后
+	gi, ki := -1, -1
+	for i, n := range got.Order {
+		if n == "glm-5.3" {
+			gi = i
+		}
+		if n == "kimi-k3.1-pro" {
+			ki = i
+		}
+	}
+	if gi < 0 || ki < 0 || gi < ki {
+		t.Errorf("glm-5.3(3.1M) 应排在 kimi-k3.1-pro(11.0M) 之后，实际顺序 %v", got.Order)
+	}
+	if got.HasHeader != true {
+		t.Error("缺少表头行")
+	}
+	if got.HasNoObs {
+		t.Error("无缓存观测的模型不该出现在排行里（画成 0% 会造假信号）")
+	}
+	if !got.HasStructural {
+		t.Error("平均 prompt 78 < 128 的模型应被标记为结构性不可命中")
+	}
+	if !strings.Contains(got.Note, "个模型有缓存观测") {
+		t.Errorf("副标题应说明观测模型数: %s", got.Note)
+	}
+}

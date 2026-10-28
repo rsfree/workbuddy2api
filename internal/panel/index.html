@@ -469,6 +469,38 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     #usCacheChart { overflow-x: auto; }
     #usCacheChart svg { min-width: 720px; }
   }
+  /* 缓存按模型排行（.cm-*）。四列栅格：模型名 / 占比条 / 命中率 / 未命中量。
+     用栅格而不是 flex 是为了让三个数值列**跨行对齐**——按 flex 撑开时各行的
+     数字宽度不同，纵向扫视会比不出来（这张表的全部意义就是纵向比较）。 */
+  .cm-list { display: flex; flex-direction: column; gap: 1px; }
+  .cm-row { display: grid; align-items: center;
+    grid-template-columns: minmax(120px, 1.4fr) minmax(90px, 2fr) 62px 78px;
+    gap: 10px; padding: 5px 2px; border-radius: 4px; font-size: 12.5px; }
+  .cm-row:hover { background: var(--surface-2); }
+  .cm-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    color: var(--ink); font-variant-numeric: tabular-nums; }
+  .cm-name .mk { color: var(--ink-3); font-size: 10.5px; margin-left: 4px; }
+  .cm-bar { display: flex; height: 8px; border-radius: 3px; overflow: hidden;
+    background: var(--line); }
+  .cm-bar i { display: block; height: 100%; }
+  .cm-bar .h { background: var(--ok); }
+  .cm-bar .m { background: var(--bad); }
+  .cm-rate { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+  .cm-miss { text-align: right; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+  .cm-row.cm-head { border-bottom: 1px solid var(--line-soft); border-radius: 0;
+    padding-bottom: 4px; margin-bottom: 2px; }
+  .cm-row.cm-head span { color: var(--ink-3); font-size: 11px; font-weight: 600; }
+  /* 尾部「其余 N 个」是**汇总行、不参与排名**：它按定义必然比上面某些行大，
+     不加视觉区隔会被读成"排序乱了"。上边框 + 降饱和把这个语义画出来。 */
+  .cm-row.cm-rest { border-top: 1px dashed var(--line); margin-top: 3px;
+    padding-top: 6px; opacity: .78; }
+  .cm-row.cm-rest .cm-bar { height: 5px; }
+  @media (max-width: 700px) {
+    /* 窄屏把"未命中量"折行到第二行，否则模型名会被压到只剩几个字符。 */
+    .cm-row { grid-template-columns: minmax(84px, 1fr) minmax(60px, 1fr) 56px; }
+    .cm-row > .cm-miss { grid-column: 1 / -1; text-align: left; font-size: 11px; }
+    .cm-row.cm-head > .cm-miss { display: none; }
+  }
   /* 缓存视图的色块与折线：命中=绿（省钱）、未命中=红（花钱）、命中率折线=强调色。
      刻意不复用 .sw-p/.sw-c —— 那组是 Token 视图的语义（prompt/completion），
      两套视图共用一个类名时，图例只要有一处没换就会串色。 */
@@ -998,6 +1030,15 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               </span>
             </div>
             <div id="usCacheChart" class="uschart-body"></div>
+          </div>
+          <div class="uschart" style="margin-top:14px">
+            <div class="uschart-hd">
+              <span class="lb">按模型</span>
+              <span class="note" id="usCacheModelNote">—</span>
+              <span class="grow"></span>
+              <span class="legend">按<b>未命中</b> token 降序（重算量，不是命中率）</span>
+            </div>
+            <div id="usCacheModels" class="cm-list"></div>
           </div>
         </div>
       </div>
