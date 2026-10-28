@@ -103,6 +103,15 @@ func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 	}
 	wg.Wait()
 
+	// v1 关卡口径（/activity/growth/tasks，无 /v2 前缀）是**另一套任务体系**，
+	// 与 v2 列表互不相交，此前完全没被扫到。它单独扫：不进执行队列（无 reward、
+	// claim 恒 400），只把「上游上了什么新关卡」记进目录。
+	// 门控：本轮 0 个账号真正跑过（全部因账号锁跳过 / 池为空）时**一个请求都不发**。
+	// tasksweep_test.go 的「忙账号不产生上游请求」契约就是靠这条守的。
+	if st.Accounts > st.Skipped {
+		st.Discovered += p.observeLegacyCatalog()
+	}
+
 	// 目录落盘：本轮观察到的新码持久化，重启后不再重复报「新任务」。
 	if st.Discovered > 0 {
 		if err := p.catalog().flush(); err != nil {
@@ -293,4 +302,40 @@ func (p *Panel) sweepAccountWithRescue(a *auth.Auth, uid string, zeroCreditRescu
 		res.claimed++
 	}
 	return res
+}
+
+// observeLegacyCatalog 扫一次 v1 关卡口径并写入任务目录，返回首次出现的码数。
+//
+// 为什么每轮只扫一个账号：v1 关卡是**全局配置**，实测 40 个账号下发的是同一批
+// 5 个码（first_chat / skill_installed / wechat_linked / expert_summoned /
+// template_used）。逐号扫会让 200+ 账号每分钟各多打一次上游，收益为零。
+//
+// 为什么不进执行队列：这 5 个码没有 reward_credit/reward_energy，web 与 chat
+// 两个域的 claim 都返回 400 task not completed（2026-10-28 实测）——它是等级
+// 进度，不是可领奖任务。写进目录只为「换关卡了要能看见」。
+func (p *Panel) observeLegacyCatalog() int {
+	for _, ps := range p.cfg.Pool.List() {
+		if ps.Disabled {
+			continue
+		}
+		a := p.cfg.Pool.AuthByUID(ps.UID)
+		if a == nil || a.IsGlobal() || a.IsEnterprise() {
+			continue // 无个人成长体系：零上游请求
+		}
+		tasks, err := p.cfg.Upstream.ListLegacyTasks(a)
+		if err != nil {
+			// 单点失败直接收工（下一轮自然重试）：目录是辅助观测，不该重试风暴。
+			return 0
+		}
+		n := 0
+		for _, t := range tasks {
+			if p.catalog().observeLegacy(t) {
+				n++
+				log.Printf("panel: 发现 v1 关卡 code=%s 标题=%q 等级=%q 状态=%s → %s",
+					t.Code, t.Title, t.LevelName, t.Status, legacyAutoNote)
+			}
+		}
+		return n
+	}
+	return 0
 }

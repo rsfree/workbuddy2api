@@ -4617,3 +4617,81 @@ function renderCapacity(d) {
 $('btnCapacity').onclick = () => loadCapacity(true);
 $('capDays').onchange = () => loadCapacity();
 $('capHours').onchange = () => loadCapacity();
+
+/* ══ 成长资产（签到活动 + 能量）══════════════════════════════════════════
+   为什么独立卡片：这两组数据每个账号各打一次上游（60 号 ≈ 120 个请求、10~20 秒），
+   不能进 /overview 热路径——那会拖慢每一次刷新。这里按需拉：进页面 3 秒后自动拉一次
+   （每会话一次），之后靠「检查」手动刷新。
+   「未签」是最有行动价值的信号：漏一天就是 100 分，而且连签档位直接断档。 */
+const LS_GROW_FOLD = 'wb2api.growFold';
+const GROW_AUTO_KEY = 'wb2api.growAutoAt';
+const GROW_AUTO_GAP_MS = 30 * 60 * 1000;   // 同一个会话里半小时内不重复自动拉
+let growFetching = false;
+
+function growFolded() { return localStorage.getItem(LS_GROW_FOLD) === '1'; }
+function applyGrowFold() {
+  const pad = $('growPad'), btn = $('btnGrowFold');
+  if (!pad || !btn) return;
+  const folded = growFolded();
+  pad.hidden = folded;
+  btn.textContent = folded ? '展开' : '收起';
+  btn.setAttribute('aria-expanded', folded ? 'false' : 'true');
+}
+function growName(r) { return r.nickname || String(r.uid || '').slice(0, 8); }
+
+function renderGrowthAssets(d) {
+  const s = d.summary || {}, a = d.activity || {}, rows = d.accounts || [];
+  const chips = [];
+  if (a.season) chips.push('<span class="chip">S' + a.season + ' ' + esc(a.theme_name || '签到活动') + '</span>');
+  if (a.end_time) chips.push('<span class="chip">截止 ' + esc(String(a.end_time).slice(0, 10)) + '</span>');
+  chips.push('<span class="chip">已签 ' + s.checked_in + '/' + s.accounts + '</span>');
+  if (s.missing) chips.push('<span class="chip on">未签 ' + s.missing + '</span>');
+  chips.push('<span class="chip">能量 ' + (s.energy_total || 0) + '</span>');
+  if (s.credits_total) chips.push('<span class="chip">活动累计 ' + s.credits_total + ' 分</span>');
+  if (s.errors) chips.push('<span class="chip on">查询失败 ' + s.errors + '</span>');
+
+  const miss = rows.filter(r => !r.err && !r.today_checked_in)
+    .sort((x, y) => x.streak_days - y.streak_days);
+  const low = rows.filter(r => !r.err).sort((x, y) => x.streak_days - y.streak_days).slice(0, 6);
+
+  let html = '<div class="chips" style="flex-wrap:wrap">' + chips.join('') + '</div>';
+  html += '<div class="empty" style="margin-top:8px">' + (miss.length
+    ? '未签：' + miss.map(r => esc(growName(r)) + '（连签 ' + r.streak_days + ' 天）').join(' · ')
+    : '今日全部已签') + '</div>';
+  if (low.length) {
+    html += '<div class="empty">连签最短：' + low.map(r =>
+      esc(growName(r)) + ' ' + r.streak_days + ' 天/本周 ' + r.week_checkin_days + ' 天').join(' · ') + '</div>';
+  }
+  $('growList').innerHTML = html;
+}
+
+async function loadGrowthAssets() {
+  if (growFetching || !$('growList')) return;
+  growFetching = true;
+  $('growNote').textContent = '查询中…';
+  try {
+    const d = await api('growth_assets', { timeoutMs: API_SLOW_GET_TIMEOUT_MS });
+    renderGrowthAssets(d);
+    $('growNote').textContent = '上次查询 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false }) +
+      (d.elapsed ? ' · 耗时 ' + (d.elapsed / 1000).toFixed(1) + 's' : '');
+    try { sessionStorage.setItem(GROW_AUTO_KEY, String(Date.now())); } catch (e) {}
+  } catch (e) {
+    $('growNote').textContent = '查询失败：' + esc(e.message);
+  }
+  growFetching = false;
+}
+
+if ($('btnGrow')) $('btnGrow').onclick = () => loadGrowthAssets();
+if ($('btnGrowFold')) {
+  $('btnGrowFold').onclick = () => {
+    try { localStorage.setItem(LS_GROW_FOLD, growFolded() ? '0' : '1'); } catch (e) {}
+    applyGrowFold();
+  };
+}
+applyGrowFold();
+// 进页面自动拉一次：延迟 3 秒让首屏先渲染，避免和 overview 抢带宽。
+setTimeout(() => {
+  let seen = 0;
+  try { seen = Number(sessionStorage.getItem(GROW_AUTO_KEY) || 0); } catch (e) {}
+  if (Date.now() - seen > GROW_AUTO_GAP_MS) loadGrowthAssets();
+}, 3000);

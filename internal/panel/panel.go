@@ -241,6 +241,9 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/compensation", p.withAuth(p.compensation))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/compensation", p.withAuth(p.accountCompensationClaim))
 	p.mux.HandleFunc("POST /panel/api/compensation_all", p.withAuth(p.compensationAll))
+	// 成长资产巡检（签到活动状态 + 能量余额，只读、按需拉取）：overview 是热路径，
+	// 这两个数据每号要各打一次上游，只能放在独立端点上，前端卡片打开时才查。
+	p.mux.HandleFunc("GET /panel/api/growth_assets", p.withAuth(p.growthAssets))
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API

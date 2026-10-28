@@ -36,6 +36,12 @@ type CatalogEntry struct {
 	Energy    int64     `json:"energy,omitempty"`
 	Target    int64     `json:"target,omitempty"`
 	Auto      string    `json:"auto,omitempty"` // 已具备的自动动作说明；空 = 未适配
+	// Source 任务码来自哪套口径：v2（默认/PC）、mp（小程序）、legacy（v1 关卡）。
+	// 三套是**不同资源**：v1 只有进度语义，v2/mp 才有 accept/claim。混在一张
+	// 目录里必须能区分，否则「未适配」会被误读成漏做动作。
+	Source    string    `json:"source,omitempty"`
+	// Level v1 关卡的等级名（「养虾尝试」…「控虾大神」），v2/mp 恒空。
+	Level     string    `json:"level,omitempty"`
 	FirstSeen time.Time `json:"first_seen"`
 	LastSeen  time.Time `json:"last_seen"`
 	Seen      int       `json:"seen"` // 出现在列表中的轮次数
@@ -91,8 +97,12 @@ func (c *taskCatalog) observe(t upstream.Task) bool {
 	defer c.mu.Unlock()
 	e, ok := c.entries[code]
 	if !ok {
-		e = &CatalogEntry{Code: code, FirstSeen: now}
+		e = &CatalogEntry{Code: code, FirstSeen: now, Source: sourceV2}
 		c.entries[code] = e
+	}
+	// 老目录（升级前落盘）没有 source 字段：v2 是历史唯一来源，直接补默认。
+	if e.Source == "" {
+		e.Source = sourceV2
 	}
 	if t.Title != "" {
 		e.Title = t.Title
@@ -107,6 +117,53 @@ func (c *taskCatalog) observe(t upstream.Task) bool {
 	} else {
 		e.Auto = ""
 	}
+	e.LastSeen = now
+	e.Seen++
+	c.dirty = true
+	return !ok
+}
+
+// 任务码来源标记（见 CatalogEntry.Source）。
+const (
+	sourceV2     = "v2"     // /v2/activity/growth/tasks（PC 默认口径）
+	sourceMP     = "mp"     // 同上 + X-Client-Platform: miniprogram
+	sourceLegacy = "legacy" // /activity/growth/tasks（v1「养虾」关卡，无领奖语义）
+)
+
+// legacyAutoNote v1 关卡的固定动作说明。
+//
+// 不能留空——空 = 「未适配（需人工登记动作）」，而这 5 个码**本来就没有动作可做**：
+// 响应无 reward_credit/reward_energy，web 与 chat 两个域的 claim 均返回
+// 400 task not completed（2026-10-28 两账号实测）。写成明确文案，运维才不会被
+// 目录里的「未适配」误导去补动作。
+const legacyAutoNote = "v1 关卡：仅进度/等级展示，无 reward 字段且 claim 恒 400，不参与领奖"
+
+// observeLegacy 记录一条 v1 关卡，返回是否首次出现。
+// 与 observe 分开是因为字段集不同（无 reward/progress/accept），强行复用 Task
+// 会让「reward 缺失」看起来像解析异常。
+func (c *taskCatalog) observeLegacy(t upstream.LegacyTask) bool {
+	code := strings.TrimSpace(t.Code)
+	if code == "" {
+		return false
+	}
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[code]
+	if !ok {
+		e = &CatalogEntry{Code: code, FirstSeen: now, Source: sourceLegacy}
+		c.entries[code] = e
+	}
+	if e.Source == "" {
+		e.Source = sourceLegacy
+	}
+	if t.Title != "" {
+		e.Title = t.Title
+	}
+	if t.LevelName != "" {
+		e.Level = t.LevelName
+	}
+	e.Auto = legacyAutoNote
 	e.LastSeen = now
 	e.Seen++
 	c.dirty = true

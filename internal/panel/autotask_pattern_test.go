@@ -40,12 +40,16 @@ func TestActionForTaskResolvesFamily(t *testing.T) {
 			want: false, // 含专家/召唤但没有具体对象，不落族模式
 		},
 		{
-			name: "排除-同模板但非专家",
+			// 原意图：标题沿用「体验「X」」模板但对象不是专家，不该落**专家族**。
+			// 该意图仍然成立（走的是画布分支、不召唤专家）；但 2026-10-28 起它会
+			// 被文案动词族按「设计创意/画布」接管，所以从「不可自动化」变成
+			// 「可自动」——这正是兜底映射的目的：换码形状的画布任务不必再人工补表。
+			name: "同模板但非专家-落画布动词族",
 			task: upstream.Task{
 				TaskCode: "design_canvas_new", Title: "体验「设计创意模式」",
 				Description: "进入「新建任务」，切换滑块到「设计创意」模式，并创建1个画布。",
 			},
-			want: false,
+			want: true,
 		},
 		{name: "未知码", task: upstream.Task{TaskCode: "invite_friend_1"}, want: false},
 		{name: "缺 slug", task: upstream.Task{TaskCode: "expert_use"}, want: false},

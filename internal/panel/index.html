@@ -925,6 +925,21 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="pad"><div id="compList"></div></div>
       </div>
 
+      <!-- 成长资产（签到活动 + 能量）：赛季/主题/截止日、今日未签名单、能量合计。
+           这两组数据每个账号要各打一次上游（60 号 ≈ 120 个请求），不能挂在
+           /overview 热路径上，所以按需拉取；卡片本身常驻，入口不藏在隐藏容器里
+           （issue #137 的教训：入口藏在自己的隐藏卡片里 = 永远点不到）。 -->
+      <div class="box" id="growBox">
+        <header>
+          <h3>成长资产<span class="hint">签到活动（赛季制）· 连签天数 · 能量余额 · 按需查询，约 10~20 秒</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="growNote"></span>
+          <button class="xs" id="btnGrowFold" aria-expanded="true">收起</button>
+          <button class="xs" id="btnGrow">检查</button>
+        </header>
+        <div class="pad" id="growPad"><div id="growList"><div class="empty">点「检查」拉取：赛季与截止日、今日未签名单、能量合计</div></div></div>
+      </div>
+
       <div class="box">
         <header>
           <h3>账号池</h3>

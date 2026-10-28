@@ -233,6 +233,12 @@ func actionForTask(t upstream.Task) *autoAction {
 			runTask:  runExpertExperience,
 		}
 	}
+	// 最后兜底：文案动词映射（只收纯事件上报类动作，见 autotask_verbs.go）。
+	// 放置顺序不可前移——精确表保证「Sequential_Tasks_2 完成 1 次专家对话」这类
+	// 标题含「对话」的专家任务仍走专用链路，不会被聊天事件顶掉。
+	if act := verbActionFor(t); act != nil {
+		return act
+	}
 	return nil
 }
 
