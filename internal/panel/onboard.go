@@ -43,6 +43,13 @@ import (
 // 与既有链路的关系：`auto_all` 负责「把 0 进度任务做出来」，`tasksweep` 只做
 // 「accept 未接受 + claim 已达标未领」。本文件把前者串成导入后的自动步骤，并额外
 // 补一轮 sweep，把动作点亮但没来得及领的奖励也一起领掉（等同人工两轮 auto_all）。
+//
+// 🔴 静默期（2026-10-28）：本流水线**必须**遵守新号任务静默期
+// （scheduler.TaskMuted，schedule.new_account_grace_days，缺省 3 天），命中则记
+// skipped 并交出控制权 —— 到期后由调度器 growth 时点自动做，不需要延迟队列。
+// 历史教训：graceguard.go 只给 HTTP 入口加了闸门，「单任务」与「一键完成」走
+// runAutoAll 的另一条路被堵住了，但 onboard 这条内部调用没堵 —— 一旦有号经
+// 授权登录入队，它会在静默期内立刻跑完整条行为链，正好是静默期要防的事。
 
 // onboardMaxRecords 留痕上限（进程内存，账号数有界）。
 const onboardMaxRecords = 100
@@ -80,11 +87,14 @@ type onboardJob struct {
 // 默认实现 execOnboard 走真实上游；测试可注入替身避免真实对话。
 type onboardExecutor func(p *Panel, a *auth.Auth) (claimed int, before, after int64, err error)
 
-// onboard 流水线里「不跑」的三种情形（记为 skipped，不是故障）。
+// onboard 流水线里「不跑」的四种情形（记为 skipped，不是故障）。
 var (
 	errOnboardBusy       = errors.New("该账号有任务动作正在执行中，本轮跳过")
 	errOnboardEnterprise = errors.New("企业版/已绑定租户会话无个人成长体系")
 	errOnboardGlobal     = errors.New("global 账号无 CN 成长体系")
+	// errOnboardGrace 新号静默期未过。判定复用 scheduler.TaskMuted（唯一口径），
+	// 用 %w 包装后再带上「第 N/M 天 · 何时到期」的原因串。
+	errOnboardGrace = errors.New("新号静默期未过，本轮不做成长行为链")
 )
 
 // parseOnboardMode 归一化 onboard 参数：auto 走单号判据；1/true/force 强制；
@@ -183,7 +193,8 @@ func (p *Panel) runOnboard(job onboardJob) {
 	case err == nil:
 		r.Status = "done"
 		r.Delta = after - before
-	case errors.Is(err, errOnboardBusy), errors.Is(err, errOnboardEnterprise), errors.Is(err, errOnboardGlobal):
+	case errors.Is(err, errOnboardBusy), errors.Is(err, errOnboardEnterprise),
+		errors.Is(err, errOnboardGlobal), errors.Is(err, errOnboardGrace):
 		r.Status = "skipped"
 		r.Message = err.Error()
 	default:
@@ -223,6 +234,20 @@ func execOnboard(p *Panel, a *auth.Auth) (claimed int, before, after int64, err 
 	}
 	if a.IsEnterpriseSession() {
 		return 0, 0, 0, errOnboardEnterprise
+	}
+
+	// 🔴 新号任务静默期：本流水线跑的是成长行为链（真实对话 + 事件上报），必须与
+	// 手动「一键完成」/ 调度器成长队列同口径拦截。否则「授权登录即入队」会成为
+	// 绕过静默期的第三条路 —— graceguard.go 只堵了 HTTP 入口，这里走的是内部调用，
+	// 不经过任何 handler。到期后由调度器 growth 时点自动接手（队列内部同样按
+	// TaskMuted 逐个放行），因此这里只跳过，不排延迟任务。
+	if p.cfg.Scheduler != nil && p.cfg.Pool != nil {
+		if st, ok := p.cfg.Pool.Status(a.UID); ok {
+			if muted, why := p.cfg.Scheduler.TaskMuted(st); muted {
+				p.cfg.Scheduler.NoteTaskGraceSkip(st, "onboard", why)
+				return 0, st.Credits, st.Credits, fmt.Errorf("%w：%s", errOnboardGrace, why)
+			}
+		}
 	}
 
 	if rm, _, uerr := p.cfg.Upstream.UserResource(a); uerr == nil {

@@ -3,16 +3,19 @@ package panel
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -412,5 +415,88 @@ func TestOnboardOnLoginNilAuth(t *testing.T) {
 	p := &Panel{}
 	if ok := p.onboardOnLogin(nil, true, "cn"); ok {
 		t.Fatal("nil 凭证不应入队")
+	}
+}
+
+// TestExecOnboardBlocksDuringGrace 静默期内 onboard 必须一只请求都不发。
+//
+// 为什么这条测试重要：graceguard.go 只给 HTTP 入口加了闸门，而 execOnboard 是
+// 直接调 runAutoAll 的内部路径，不经过任何 handler。一旦漏拦，"授权登录即入队"
+// 就会在静默期内立刻跑完整条行为链（真实对话 + 事件上报），正好是静默期要防的事。
+// 因此这里断言的是**零上游请求**，而不只是错误类型。
+func TestExecOnboardBlocksDuringGrace(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Write([]byte("{\"code\":0,\"msg\":\"OK\",\"data\":{}}"))
+	}))
+	defer srv.Close()
+
+	newPanel := func(graceDays int) *Panel {
+		return &Panel{cfg: Config{
+			Pool:      pool.New(""),
+			Upstream:  &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL, WebBaseCN: srv.URL},
+			AuthDir:   t.TempDir(),
+			Scheduler: scheduler.New(scheduler.Config{NewAccountGraceDays: graceDays}),
+		}}
+	}
+
+	cases := []struct {
+		name      string
+		importedAt time.Time
+		graceDays int
+		wantGrace bool
+	}{
+		{"静默期内必须拦", time.Now().Add(-24 * time.Hour), 3, true},
+		{"刚导入必须拦", time.Now(), 3, true},
+		{"已过静默期放行", time.Now().Add(-4 * 24 * time.Hour), 3, false},
+		{"静默期关闭放行", time.Now(), 0, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			atomic.StoreInt32(&hits, 0)
+			p := newPanel(c.graceDays)
+			a := &auth.Auth{UID: "grace-" + c.name, Nickname: "g", AccessToken: "at", ExpiresAt: time.Now().Add(time.Hour).Unix()}
+			a.EnsureImportedAt(c.importedAt)
+			p.cfg.Pool.Add(a)
+
+			claimed, before, after, err := execOnboard(p, a)
+			if c.wantGrace {
+				if !errors.Is(err, errOnboardGrace) {
+					t.Fatalf("err=%v，期望 errOnboardGrace", err)
+				}
+				if claimed != 0 {
+					t.Fatalf("claimed=%d，静默期应为 0", claimed)
+				}
+				if before != after {
+					t.Fatalf("静默期不应变动余额 before=%d after=%d", before, after)
+				}
+				if got := atomic.LoadInt32(&hits); got != 0 {
+					t.Fatalf("静默期内不应发起任何上游请求，实际 %d 次", got)
+				}
+				return
+			}
+			// 放行路径：不再返回静默期错误即可（后续会因桩服务返回空 data 而失败，
+			// 这是预期的，不是本测试关心的东西）。
+			if errors.Is(err, errOnboardGrace) {
+				t.Fatalf("已过静默期/GraceDays<=0 不应被拦，err=%v", err)
+			}
+		})
+	}
+}
+
+// TestOnboardMarkGraceSkipped 静默期归因到 skipped（不是 error），且原因串带天数。
+func TestOnboardMarkGraceSkipped(t *testing.T) {
+	p := &Panel{}
+	p.onboardRun = func(_ *Panel, _ *auth.Auth) (int, int64, int64, error) {
+		return 0, 100, 100, fmt.Errorf("%w：%s", errOnboardGrace, "新号静默期 第1/3天（10-31 11:05 到期，credits=100）")
+	}
+	p.enqueueOnboard([]*auth.Auth{{UID: "grace-log-1", Nickname: "g"}}, "test")
+	recs := waitOnboard(t, p, 1)
+	if recs[0].Status != "skipped" {
+		t.Fatalf("status=%s want skipped", recs[0].Status)
+	}
+	if !strings.Contains(recs[0].Message, "静默期") {
+		t.Fatalf("原因串应含静默期说明，got %q", recs[0].Message)
 	}
 }
