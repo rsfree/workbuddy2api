@@ -405,7 +405,14 @@ function go(v) {
   if (v === 'models' && !$('mdBody').children.length) loadModels();
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
-  if (v === 'usage') loadUsage();
+  // 用量页的「路由诊断」三条（sCacheHit / sStickyHit / sAffinityHit）来自 overview 的
+  // cache 字段，不属于 loadUsage 的窗口数据，只在 start() 与账号池轮询时更新。若不补拉，
+  // 切到本页看到的是「进入页面那一刻」的进程内快照，之后一直是旧值且无任何提示。
+  // 进视图拉一次即可（这三条是累计值，不随时间范围变），不塞进 5 秒轮询。
+  // 第二参 metricsOnly：本页不显示账号表，跳过 130 行的 renderAccounts 重建——
+  // 否则每次切到用量页都会白刷一遍隐藏的账号池表格（用户报的性能问题正是这个）。
+  // loadOverview 是 async，不 await：等它返回会拖慢视图切换。
+  if (v === 'usage') { loadUsage(); loadOverview(true, true); }
   if (v === 'capacity') loadCapacity();
   if (v === 'packages') loadPackages();
   // 到期提醒卡片：默认可见，进页面即用 overview 快照渲染（零上游请求，随首页统计
@@ -553,7 +560,12 @@ function renderModelLocks(rows) {
   }
 }
 
-async function loadOverview(quiet) {
+/* loadOverview(quiet, metricsOnly)
+   quiet       — 失败不弹 toast（轮询/切视图用）。
+   metricsOnly — 只更新顶部与统计量，跳过账号表 / 模型锁池 / 到期卡的重建。用量页
+                 调它补「路由诊断」三条时用：那页看不见账号表，130 行 innerHTML
+                 白刷一遍纯属浪费，而这个面板的性能痛点正是全量重建。 */
+async function loadOverview(quiet, metricsOnly) {
   try {
     const d = await api('overview');
     overviewData = d;
@@ -622,13 +634,15 @@ async function loadOverview(quiet) {
     $('accNote').textContent = d.in_flight_full ? d.in_flight_full + ' 个账号在途占满' : '';
     const up = Math.floor(d.uptime_sec);
     $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
-    renderAccounts(d.accounts || []);
-    renderModelLocks(d.model_locks);
-    // 到期卡片跟随首页统计同步刷新（用同一份响应里的按日批次，不额外发请求）。
-    // 2 分钟内的实时明细最新且更全，保留；过期后由 state 快照接管，避免点过一次
-    // 「检查」之后卡片永远停在那一刻的旧数据。
-    const liveFresh = lastPackages && (Date.now() - lastPackagesAt) < EXP_FRESH_MS;
-    if ($('expBox') && !liveFresh) renderExpirySnapshot(d);
+    if (!metricsOnly) {
+      renderAccounts(d.accounts || []);
+      renderModelLocks(d.model_locks);
+      // 到期卡片跟随首页统计同步刷新（用同一份响应里的按日批次，不额外发请求）。
+      // 2 分钟内的实时明细最新且更全，保留；过期后由 state 快照接管，避免点过一次
+      // 「检查」之后卡片永远停在那一刻的旧数据。
+      const liveFresh = lastPackages && (Date.now() - lastPackagesAt) < EXP_FRESH_MS;
+      if ($('expBox') && !liveFresh) renderExpirySnapshot(d);
+    }
   } catch (e) { if (!quiet) toast(e.message, 'err'); }
 }
 

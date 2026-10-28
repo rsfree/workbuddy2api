@@ -253,7 +253,10 @@
 
   /* ── 5. 其余栅格与列表：全部收紧间距，统一 12px 圆角卡片感 ──────── */
   .view { padding: 10px 10px 40px; }
-  .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); border-radius: 12px; margin-bottom: 10px; }
+  /* 列数交给主样式的 .stats { auto-fit, minmax(132px,1fr) } 自适应，这里不再覆盖
+     grid-template-columns——写死 3 列会让 7 项排成「2 行 + 1 个孤项」。
+     只保留圆角与间距的收窄。 */
+  .stats { border-radius: 12px; margin-bottom: 10px; }
   .stat { padding: 7px 9px; min-width: 0; }
   .stat .v { font-size: 15px; line-height: 1.2; white-space: normal; overflow-wrap: anywhere; }
   .stat .k { font-size: 9.5px; margin-top: 1px; }

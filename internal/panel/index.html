@@ -11,7 +11,9 @@
 :root {
   --bg: #0c0e14; --surface: #14171f; --surface-2: #1a1e28; --raise: #202531;
   --line: #262c3a; --line-soft: #1e232e;
-  --ink: #e8ebf2; --ink-2: #a8b0c2; --ink-3: #6b7488;
+  /* --ink-3 承载表头 / .k 标签 / 时间戳 / hint，全部是 11.5px 小字，必须过 AA 4.5:1。
+     原 #6b7488 在 --surface 上实测 3.82:1（不达标），换 #7c8599 后 4.84:1。 */
+  --ink: #e8ebf2; --ink-2: #a8b0c2; --ink-3: #7c8599;
   --accent: #5b7cfa; --accent-ink: #ffffff; --accent-soft: rgba(91,124,250,.13);
   --ok: #3ddc97; --ok-soft: rgba(61,220,151,.12);
   --warn: #f5b544; --warn-soft: rgba(245,181,68,.12);
@@ -23,9 +25,13 @@
 [data-theme="light"] {
   --bg: #f4f5f8; --surface: #ffffff; --surface-2: #f8f9fb; --raise: #ffffff;
   --line: #e2e5ec; --line-soft: #eceef3;
-  --ink: #14171f; --ink-2: #545c6e; --ink-3: #8b93a5;
+  /* 浅色下这两个色原来都不达标（实测 on --surface）：--ink-3 #8b93a5 仅 3.08:1、
+     --ok #0f9d63 仅 3.49:1，而它们分别用于 11.5px 标签与 .tag.ok 状态文字。
+     改 #6f7789 → 4.49:1、#0a7a4c → 5.38:1。--ok-soft 同步换基色，避免实色与
+     浅底来自两个不同的绿。 */
+  --ink: #14171f; --ink-2: #545c6e; --ink-3: #6f7789;
   --accent: #3d5fe0; --accent-ink: #ffffff; --accent-soft: rgba(61,95,224,.09);
-  --ok: #0f9d63; --ok-soft: rgba(15,157,99,.1);
+  --ok: #0a7a4c; --ok-soft: rgba(10,122,76,.1);
   --warn: #b47611; --warn-soft: rgba(180,118,17,.11);
   --bad: #cf3b34; --bad-soft: rgba(207,59,52,.09);
   --shadow: 0 1px 2px rgba(16,20,32,.06), 0 8px 24px -14px rgba(16,20,32,.14);
@@ -180,17 +186,32 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .inline { display: flex; align-items: center; gap: 9px; }
 
 /* ── 统计条（观测区）──────────────────────────────────────────────── */
+/* 列数是自适应的，不写死：写死 7 列时窄屏继任的 3 列 / 2 列都会让 7 项排成
+   「2 行 + 1 个孤项」（10 项时代是 3 行 + 1，同一个病）。auto-fit 会把最后一行
+   的剩余空间均摊给已有项，任意项数都不留空，也就不必再手写 3 个断点。
+   132px 下限按最长标签「积分剩余 / 总额」核过：11.5px 中文 ≈7 字 = 80px，
+   加 `/` 与两侧空格 ≈93px，再加大号左右内边距 34px ≈127px，留 5px 余量。
+   注：大号数值（26px 等宽，如「12,480 / 40,000」≈230px）比标签宽，是真正的
+   约束项；窄屏靠 mobile.css 的 `.stat .v { white-space:normal }` 折行兜底，
+   不在这里再压字号。 */
 .stats {
-  display: grid; grid-template-columns: repeat(7, 1fr);
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
   border: 1px solid var(--line); border-radius: 11px; background: var(--surface);
   overflow: hidden; margin-bottom: 20px; box-shadow: var(--shadow);
 }
-@media (max-width: 980px) { .stats { grid-template-columns: repeat(3, 1fr); } }
-@media (max-width: 560px) { .stats { grid-template-columns: repeat(2, 1fr); } }
 .stat { padding: 14px 17px; border-right: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft); }
 .stat .v { font: 600 26px/1.15 var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -.02em; white-space: nowrap; }
 .stat .k { color: var(--ink-3); font-size: 11.5px; margin-top: 5px; }
 .stat.good .v { color: var(--ok); } .stat.warn .v { color: var(--warn); } .stat.bad .v { color: var(--bad); }
+/* 3 项诊断条（用量 → 路由诊断）：复用 .stat 的单元格排版，但**去掉外层卡片**——
+   它已经躺在 .box 里，再套一层底/边框/阴影就成了盒中盒。列数显式给 3，
+   避免继承 .stats 的 7 列后右侧空出 4/7（账号池那处错位的同款成因）。
+   列宽用 minmax(0,1fr) 而非裸 1fr：与 mobile.css 的 .stats 同款防御，
+   否则窄屏下长文案（如 "94.6%"）会把 1fr 列撑开、整条溢出。 */
+.stats.s3 { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-bottom: 0;
+  border: none; border-radius: 0; background: none; box-shadow: none; }
+.stats.s3 .stat { border-bottom: none; }
+.stats.s3 .stat:last-child { border-right: none; }
 
 /* ── 面板块 ───────────────────────────────────────────────────────── */
 .box { background: var(--surface); border: 1px solid var(--line); border-radius: 11px; box-shadow: var(--shadow); margin-bottom: 20px; overflow: hidden; }
@@ -223,7 +244,11 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
    伪元素在表格行内会被浏览器当作匿名单元格插入行首，整行内容右移一列、
    与表头错位——窗口越宽列越宽越明显。 */
 .acc .mark { width: 3px; min-width: 3px; padding: 0; }
-.acc .mark i { display: block; width: 3px; height: 100%; min-height: 36px; background: var(--ok); }
+/* 健康色条默认透明：色条是「异常指示灯」，不是「健康指示灯」。
+   此前默认 background:var(--ok)，130 个正常号会画出 130 根满高绿条，异常那几根
+   黄/红条被同一色阶的绿淹没——运维扫一遍只看到一片绿，等于没有信号。
+   改成只有 cool/off 行着色后，正常行完全安静，异常色条自动浮出来（零额外部件）。 */
+.acc .mark i { display: block; width: 3px; height: 100%; min-height: 36px; background: transparent; }
 .acc tbody tr.cool .mark i { background: var(--warn); }
 .acc tbody tr.off .mark i { background: var(--bad); }
 /* 模型表无色条（健康指示只属于账号表）。 */
@@ -754,15 +779,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="stat warn"><div class="v" id="sPaused">-</div><div class="k">已暂停选号</div></div>
         <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分剩余 / 总额</div></div>
         <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
-        <!-- 缓存命中率与粘性命中率必须并排看：粘性命中率掉 = 会话在被搬号（账号级
-             前缀缓存必然全冷，该修路由）；粘性命中率高而缓存命中率低 = 上游/该模型
-             本身没缓存（网关无从优化）。数值是进程内累计，重启归零。 -->
-        <div class="stat" title="上游回报的前缀缓存命中 token 占比（hit / (hit+miss)），进程内累计"><div class="v" id="sCacheHit">-</div><div class="k">前缀缓存命中</div></div>
-        <div class="stat" title="会话粘性命中率（同号比例）。掉下去说明会话在被搬号，缓存必然全冷"><div class="v" id="sStickyHit">-</div><div class="k">粘性命中（同号）</div></div>
-        <!-- 前缀亲和：不同会话但共享同一段 system+tools 时，是否被撮合到同一个号。
-             它是粘性解决不了的那一半——粘性管「同一会话多轮」，亲和管「多个并行会话
-             共享的共同前缀」。只看粘性正常就以为缓存没问题，是这里最常见的误判。 -->
-        <div class="stat" title="前缀亲和命中率：会话新建时，是否落到了「这段 system+tools 缓存已热」的账号（悬停看前缀占比——占比小则命中率再高也省不下钱）"><div class="v" id="sAffinityHit">-</div><div class="k">前缀亲和（同前缀）</div></div>
+        <!-- 前缀缓存命中 / 粘性命中 / 前缀亲和三条是**路由诊断**（进程内累计），
+             不是「池子现在能不能扛」，与上面 7 个容量指标不是同一个决策，故移到
+             「用量 → 路由诊断」。7 项正好填满 .stats 的 7 列一行，不再出现
+             第二行只有 3 项、右侧空出 4/7 的错位。 -->
       </div>
 
       <!-- 卡片默认可见：此前 hidden + 「仅点检查才渲染」形成死锁（按钮藏在隐藏卡片里，
@@ -1041,6 +1061,29 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div id="usCacheModels" class="cm-list"></div>
           </div>
         </div>
+      </div>
+
+      <!-- 路由诊断：从「账号池」统计条移来的第 8/9/10 项。它们回答的是「会话有没有
+           被搬号、前缀有没有被撮合」，不是「池子现在能不能扛」，与容量指标不是同一个
+           决策，所以留在用量侧。
+           ⚠ 口径差异必须写在标题里：这三条是**进程内累计**（loadOverview 的 cache
+           字段），不跟随本页上方的时间范围筛选，重启归零。不写清楚会被当成窗口值读。
+           名额靠 id 承载（sCacheHit / sStickyHit / sAffinityHit），由 loadOverview
+           判空填充；它们所在容器**不能**是 renderUsage/renderCacheBox 会整体
+           innerHTML 重写的 #usStats / #usCacheStats，否则刷新一次节点就被抹掉。 -->
+      <div class="box" id="routeDiagBox">
+        <header>
+          <h3>路由诊断 <span class="hint">进程内累计 · 不随上方时间范围筛选 · 重启归零</span></h3>
+        </header>
+        <div class="stats s3">
+          <div class="stat" title="上游回报的前缀缓存命中 token 占比（hit / (hit+miss)），进程内累计"><div class="v" id="sCacheHit">-</div><div class="k">前缀缓存命中</div></div>
+          <div class="stat" title="会话粘性命中率（同号比例）。掉下去说明会话在被搬号，缓存必然全冷"><div class="v" id="sStickyHit">-</div><div class="k">粘性命中（同号）</div></div>
+          <div class="stat" title="前缀亲和命中率：会话新建时，是否落到了「这段 system+tools 缓存已热」的账号（悬停看前缀占比——占比小则命中率再高也省不下钱）"><div class="v" id="sAffinityHit">-</div><div class="k">前缀亲和（同前缀）</div></div>
+        </div>
+        <!-- 三条必须并排看的理由（随指标一起搬）：粘性命中率掉 = 会话在被搬号（账号级
+             前缀缓存必然全冷，该修路由）；粘性命中率高而缓存命中率低 = 上游/该模型本身
+             没缓存（网关无从优化）。前缀亲和管「共享同一段 system+tools 的多个并行会话」，
+             是粘性管不到的那一半；只看粘性正常就以为缓存没问题，是这里最常见的误判。 -->
       </div>
 
       <div class="box">
