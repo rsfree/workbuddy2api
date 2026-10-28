@@ -230,8 +230,8 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 #alertChips .chip .n { font-family: var(--mono); font-weight: 600; margin-left: 4px; }
 
 /* ── 面板块 ───────────────────────────────────────────────────────── */
-.box { background: var(--surface); border: 1px solid var(--line); border-radius: 11px; box-shadow: var(--shadow); margin-bottom: 20px; overflow: hidden; }
-.box > header { display: flex; align-items: center; gap: 12px; padding: 12px 17px; border-bottom: 1px solid var(--line-soft); }
+.box { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); margin-bottom: 20px; overflow: hidden; }
+.box > header { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border-bottom: 1px solid var(--line-soft); }
 .box > header h3 { font-size: 13.5px; font-weight: 600; }
 .box > header h3 .hint { font-size: 11.5px; font-weight: 400; color: var(--ink-3); margin-left: 6px; }
 .box > header .grow { flex: 1; }
@@ -240,7 +240,7 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
    在 header 里会把标题挤成两行、把"近 3 天"这类短选项拉成一整条。 */
 .box > header select, .box > header input { width: auto; }
 .box > header h3 { white-space: nowrap; }
-.box .pad { padding: 17px; }
+.box .pad { padding: 14px; }
 /* 补偿活动行：昵称 / 状态标 / 截止倒计时 / 额度 / 领取按钮，单行紧凑排布。
    沿用 .tag 体系染色（ok=已领、warn=待领、bad=临期、mute=中性信息）。 */
 .comp-row { display: flex; align-items: center; gap: 9px; padding: 7px 0; border-bottom: 1px solid var(--line-soft); }
@@ -285,6 +285,60 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 /* 模型表：紧凑一些，7 列在常见窗口下尽量免横向滚动 */
 .acc.md { min-width: 700px; }
 .acc.md th, .acc.md td { padding: 10px 9px; }
+/* ── 账号池「密集」变体（.acc.dense）─────────────────────────────────
+   只给账号表用，**不碰 .acc 本体**：table.acc 在模型锁池 / 用量明细 / 请求记录
+   三处也在用，改本体的 padding 会连锁改 4 张表。
+   整块包在 min-width:761px 里是必须的：mobile.css 在 ≤760px 用 `.acc td{padding:0}`
+   + `.acc .who{display:block}` 把表格改成卡片，而 `.acc.dense td` 的特异性比
+   `.acc td` 高，不包这层会把移动端卡片布局顶坏（媒体查询加不了特异性，只能靠隔离）。
+   行高实测：内容最高的元素是操作按钮 28px，4px 上下内边距 ⇒ 38px/行（原 62px）。
+   内边距没有照规格写 7px：7px 会得到 42px（28 + 14），超出 34-40 的目标区间；
+   再往下压只能动按钮高度，那是点击区，不动。 */
+@media (min-width: 761px) {
+  .acc.dense th { padding: 8px 10px; }
+  .acc.dense td { padding: 4px 10px; }
+  /* 色条 min-height:36px 是旧行高的地板：不放开它，行高永远压不到 40 以下。
+     padding 必须显式归零：`.acc.dense td` 的 12px 左右内边距会把色条从表格左缘推
+     进来 12px（`.acc .mark{padding:0}` 的特异性比 `.acc.dense td` 低，压不住），
+     而这条色条是靠「贴着行左缘」读成状态灯的。 */
+  .acc.dense .mark { padding: 0; }
+  .acc.dense .mark i { min-height: 22px; }
+  /* 账号列两行（昵称 / uid）并成一行：34-40px 的行里放不下两行文本。
+     ⚠ 绝不能给 .who 写 display:flex —— .who 就是 <td> 本身，改成 flex 后不再是
+     table-cell，浏览器会包一层匿名单元格接管列宽，列宽算法与 vertical-align 都会失控。
+     td 保持 table-cell，靠内部两个 inline-block + 预算好的宽度并成一行：
+       预留 = uid 上限 58 + 间隔 6 = 64，nm 用 calc(100% - 64px) 吃掉剩下的，
+      nm + gap + id ≤ 100% 恒成立 ⇒ 数学上不可能折行（折行就是 60px 行高回来）。
+     uid 只留 8~9 个字符：真实 uid 是 36 字符 uuid，再宽也放不下完整的，而前 8 位
+     已经唯一（备注功能用的就是这 8 位），第 9 位之后对识别零贡献——把宽度让给昵称。
+     完整值在 tr 的 title 里。 */
+  .acc.dense .who .nm {
+    display: inline-block; vertical-align: bottom;
+    max-width: calc(100% - 64px);
+    font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .acc.dense .who .id {
+    display: inline-block; vertical-align: bottom;
+    max-width: 58px; margin-left: 6px; margin-top: 0; font-size: 10.5px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  /* 出口标签在密集态隐藏：它是任意长度的串，第三个 inline-block 一定会把 uid 挤到
+     第二行（行高直接回到 56px+）。目前它只在开了代理/弹性出口的池子里出现，且
+     「账号 → 行 title」里仍有完整 uid 可对账。要保留就得动模板（批次 3 不做），
+     或者把它并进 tr 的 hover title（一行 JS，等批）。 */
+  .acc.dense .who .id.egress { display: none; }
+  /* 用量列原本 4 个 chip + min-width:268px，吃掉近 1/4 行宽。常驻只留「次数 / token」，
+     延迟与速率本来就在 .usage-cell 的 title 里（「最近一次：N 次 / tok / 延迟 / 速率」），
+     没有丢信息；aria-label 也还是完整那串。 */
+  .acc.dense .usage-cell { min-width: 0; }
+  .acc.dense .usage-item.usage-latency, .acc.dense .usage-item.usage-rate { display: none; }
+  /* 状态标签：只收高度，字号 11.5px 是对比度验收过的，不动。 */
+  .acc.dense .tag { height: 18px; padding: 0 8px; }
+  /* 操作列是宽度大头（332px = 整表 27%）。只收按钮的横向内边距与间距，
+     不动字号/竖向内边距：点击区高度 28px 保持不变，文字也不缩。 */
+  .acc.dense .acts { gap: 4px; }
+  .acc.dense .acts button { padding-left: 6px; padding-right: 6px; }
+}
 .who { min-width: 118px; max-width: 200px; }
 #taskTable .who { max-width: 360px; }
 #taskTable .who .nm, #taskTable .who .id { white-space: normal; word-break: break-all; }
@@ -863,7 +917,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button class="xs" id="btnKeepaliveAll">全部保活</button>
         </header>
         <div class="tbl-wrap">
-        <table class="acc">
+        <table class="acc dense">
           <thead><tr>
             <th class="mark" aria-hidden="true"></th>
             <th>账号</th><th>状态</th><th>积分</th>
