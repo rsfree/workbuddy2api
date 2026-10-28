@@ -93,6 +93,10 @@ type Error struct {
 	Kind   ErrKind
 	Status int
 	Msg    string
+	// Code 上游业务码（信封里的 code；HTTP 层错误时为 0）。此前只能从 Msg 的
+	// "code=N msg=..." 前缀里正则扒，签到这类「同一个 code 承载多种语义」的
+	// 端点必须拿到结构化码才能分清失败/已签/排队（见 checkin.go）。
+	Code int
 	// RetryAfter 上游明示的等待时长（Retry-After 秒 / retry-after-ms /
 	// x-ratelimit-reset 头解析，见 ParseRetryAfter）。零值 = 上游未明示，
 	// 冷却时长回落调用方计算值。挂载点选在 Error 信封：Kind 决定「罚不罚」，
@@ -239,10 +243,8 @@ func isPromptTooLongStatus(status int) bool {
 		status == http.StatusRequestEntityTooLarge
 }
 
-// alreadyCheckinMarkers "今天已签到"关键词（上游对重复签到返回 code!=0，
-// 实测 code=10001/14001 "今天已签到"/"今日已签到"）。只对 *Error.Msg 做包含匹配，
-// 网络层/解析层错误不在此识别（见 IsAlreadyCheckin）。
-var alreadyCheckinMarkers = []string{"已签到", "already"}
+// 签到的四态判定词表见 checkin.go（`已签到` 裸子串是错的：它在
+// 「签到失败，已签到天数不足 7 天」里同样出现）。
 var badParamsMarkerCode = `"code":11101`
 
 // softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
@@ -1057,7 +1059,8 @@ func (c *Client) doJSON(a *auth.Auth, req *http.Request) (json.RawMessage, error
 		if kind == ErrNone {
 			kind = ErrClient
 		}
-		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: fmt.Sprintf("code=%d msg=%s", env.Code, truncate(env.Msg, 160))}
+		return nil, &Error{Kind: kind, Status: resp.StatusCode, Code: env.Code,
+			Msg: fmt.Sprintf("code=%d msg=%s", env.Code, truncate(env.Msg, 160))}
 	}
 	return env.Data, nil
 }
@@ -2657,30 +2660,44 @@ func packageRemainUsed(a respAccount) (remain, used, size int64) {
 	return remain, used, size
 }
 
-// DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
-// 偶发上游 5xx（code 10000）做有界重试（见 retryBillingTransient）——单次抖动不再
-// 让该账号整天漏签；「已签到」等业务错误不重试。
-func (c *Client) DailyCheckin(a *auth.Auth) error {
-	return c.retryBillingTransient(func() error {
-		_, err := c.billingMeterJSON(a, c.checkinMeterPaths(a), http.MethodPost, map[string]any{})
-		return err
+// DailyCheckin 执行每日签到，返回四态回执（见 checkin.go）。
+//
+// 为什么不是纯 error：签到是「一天一次、漏一天少一天积分」的幂等动作，而它的
+// 回执至少有四种语义（成功 / 今天已签 / 排队中请重试 / 业务失败），单靠
+// error 的有无会把后三种压成一团——「签到失败，已签到天数不足 7 天」曾被
+// 当成「今天已签到」写进 lastCheckinDay，当天后续两轮排程都不再重试。
+//
+// 偶发上游 5xx（code 10000）做有界重试（见 retryBillingTransient）——单次抖动
+// 不再让该账号整天漏签；「已签到」「排队中」等业务回执不重试（重试只会原样再失败）。
+func (c *Client) DailyCheckin(a *auth.Auth) (CheckinOutcome, error) {
+	outcome := CheckinUnknown
+	err := c.retryBillingTransient(func() error {
+		data, err := c.billingMeterJSON(a, c.checkinMeterPaths(a), http.MethodPost, map[string]any{})
+		if err != nil {
+			return err
+		}
+		// 🔴 code=0 也可能是失败：上游把「签到失败，已签到天数不足 7 天」用
+		// 200 + code 0 回，只看 err 会把它记成成功。data 里的 msg 与状态字段
+		// 都要参与判定（ClassifyCheckin 是纯函数，可单测）。
+		outcome = ClassifyCheckin(0, string(data))
+		return nil
 	})
+	if err != nil {
+		// 业务错误：分类看上游码+文案；网络/解析层错误落 CheckinUnknown，
+		// 调用方据此**不写** lastCheckinDay（抖动不等于今天签过了）。
+		return CheckinOutcomeOf(outcome, err), err
+	}
+	return outcome, nil
 }
 
 // IsAlreadyCheckin 报告 err 是否表示"今天已签到"（上游幂等拒绝重复签到）。
-// 只认带分类的 *Error（业务 code 或 HTTP 错误）：网络层/解析层错误不得当作幂等成功，
-// 否则停机补签遇到抖动会误记为 already，账号当天实际未签到却被判定正常。
+// 只认带分类的 *Error（业务 code 或 HTTP 错误）：网络层/解析层错误不得当作幂等
+// 成功，否则停机补签遇到抖动会误记为 already，账号当天实际未签到却被判定正常。
+//
+// 判定委托给 ClassifyCheckin：此前这里是裸子串 "已签到" 匹配，而失败文案
+// 「签到失败，已签到天数不足 7 天」天然含这三个字——一条失败被读成幂等成功。
 func IsAlreadyCheckin(err error) bool {
-	var ue *Error
-	if !errors.As(err, &ue) {
-		return false
-	}
-	for _, m := range alreadyCheckinMarkers {
-		if strings.Contains(ue.Msg, m) || strings.Contains(strings.ToLower(ue.Msg), strings.ToLower(m)) {
-			return true
-		}
-	}
-	return false
+	return CheckinOutcomeOf(CheckinUnknown, err) == CheckinAlready
 }
 
 func truncate(s string, n int) string {

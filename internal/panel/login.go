@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 const (
@@ -271,8 +272,11 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		// 企业版跳过签到：上游 POST /v2/billing/meter/daily-checkin 对企业号
 		// 400 code 10001「企业账号不支持该操作」，发了只会把该错误写进登录返回。
 		// 下方 UserResource 余额查询照常（企业额度走 get-enterprise-user-usage 口径）。
-		if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
+		if outcome, err := p.cfg.Upstream.DailyCheckin(a); err != nil {
 			checkinMsg = err.Error()
+			if outcome == upstream.CheckinPending {
+				checkinMsg = "签到排队中，稍后自动重试"
+			}
 		}
 	}
 	if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {

@@ -34,7 +34,7 @@ func TestDailyCheckinRetriesTransient500(t *testing.T) {
 		}
 		return jsonResp(200, `{"code":0,"data":{}}`), nil
 	})
-	if err := c.DailyCheckin(&auth.Auth{AccessToken: "at"}); err != nil {
+	if _, err := c.DailyCheckin(&auth.Auth{AccessToken: "at"}); err != nil {
 		t.Fatalf("首次 500 应重试成功，err=%v", err)
 	}
 	if n := atomic.LoadInt32(&calls); n != 2 {
@@ -49,7 +49,7 @@ func TestDailyCheckinRetriesExhausted(t *testing.T) {
 		atomic.AddInt32(&calls, 1)
 		return jsonResp(500, `{"code":10000,"msg":"API request failed with status code: 500"}`), nil
 	})
-	err := c.DailyCheckin(&auth.Auth{AccessToken: "at"})
+	_, err := c.DailyCheckin(&auth.Auth{AccessToken: "at"})
 	if err == nil {
 		t.Fatal("持续 500 应返回错误")
 	}
@@ -66,9 +66,12 @@ func TestDailyCheckinNoRetryOnBusinessError(t *testing.T) {
 		// 「今天已签到」是业务幂等拒绝（code!=0），重试无意义。
 		return jsonResp(200, `{"code":14001,"msg":"今日已签到"}`), nil
 	})
-	err := c.DailyCheckin(&auth.Auth{AccessToken: "at"})
+	outcome, err := c.DailyCheckin(&auth.Auth{AccessToken: "at"})
 	if err == nil || !IsAlreadyCheckin(err) {
 		t.Fatalf("err=%v want already-checkin business error", err)
+	}
+	if outcome != CheckinAlready {
+		t.Fatalf("outcome=%s want already", outcome)
 	}
 	if n := atomic.LoadInt32(&calls); n != 1 {
 		t.Fatalf("calls=%d want 1（业务错误不重试）", n)
@@ -82,7 +85,7 @@ func TestDailyCheckinNoRetryOn4xx(t *testing.T) {
 		atomic.AddInt32(&calls, 1)
 		return jsonResp(403, `{"code":11140,"msg":"request illegal"}`), nil
 	})
-	if err := c.DailyCheckin(&auth.Auth{AccessToken: "at"}); err == nil {
+	if _, err := c.DailyCheckin(&auth.Auth{AccessToken: "at"}); err == nil {
 		t.Fatal("403 应返回错误")
 	}
 	if n := atomic.LoadInt32(&calls); n != 1 {

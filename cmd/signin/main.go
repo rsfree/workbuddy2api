@@ -77,22 +77,32 @@ func main() {
 			}
 		}
 
-		err = up.DailyCheckin(a)
-		switch {
-		case err == nil:
+		// 四态回执（见 upstream/checkin.go）。旧的 isAlready 用
+		// strings.Contains(msg, "checkin") + "code=400" 判定，任何含
+		// "checkin failed" 的失败都会被读成已签——命令行统计因此偏乐观。
+		outcome, cerr := up.DailyCheckin(a)
+		switch outcome {
+		case upstream.CheckinDone:
 			r.status = "OK"
 			okN++
-		default:
-			// DailyCheckin 已签到返回 code!=0 错误
-			if isAlready(err.Error()) {
-				r.status = "ALREADY"
-				r.detail = short(err.Error())
-				alreadyN++
-			} else {
-				r.status = "FAIL"
-				r.detail = short(err.Error())
-				failN++
+		case upstream.CheckinAlready:
+			r.status = "ALREADY"
+			if cerr != nil {
+				r.detail = short(cerr.Error())
 			}
+			alreadyN++
+		case upstream.CheckinPending:
+			r.status = "PENDING"
+			if cerr != nil {
+				r.detail = short(cerr.Error())
+			}
+			failN++
+		default:
+			r.status = "FAIL"
+			if cerr != nil {
+				r.detail = short(cerr.Error())
+			}
+			failN++
 		}
 		// 顺手查余额
 		if remain, _, qerr := up.UserResource(a); qerr == nil {
@@ -113,15 +123,6 @@ func main() {
 			trunc(r.uid, 36), trunc(r.nick, 11), r.status, remain, r.detail)
 	}
 	fmt.Printf("\ntotal=%d ok=%d already=%d fail=%d\n", len(rows), okN, alreadyN, failN)
-}
-
-// 已签判定：code 非 0 且含 "已签到"/"already"/"checkin" 等字样
-func isAlready(msg string) bool {
-	s := strings.ToLower(msg)
-	return strings.Contains(s, "已签到") ||
-		strings.Contains(s, "already") ||
-		strings.Contains(s, "checkin") ||
-		strings.Contains(s, "code=400")
 }
 
 func trunc(s string, n int) string {

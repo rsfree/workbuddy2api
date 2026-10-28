@@ -515,20 +515,26 @@ func (s *Scheduler) RunCheckinNow() {
 		// 下方余额查询照常跑（企业额度走 get-enterprise-user-usage 口径，且是
 		// credit_floor 判定与面板额度展示的唯一数据源）。
 		if !a.IsEnterprise() {
-			if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
-				// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
-				if upstream.IsAlreadyCheckin(err) {
-					s.cfg.Pool.NoteCheckinDone(st.UID)
-					log.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(st.UID, st.Nickname))
-				} else {
-					log.Printf("checkin %s: %v", logfmt.Label(st.UID, st.Nickname), err)
-				}
-				// 其余业务错误也继续走余额查询
-			} else {
-				// 首次签到成功此前静默——排查「签到到底跑没跑」时无迹可循（幂等行只在
-				// 重复触发时出现），成功也落一行。
+			// 四态回执（见 upstream/checkin.go）：只有 Done / Already 能写
+			// lastCheckinDay。Pending（上游排队中）与 Failed（天数不足等）都必须
+			// 留白，否则当天后续轮次不再重试——「签到失败，已签到天数不足 7 天」
+			// 曾被裸子串 "已签到" 判成幂等成功，一次漏签被完整藏起来。
+			outcome, err := s.cfg.Upstream.DailyCheckin(a)
+			if outcome.Settled() {
 				s.cfg.Pool.NoteCheckinDone(st.UID)
+			}
+			switch outcome {
+			case upstream.CheckinDone:
+				// 首次签到成功此前静默——排查「签到到底跑没跑」时无迹可循（幂等行
+				// 只在重复触发时出现），成功也落一行。
 				log.Printf("checkin %s: 签到成功", logfmt.Label(st.UID, st.Nickname))
+			case upstream.CheckinAlready:
+				log.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(st.UID, st.Nickname))
+			case upstream.CheckinPending:
+				// 上游还在处理刚才那次：当天未完成，下一轮排程会重试。
+				log.Printf("checkin %s: 上游排队中，留待下一轮重试 (%v)", logfmt.Label(st.UID, st.Nickname), err)
+			default:
+				log.Printf("checkin %s: 未标记已签（%s）%v", logfmt.Label(st.UID, st.Nickname), outcome, err)
 			}
 		}
 		// 分桶查余额：配置窗口内的积分单独标记，同时记录最早未来到期批次与

@@ -158,8 +158,8 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 				log.Printf("panel: import global trial uid=%s 已领", uid)
 			}
 		} else {
-			if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
-				log.Printf("panel: import checkin uid=%s: %v", uid, err)
+			if outcome, err := p.cfg.Upstream.DailyCheckin(a); err != nil {
+				log.Printf("panel: import checkin uid=%s [%s]: %v", uid, outcome, err)
 			}
 		}
 		if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {

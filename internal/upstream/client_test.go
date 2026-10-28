@@ -479,9 +479,12 @@ func TestDailyCheckinAlready(t *testing.T) {
 		}
 		return jsonResp(200, `{"code":14001,"msg":"今日已签到"}`), nil
 	})
-	err := c.DailyCheckin(&auth.Auth{AccessToken: "at"})
+	outcome, err := c.DailyCheckin(&auth.Auth{AccessToken: "at"})
 	if err == nil || !strings.Contains(err.Error(), "已签到") {
 		t.Errorf("err=%v", err)
+	}
+	if outcome != CheckinAlready {
+		t.Errorf("outcome=%s want already（14001 今日已签到）", outcome)
 	}
 }
 

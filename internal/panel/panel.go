@@ -838,16 +838,26 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	// 前端对企业号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存前端仍可能调用）。
 	if a.IsEnterprise() {
 		checkinMsg = "企业账号无签到体系（已跳过签到，仅刷新额度）"
-	} else if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
-		checkinMsg = err.Error() // "今天已签到"等业务错误照常查余额
-		// 幂等拒绝同样是「今日已签」，标记后按钮显示「已签」。
-		if upstream.IsAlreadyCheckin(err) {
+	} else {
+		// 四态回执：只有 Done / Already 标已签（见 upstream/checkin.go）。
+		// 排队中与失败都不标记，页面按钮保持「可签到」，用户可以再点一次。
+		outcome, err := p.cfg.Upstream.DailyCheckin(a)
+		if outcome.Settled() {
 			p.cfg.Pool.NoteCheckinDone(uid)
 			checkinDone = true
 		}
-	} else {
-		p.cfg.Pool.NoteCheckinDone(uid)
-		checkinDone = true
+		switch outcome {
+		case upstream.CheckinDone, upstream.CheckinAlready:
+			// 已签：无需额外文案（旧的 already 文案会显示一段业务错误，没必要）。
+		case upstream.CheckinPending:
+			checkinMsg = "上游排队中，请稍后再试"
+		default:
+			if err != nil {
+				checkinMsg = err.Error()
+			} else {
+				checkinMsg = "签到回执无法判定，未标记已签"
+			}
+		}
 	}
 	resp := map[string]any{"ok": true, "checkin_done": checkinDone}
 	if a.IsEnterprise() {
