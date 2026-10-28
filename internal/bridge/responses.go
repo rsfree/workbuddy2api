@@ -321,6 +321,11 @@ func ChatToResponse(obj map[string]any, model string) map[string]any {
 			"reasoning_tokens": IntOf(d["reasoning_tokens"]),
 		}
 	}
+	// 缓存命中：Responses 的原生位置是 input_tokens_details.cached_tokens。
+	// 原先这里完全没有该字段，客户端（Codex 等）算 input 成本时永远是全价。
+	if c, ok := usageCacheRead(usage); ok {
+		respUsage["input_tokens_details"] = map[string]any{"cached_tokens": c}
+	}
 	if v, ok := usage["credit"]; ok {
 		respUsage["credit"] = v
 	}
@@ -402,6 +407,10 @@ func (s *ResponsesStream) envelope(status string, output []any) map[string]any {
 		"input_tokens":  IntOf(s.usage["prompt_tokens"]),
 		"output_tokens": IntOf(s.usage["completion_tokens"]),
 		"total_tokens":  IntOf(s.usage["prompt_tokens"]) + IntOf(s.usage["completion_tokens"]),
+	}
+	// 缓存命中（同非流式口径）：只补原生字段，不发明协议外的键。
+	if c, ok := usageCacheRead(s.usage); ok {
+		usage["input_tokens_details"] = map[string]any{"cached_tokens": c}
 	}
 	return map[string]any{
 		"id": s.ResponseID, "object": "response", "status": status,

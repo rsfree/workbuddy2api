@@ -402,11 +402,17 @@ func ChatToAnthropic(obj map[string]any, model string) map[string]any {
 		"input_tokens":  IntOf(usage["prompt_tokens"]),
 		"output_tokens": IntOf(usage["completion_tokens"]),
 	}
-	// 缓存命中数：Anthropic 用 cache_read_input_tokens 单独报，客户端据此算成本。
-	if d, ok := usage["prompt_tokens_details"].(map[string]any); ok {
-		if c := IntOf(d["cached_tokens"]); c > 0 {
-			anthUsage["cache_read_input_tokens"] = c
-		}
+	// 缓存命中/写入：Anthropic 用 cache_read_input_tokens / cache_creation_input_tokens
+	// 单独报，客户端据此算成本（读取按 0.1x、写入按 1.25x，不报就等于按原价算）。
+	//
+	// 原先只读 prompt_tokens_details.cached_tokens 一个路径：上游把真实命中写在
+	// prompt_cache_hit_tokens / cache_read_input_tokens、而兼容别名 cached_tokens
+	// 填 0 时，这里就把命中整个丢了。统一走 usageCacheRead（多别名取最优）。
+	if c, ok := usageCacheRead(usage); ok {
+		anthUsage["cache_read_input_tokens"] = c
+	}
+	if w := usageCacheWrite(usage); w > 0 {
+		anthUsage["cache_creation_input_tokens"] = w
 	}
 	// 上游的积分扣费透出到响应里，客户端可观测成本（非标准字段，忽略无害）。
 	if pts, ok := usage["credit"]; ok {
@@ -638,7 +644,25 @@ func (s *AnthropicStream) Finish() []Event {
 		s.blockIdx++
 	}
 
-	usage := map[string]any{"output_tokens": IntOf(s.usage["completion_tokens"])}
+	// 收尾 usage 必须给全三个维度。
+	//
+	// 原先只有 output_tokens（+credit）：input_tokens 缺失、缓存字段更是完全没有，
+	// 客户端（Claude Code 等）看到的用量永远是"0 输入、0 缓存"——实测
+	// kimi-k3.1-pro 的网关账本记 70.7% 命中，客户端却一个缓存字段都拿不到。
+	//
+	// message_start 里的 input_tokens 只能是 0：上游把 usage 放在末帧，开始推流时
+	// 还不知道真实值。所以真实用量统一在 message_delta 补全，客户端按累计口径
+	// 读取即可（这是桥接 chat→Anthropic 的固有约束，不是可以省的一步）。
+	usage := map[string]any{
+		"input_tokens":  IntOf(s.usage["prompt_tokens"]),
+		"output_tokens": IntOf(s.usage["completion_tokens"]),
+	}
+	if c, ok := usageCacheRead(s.usage); ok {
+		usage["cache_read_input_tokens"] = c
+	}
+	if w := usageCacheWrite(s.usage); w > 0 {
+		usage["cache_creation_input_tokens"] = w
+	}
 	if v, ok := s.usage["credit"]; ok {
 		usage["credit"] = v
 	}
