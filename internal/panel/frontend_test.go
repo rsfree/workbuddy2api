@@ -939,8 +939,10 @@ process.stdout.write(JSON.stringify(names));`
 	if err != nil {
 		t.Fatalf("expiry sort node test failed: %v\n%s", err, out)
 	}
-	// 最快到期的排最前（跨域）；无 7 天内到期的与查询失败的排最后。
-	const want = `["gl-soon","cn-mid","cn-late","no-expiry","broken"]`
+	// 最快到期的排最前（跨域）；查询失败的排在最后、逐行可见。
+	// 无 7 天内到期的账号**不再逐行占位**，合并成末尾一行「其余 N 个号」——130 个号
+	// 绝大多数属于这一类，逐行渲染会把到期卡片撑成 130 行、把账号表挤到几屏之外。
+	const want = `["gl-soon","cn-mid","cn-late","broken","其余 1 个号"]`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("expiry order=%s\nwant %s", strings.TrimSpace(string(out)), want)
 	}
@@ -994,8 +996,9 @@ const d = { accounts: [
 ctx.renderExpirySnapshot(d);
 const html = sinks['expList'] ? sinks['expList'].innerHTML : '';
 const names = [...html.matchAll(/<span class="exp-nm">([^<]*)<\/span>/g)].map(m => m[1]);
-// 2 天到期的应排最前（红），30 天其次，无到期信息的排最后。
-const wantNames = JSON.stringify(['秋', '秋千易', '长期包']);
+// 2 天到期的应排最前（红），30 天其次；无到期信息的账号不再逐行占位，
+// 合并成末尾一行「其余 N 个号」（否则 130 个号会把卡片撑成 130 行）。
+const wantNames = JSON.stringify(['秋', '秋千易', '其余 1 个号']);
 const gotNames = JSON.stringify(names);
 process.stdout.write(JSON.stringify({
   visible: sinks['expBox'] ? sinks['expBox'].hidden === false : false,
@@ -1016,7 +1019,7 @@ process.stdout.write(JSON.stringify({
 	if err != nil {
 		t.Fatalf("expiry snapshot node test failed: %v\n%s", err, out)
 	}
-	const want = `{"visible":true,"rows":3,"order":true,"got":"[\"秋\",\"秋千易\",\"长期包\"]","want":"[\"秋\",\"秋千易\",\"长期包\"]"}`
+	const want = `{"visible":true,"rows":3,"order":true,"got":"[\"秋\",\"秋千易\",\"其余 1 个号\"]","want":"[\"秋\",\"秋千易\",\"其余 1 个号\"]"}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("expiry snapshot=%s\nwant %s（visible 必须为 true，否则卡片仍隐藏）",
 			strings.TrimSpace(string(out)), want)

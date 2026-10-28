@@ -613,7 +613,11 @@ function accRowHtml(s, maxCred) {
       // upstream 的 get-enterprise-user-usage 口径填充。
       (s.enterprise ? '' :
         '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>') +
-      '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>' +
+      // 「额度」按钮只留给企业版：它是企业号**唯一**能用的操作（签到/任务企业版一律
+      // 403，故上面那条不渲染），少了它企业号的操作列会空掉。
+      // 普通号不再渲染「余额」：额度本来每 5 分钟自动刷新（schedule.balance_refresh），
+      // 而「签到」按钮本身也会刷新余额（见其 title）。行内少一个按钮，操作列省约 50px。
+      (s.enterprise ? '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '" title="刷新企业版已分配额度（上游 get-enterprise-user-usage）">额度</button>' : '') +
       (s.enterprise ? '' :
         '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>') +
       (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
@@ -4196,19 +4200,24 @@ function expiryRowsHtml(list) {
     const ay = String(y.a.nickname || y.a.uid || '');
     return ax < ay ? -1 : ax > ay ? 1 : 0;
   });
-  return keyed.map(({ a }) => {
+  // 「7 天内无到期」的账号**不再逐个占一行**：130 个号里绝大多数是这种，会把
+  // 整张卡片撑成 130 行、把下面的账号表挤到几屏之外（实测 1700px 窗口都看不到表）。
+  // 收集成末尾一行汇总；有到期的、查询失败的照旧逐行显示（那才是要看的信息）。
+  const rows = [];
+  let noExpN = 0;
+  keyed.forEach(({ a }) => {
     const name = a.nickname || String(a.uid || '').slice(0, 8);
+    // 注意：这里必须是 rows.push 而不能 return —— 外层已经从 map 改成 forEach，
+    // return 的字符串会被丢弃，查询失败的账号会静默消失（测试 TestAppJSExpirySortedByExpiry
+    // 就是靠这条抓住的）。
     if (a.error) {
-      return '<div class="exp-row"><span class="exp-dot" style="background:var(--ink-3)"></span>' +
+      rows.push('<div class="exp-row"><span class="exp-dot" style="background:var(--ink-3)"></span>' +
         '<span class="exp-nm">' + esc(name) + '</span>' +
-        '<span class="exp-main err">查询失败：' + esc(a.error) + '</span></div>';
+        '<span class="exp-main err">查询失败：' + esc(a.error) + '</span></div>');
+      return;
     }
     const bs = expBatches(a.packages).filter(b => expDaysLeft(b.date, today) >= 0);
-    if (!bs.length) {
-      return '<div class="exp-row"><span class="exp-dot" style="background:var(--ok)"></span>' +
-        '<span class="exp-nm">' + esc(name) + '</span>' +
-        '<span class="exp-main">7 天内无到期积分</span></div>';
-    }
+    if (!bs.length) { noExpN++; return; }
     const first = bs[0];
     const days = expDaysLeft(first.date, today);
     const daily = Math.ceil(first.remain / Math.max(1, days));
@@ -4222,15 +4231,21 @@ function expiryRowsHtml(list) {
     const more = bs.length > 4 ? '　等 ' + bs.length + ' 批' : '';
     const rest = bs.slice(1, 4).map(b =>
       '随后 ' + esc(b.date.slice(5)) + ' · ' + fmtTok(b.remain)).join('　') + more;
-    return '<div class="exp-row"><span class="exp-dot" style="background:' + cls + '"></span>' +
+    rows.push('<div class="exp-row"><span class="exp-dot" style="background:' + cls + '"></span>' +
       '<span class="exp-nm">' + esc(name) + '</span>' +
       '<span class="exp-main">最近到期 <b>' + esc(first.date) + '</b>（' + dayWord +
       '）· 该批 <b>' + fmtTok(first.remain) + '</b> 积分 · 到期前日均需耗 ≥<b>' +
       fmtTok(daily) + '</b>' +
       (week > first.remain ? ' · 7 天内合计 ' + fmtTok(week) : '') +
       (rest ? '<div class="note">' + rest + '</div>' : '') +
-      '</span></div>';
-  }).join('');
+      '</span></div>');
+  });
+  if (noExpN > 0) {
+    rows.push('<div class="exp-row"><span class="exp-dot" style="background:var(--ok)"></span>' +
+      '<span class="exp-nm">其余 ' + noExpN + ' 个号</span>' +
+      '<span class="exp-main">7 天内无到期积分</span></div>');
+  }
+  return rows.join('');
 }
 
 function renderExpiry(d) {
@@ -4302,13 +4317,13 @@ function renderExpirySnapshot(d) {
     if (y.key === null) return -1;
     return x.key - y.key;
   });
-  const rows = keyed.map(({ a, ms }) => {
+  // 与 expiryRowsHtml 同一处理：「无近期到期」的账号不逐个占一行，末尾汇总。
+  // 否则 130 个号会把这张卡片撑成 130 行，账号表被挤到几屏之外。
+  const rows = [];
+  let noExpN = 0;
+  keyed.forEach(({ a, ms }) => {
     const nm = esc(a.nickname || String(a.uid || '').slice(0, 8));
-    if (!ms || !a.credits_earliest_remaining) {
-      return '<div class="exp-row"><span class="exp-dot" style="background:var(--ok)"></span>' +
-        '<span class="exp-nm">' + nm + '</span>' +
-        '<span class="exp-main">无近期到期批次</span></div>';
-    }
+    if (!ms || !a.credits_earliest_remaining) { noExpN++; return; }
     // 与 expDaysLeft 同口径：按本地自然日算，而不是对精确时间戳 ceil（后者会把
     // 明天/今天各多算一天，日均需耗也随之少一半）。
     const dt = new Date(ms);
@@ -4319,15 +4334,20 @@ function renderExpirySnapshot(d) {
     const daily = Math.ceil(remain / Math.max(1, days));
     const cls = days <= 3 ? 'var(--bad)' : days <= 7 ? 'var(--warn)' : 'var(--ok)';
     const dayWord = days === 0 ? '今天到期' : days === 1 ? '明天到期' : days + ' 天后到期';
-    return '<div class="exp-row"><span class="exp-dot" style="background:' + cls + '"></span>' +
+    rows.push('<div class="exp-row"><span class="exp-dot" style="background:' + cls + '"></span>' +
       '<span class="exp-nm">' + nm + '</span>' +
       '<span class="exp-main">最近到期 <b>' + esc(when) + '</b>（' + dayWord +
       '）· 该批 <b>' + fmtTok(remain) + '</b> 积分 · 到期前日均需耗 ≥<b>' +
       fmtTok(daily) + '</b>' +
       '<div class="note">仅最早一批，点「检查」看全部到期批次</div>' +
-      '</span></div>';
-  }).join('');
-  $('expList').innerHTML = rows || '<div class="empty">没有账号</div>';
+      '</span></div>');
+  });
+  if (noExpN > 0) {
+    rows.push('<div class="exp-row"><span class="exp-dot" style="background:var(--ok)"></span>' +
+      '<span class="exp-nm">其余 ' + noExpN + ' 个号</span>' +
+      '<span class="exp-main">无近期到期批次</span></div>');
+  }
+  $('expList').innerHTML = rows.join('') || '<div class="empty">没有账号</div>';
   $('expNote').textContent = snapshotNoteText(list.length, d);
   $('expBox').hidden = false;
 }
