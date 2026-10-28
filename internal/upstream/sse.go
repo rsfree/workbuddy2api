@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -18,6 +19,20 @@ import (
 // 「上游空流」与「客户端断连写失败」——空流是上游缺陷，应记 502 观测；写失败是
 // 客户端已走，日志口径不同。Aggregate 与 StreamHint 共用同一哨兵（errors.Is 判定）。
 var errEmptyStream = errors.New("upstream stream contained no valid data events")
+
+// SSE 心跳参数。上游在长思考（deepseek 推理 / kimi 长上下文）期间可能整分钟
+// 一个字节都不发，连自己的 `: heartbeat` 也停；而客户端（Claude Code / Codex /
+// DSH）的空闲阈值是 60–120s——先断的永远是客户端，用户看到「对话到一半断了」，
+// 重试还得多烧一轮额度。网关因此在静默期补一帧 SSE 注释：按规范以 ':' 开头的行
+// 是注释，所有 SSE 解析器都必须忽略它，对业务零影响。
+// 两个时间参数声明成 var 而非 const：测试要把它们压到毫秒级才能验证心跳
+// 真的发出来了（否则一条断言要等 15 秒）。运行期不写，等价常量。
+var (
+	sseKeepaliveIdle  = 15 * time.Second // 静默多久补一帧
+	sseKeepaliveCheck = 5 * time.Second  // 检查周期
+)
+
+const sseKeepaliveFrame = ": keepalive\n\n"
 
 // IsEmptyStreamError 报告错误是否为「上游空流」（无有效 SSE 帧）——供 handler
 // 在流式路径把空流记为失败观测（HTTP 头已发出只能 200，但日志/状态应收敛到
@@ -525,6 +540,64 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	h.Set("X-Accel-Buffering", "no")
 	fl, _ := w.(http.Flusher)
 
+	// 写 ResponseWriter 的唯一出口：业务帧与心跳共用同一把锁。少了这把锁，
+	// 心跳会插进 `data: {...}` 与它的结尾空行之间，把一帧劈成两半。
+	var wmu sync.Mutex
+	lastWrite := time.Now()
+	writePass := func(str string) error {
+		wmu.Lock()
+		defer wmu.Unlock()
+		if _, werr := io.WriteString(w, str); werr != nil {
+			return werr
+		}
+		lastWrite = time.Now()
+		if fl != nil {
+			fl.Flush()
+		}
+		return nil
+	}
+
+	stopKeep := make(chan struct{})
+	keepDone := make(chan struct{})
+	go func() {
+		defer close(keepDone)
+		t := time.NewTicker(sseKeepaliveCheck)
+		defer t.Stop()
+		for {
+			select {
+			case <-stopKeep:
+				return
+			case <-t.C:
+				wmu.Lock()
+				if time.Since(lastWrite) >= sseKeepaliveIdle {
+					if _, werr := io.WriteString(w, sseKeepaliveFrame); werr == nil {
+						lastWrite = time.Now()
+						if fl != nil {
+							fl.Flush()
+						}
+					}
+				}
+				wmu.Unlock()
+			}
+		}
+	}()
+	// stopKeepalive 停心跳并等 goroutine 退出：handler 一旦返回，ResponseWriter
+	// 就不许再写。等待带超时——心跳可能正卡在 Write 上（客户端不读、TCP 窗口满），
+	// 无限等会把 handler 也钉死、连接永远释放不了；超时后放手，那条 goroutine
+	// 会在下一次写失败（EPIPE）时自行退出。
+	// 幂等：写 [DONE] 前会主动调一次（收尾帧之后不该再有心跳），defer 再兜一次。
+	var keepOnce sync.Once
+	stopKeepalive := func() {
+		keepOnce.Do(func() {
+			close(stopKeep)
+			select {
+			case <-keepDone:
+			case <-time.After(time.Second):
+			}
+		})
+	}
+	defer stopKeepalive()
+
 	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，
 	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
 	toolCallSeen := map[int]bool{}
@@ -544,15 +617,9 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	maxToolIdx := -1
 	toolFinishSent := false
 
-	// writeSSE 原样写出一帧并 flush。
+	// writeSSE 原样写出一帧并 flush（持锁 + 刷新 lastWrite，见 writePass）。
 	writeSSE := func(payload string) error {
-		if _, werr := io.WriteString(w, "data: "+payload+"\n\n"); werr != nil {
-			return werr
-		}
-		if fl != nil {
-			fl.Flush()
-		}
-		return nil
+		return writePass("data: " + payload + "\n\n")
 	}
 
 	// writeRaw 原样写出一帧（绕过 normalizeFrame）。上游 error 帧（error-passthrough）
@@ -725,12 +792,10 @@ readLoop:
 				return werr
 			}
 		case trimmed != "":
-			// 注释/其他行：原样透传
-			if _, werr := io.WriteString(w, line); werr != nil {
+			// 注释/其他行：原样透传。上游自己的 `: heartbeat` 也走这里，它同样
+			// 算一次写入——lastWrite 被推后，网关不会在它之后重复补心跳。
+			if werr := writePass(line); werr != nil {
 				return werr
-			}
-			if fl != nil {
-				fl.Flush()
 			}
 		}
 		// 空行（帧分隔）吞掉：本函数自产 "\n\n"
@@ -771,12 +836,11 @@ readLoop:
 	if validFrames == 0 {
 		_ = writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error","code":"upstream_parse"}}`)
 	}
+	// [DONE] 是收尾帧：先停心跳，别让 `: keepalive` 出现在它之后。
+	stopKeepalive()
 	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）。
-	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
+	if err := writePass("data: [DONE]\n\n"); err != nil {
 		return err
-	}
-	if fl != nil {
-		fl.Flush()
 	}
 	if validFrames == 0 {
 		return errEmptyStream

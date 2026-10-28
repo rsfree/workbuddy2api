@@ -12,9 +12,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/bridge"
 )
@@ -26,6 +29,22 @@ const (
 	protoAnthropic protoKind = iota // /v1/messages
 	protoResponses                  // /v1/responses
 )
+
+// SSE 心跳参数（与 upstream 的 chat SSE 同口径，见 upstream/sse.go）。
+// 翻译层这条路径**必须**自己发心跳：上游的 `: heartbeat` 在 handleFrame 里被
+// 当注释块丢弃，客户端（Claude Code / Codex）在长思考期间收不到任何字节就会
+// 主动断开——上游还在跑，这一轮额度已经烧掉了。
+// 两个时间参数是 var 而非 const：测试压到毫秒级才能断言心跳（运行期不写）。
+var (
+	sseKeepaliveIdle  = 15 * time.Second
+	sseKeepaliveCheck = 5 * time.Second
+)
+
+// anthropicPing 是 Anthropic 官方的保活事件形态（客户端按 type=ping 忽略）。
+const anthropicPing = "event: ping\ndata: {\"type\":\"ping\"}\n\n"
+
+// sseComment 是通用 SSE 注释保活帧（chat / Responses 两条路径）。
+const sseComment = ": keepalive\n\n"
 
 // bridgeWriter 实现 http.ResponseWriter + http.Flusher：
 // 上游（chatCompletions）看到的是普通写入器，客户端看到的是目标协议。
@@ -47,6 +66,13 @@ type bridgeWriter struct {
 
 	anth *bridge.AnthropicStream
 	rsp  *bridge.ResponsesStream
+
+	// mu 保护 dst 的全部写入与 lastWrite：心跳 goroutine 与 handler goroutine
+	// 会并发写同一个 ResponseWriter（http.ResponseWriter 不保证并发安全）。
+	mu        sync.Mutex
+	lastWrite time.Time
+	keepStop  chan struct{}
+	keepDone  chan struct{}
 }
 
 func newBridgeWriter(dst http.ResponseWriter, kind protoKind, model string) *bridgeWriter {
@@ -87,6 +113,62 @@ func (b *bridgeWriter) startStream() {
 		b.rsp = bridge.NewResponsesStream(b.model, "")
 		b.emit(b.rsp.Start())
 	}
+	b.startKeepalive()
+}
+
+// startKeepalive 起一个后台 goroutine，静默超过 sseKeepaliveIdle 就往客户端
+// 补一帧心跳。只在流式已开（opened）后调用。
+func (b *bridgeWriter) startKeepalive() {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	payload := sseComment
+	if b.kind == protoAnthropic {
+		payload = anthropicPing
+	}
+	b.mu.Lock()
+	b.lastWrite = time.Now()
+	b.keepStop, b.keepDone = stop, done
+	b.mu.Unlock()
+
+	go func() {
+		defer close(done)
+		t := time.NewTicker(sseKeepaliveCheck)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				b.mu.Lock()
+				if time.Since(b.lastWrite) >= sseKeepaliveIdle {
+					if _, err := io.WriteString(b.dst, payload); err == nil {
+						b.lastWrite = time.Now()
+						if f, ok := b.dst.(http.Flusher); ok {
+							f.Flush()
+						}
+					}
+				}
+				b.mu.Unlock()
+			}
+		}
+	}()
+}
+
+// stopKeepalive 停心跳并**等它退出**——Close 之后 handler 就返回了，ResponseWriter
+// 不许再被写（否则是 use-after-free 形态的偶发 panic / 空响应）。
+func (b *bridgeWriter) stopKeepalive() {
+	stop, done := b.keepStop, b.keepDone
+	if stop == nil {
+		return
+	}
+	b.keepStop, b.keepDone = nil, nil
+	close(stop)
+	// 等待带超时：心跳可能卡在写（客户端不读、TCP 窗口满），无限等会把 Close
+	// 也钉死，handler 不返回、连接不释放。超时后放手，goroutine 随写失败退出。
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+	}
 }
 
 // Write 累积输出。流式时按帧解析，凑齐一帧就立刻翻译下发。
@@ -105,10 +187,12 @@ func (b *bridgeWriter) Write(p []byte) (int, error) {
 // Flush 实现 http.Flusher（upstream.StreamHint 依赖它做逐帧推送）。
 func (b *bridgeWriter) Flush() {
 	if b.stream {
-		b.drain()
+		b.drain() // emit 自己持锁；这里不能再套一层（sync.Mutex 不可重入）
+		b.mu.Lock()
 		if f, ok := b.dst.(http.Flusher); ok {
 			f.Flush()
 		}
+		b.mu.Unlock()
 		return
 	}
 	if b.opened {
@@ -185,6 +269,10 @@ func (b *bridgeWriter) emit(events []bridge.Event) {
 	if len(events) == 0 {
 		return
 	}
+	// 整批事件在同一把锁里写完：心跳只允许落在事件之间，不允许插进某个
+	// event/data 对里（那会让客户端把半帧当完整事件解析）。
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	for _, ev := range events {
 		raw, err := json.Marshal(ev.Data)
 		if err != nil {
@@ -194,6 +282,7 @@ func (b *bridgeWriter) emit(events []bridge.Event) {
 			return
 		}
 	}
+	b.lastWrite = time.Now()
 	if f, ok := b.dst.(http.Flusher); ok {
 		f.Flush()
 	}
@@ -202,6 +291,7 @@ func (b *bridgeWriter) emit(events []bridge.Event) {
 // Close 收尾。必须在 chatCompletions 返回后调用（延迟调用即可）：
 // 流式补发 Finish 事件，非流式把缓冲的整包 JSON 翻译后写出。
 func (b *bridgeWriter) Close() {
+	b.stopKeepalive()
 	if b.status == 0 {
 		// 什么都没写（chatCompletions 的防抖分支理论上不会发生）：按空成功处理。
 		b.WriteHeader(http.StatusOK)
