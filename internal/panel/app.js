@@ -588,7 +588,10 @@ function accRowHtml(s, maxCred) {
   const rate = formatRate(tu.last_tokens_per_second);
   const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
   // data-uid 是增量更新的地基：行级 diff 靠它找回同一行，移动/替换时不用重建整表。
-  return '<tr class="' + cls + '" data-uid="' + esc(s.uid) + '" title="uid: ' + esc(s.uid) + '">' +
+  // 出口串并进 title：密集态里 .id.egress 不占列宽（第三个 inline-block 必折行），
+  // 但信息不能丢——悬停整行即可看到。
+  return '<tr class="' + cls + '" data-uid="' + esc(s.uid) + '" title="uid: ' + esc(s.uid) +
+    (s.egress ? ' · 出口: ' + esc(s.egress) : '') + '">' +
     '<td class="mark" aria-hidden="true"><i></i></td>' +
     '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') +
       (entSession.has(s.uid) ? ' <span class="realm-tag warn" title="该凭证绑定企业租户/企业版：行为事件被上游静默丢弃（200 不计分），成长任务与签到不会入账，面板会拦截任务动作。修法：在浏览器退出企业空间，以个人身份重新登录后重新导入。">企业会话·不计分</span>' : '') + '</div><div class="id">' + esc(short) + '</div>' + (s.egress ? '<div class="id egress" title="出口 ' + esc(s.egress) + '">出口 ' + esc(s.egress) + '</div>' : '') + '</td>' +

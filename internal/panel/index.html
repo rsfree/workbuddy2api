@@ -195,9 +195,18 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
    约束项；窄屏靠 mobile.css 的 `.stat .v { white-space:normal }` 折行兜底，
    不在这里再压字号。 */
 .stats {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+  /* 下限 145 而非 132：sCredits 的「129/260K」实测 121px，加左右内边距 18px = 139px，
+     132 的单元格（内容区仅 ~114px）放不下会把数字压到右邻「粘性会话」上。145 保证
+     1200px 窗口下 auto-fit 自动降到 6 列，而不是硬塞 7 列后文字重叠。 */
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
   border: 1px solid var(--line); border-radius: 11px; background: var(--surface);
   overflow: hidden; margin-bottom: 20px; box-shadow: var(--shadow);
+}
+/* 1280 以下改 4 列：auto-fit 在 ~1200px 会掉到 6 列 + 1 个孤项（右侧一大片空白），
+   4 列 = 4+3 两行都饱满。145 下限的 auto-fit 保留在 1280 以上，1440 仍是一行 7 项。
+   .stats.s3（用量页路由诊断）有显式 3 列、特异性更高，不受这条影响。 */
+@media (max-width: 1280px) {
+  .stats { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 }
 .stat { padding: 14px 17px; border-right: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft); }
 .stat .v { font: 600 26px/1.15 var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -.02em; white-space: nowrap; }
@@ -323,9 +332,8 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   /* 出口标签在密集态隐藏：它是任意长度的串，第三个 inline-block 一定会把 uid 挤到
-     第二行（行高直接回到 56px+）。目前它只在开了代理/弹性出口的池子里出现，且
-     「账号 → 行 title」里仍有完整 uid 可对账。要保留就得动模板（批次 3 不做），
-     或者把它并进 tr 的 hover title（一行 JS，等批）。 */
+     第二行（行高直接回到 56px+）。信息没丢——出口串已经并进 <tr> 的 title
+     （app.js accRowHtml：「uid: xxx · 出口: yyy」），悬停整行可见。 */
   .acc.dense .who .id.egress { display: none; }
   /* 用量列原本 4 个 chip + min-width:268px，吃掉近 1/4 行宽。常驻只留「次数 / token」，
      延迟与速率本来就在 .usage-cell 的 title 里（「最近一次：N 次 / tok / 延迟 / 速率」），
@@ -334,9 +342,25 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
   .acc.dense .usage-item.usage-latency, .acc.dense .usage-item.usage-rate { display: none; }
   /* 状态标签：只收高度，字号 11.5px 是对比度验收过的，不动。 */
   .acc.dense .tag { height: 18px; padding: 0 8px; }
-  /* 操作列是宽度大头（332px = 整表 27%）。只收按钮的横向内边距与间距，
-     不动字号/竖向内边距：点击区高度 28px 保持不变，文字也不缩。 */
-  .acc.dense .acts { gap: 4px; }
+  /* 操作列固定在右缘：窗口再窄，「移除」也不会被切掉——横向滚动时内容列从它下面
+     滑过。滚动容器是 .tbl-wrap（overflow-x:auto），sticky 相对它生效；.box 虽然有
+     overflow:hidden，但它在 .tbl-wrap 之外，不会截断 sticky 的定位。
+     背景必须不透明：滚过去的内容会从单元格底下穿过，transparent 会露馅。 */
+  .acc.dense .c-acts, .acc.dense .acts {
+    position: sticky; right: 0; z-index: 2;
+    background: var(--surface);
+  }
+  .acc.dense thead .c-acts { z-index: 3; }   /* 表头压在内容之上 */
+  /* 行 hover 时整行是 --surface-2，sticky 单元格还留在 --surface 就会有一块补丁 */
+  .acc.dense tbody tr:hover .c-acts,
+  .acc.dense tbody tr:hover .acts { background: var(--surface-2); }
+  /* .acts 原来是 display:flex（td 上开 flex），这种状态下 sticky 失效（浏览器会给它
+     套一层匿名单元格，sticky 只在那层里滑）。密集态改回 table-cell，按钮靠
+     text-align:right + 相邻 margin 排布，视觉与 flex 版一致。 */
+  .acc.dense .acts { display: table-cell; text-align: right; white-space: nowrap; }
+  .acc.dense .acts button + button { margin-left: 4px; }
+  /* 操作列是宽度大头（332px）。只收按钮横向内边距，不动字号/竖向内边距：
+     点击区高度 28px 保持不变。 */
   .acc.dense .acts button { padding-left: 6px; padding-right: 6px; }
 }
 .who { min-width: 118px; max-width: 200px; }
