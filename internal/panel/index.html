@@ -4,6 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>WorkBuddy2API · 控制台</title>
+<!-- 站点图标：内联 SVG data URI，不新增文件与路由（CSP img-src 已含 data:）。
+     形状是「圆角方 + 双向箭头」＝网关转发语义；实心块在 16px 标签页下才认得出，
+     outline 线稿缩到 16px 会糊成一团。侧栏 .brand 用的是同一个图形。 -->
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b7cfa'/%3E%3Cg fill='none' stroke='%23fff' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M9.5 12.5h13'/%3E%3Cpath d='M19 9l3.5 3.5L19 16'/%3E%3Cpath d='M22.5 19.5h-13'/%3E%3Cpath d='M13 16l-3.5 3.5L13 23'/%3E%3C/g%3E%3C/svg%3E">
 <style>
 /* ── 设计令牌：明暗两套独立色板 ─────────────────────────────────────────
    冷石墨基调（仪表盘语言，非营销页）：底色分层 + 单一靛蓝强调（仅交互），
@@ -53,7 +57,14 @@ body {
   background: var(--surface); border-right: 1px solid var(--line);
   display: flex; flex-direction: column; position: sticky; top: 0; height: 100vh;
 }
-.brand { padding: 20px 18px 16px; border-bottom: 1px solid var(--line-soft); }
+.brand {
+  padding: 20px 18px 16px; border-bottom: 1px solid var(--line-soft);
+  display: flex; align-items: center; gap: 10px;
+}
+/* 与 favicon 同一图形：实心靛蓝圆角块 + 白色双向箭头。
+   尺寸取 26px = 15px 字号 + 行距，视觉重量与标题相当，不会盖过导航。 */
+.brand .mark { width: 26px; height: 26px; flex: none; display: block; border-radius: 7px; }
+.brand .mark svg { width: 100%; height: 100%; display: block; }
 .brand .name { font-weight: 650; letter-spacing: -.01em; font-size: 15px; }
 .brand .sub { color: var(--ink-3); font-size: 11.5px; font-family: var(--mono); margin-top: 3px; }
 .nav ul { list-style: none; padding: 10px 8px; flex: 1; }
@@ -1032,8 +1043,11 @@ body.bulk-on { padding-bottom: 88px; }
 <div class="shell">
   <nav class="nav" id="navDrawer">
     <div class="brand">
-      <div class="name">WorkBuddy2API</div>
-      <div class="sub" id="navSub">控制台</div>
+      <span class="mark" aria-hidden="true"><svg viewBox="0 0 32 32"><rect width="32" height="32" rx="8" fill="#5b7cfa"/><g fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 12.5h13"/><path d="M19 9l3.5 3.5L19 16"/><path d="M22.5 19.5h-13"/><path d="M13 16l-3.5 3.5L13 23"/></g></svg></span>
+      <div>
+        <div class="name">WorkBuddy2API</div>
+        <div class="sub" id="navSub">控制台</div>
+      </div>
     </div>
     <ul>
       <li><a href="#accounts" data-view="accounts" class="on">
