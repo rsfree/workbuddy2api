@@ -41,6 +41,14 @@ const zeroCreditRescueMax = 3
 // 时，当天就能补回来）。
 var rescueRetryTTL = 45 * time.Minute
 
+// rescueRateTTL 瞬时错误（soft_rate 429 / upstream_busy / 5xx / waf）的短退避。
+//
+// 45 分钟那档是给「任务本身做不动」（回读没点亮、判据对不上）的：重放同一条
+// 动作也大概率白跑。而 429 是**这一刻配额被占**，与任务能不能做无关——按 45
+// 分钟退避等于一次限流罚掉一整天里 1/32 的窗口（2026-10-31 00:49 那轮：12 个
+// 候选里 10+ 个瞬间 429，全被罚 45 分钟）。5 分钟小于清扫周期，下一轮就能重试。
+var rescueRateTTL = 5 * time.Minute
+
 // rescueKey 退避表键（与 acceptStuckKey 同构：NUL 分隔，避免拼接歧义）。
 func rescueKey(uid, code string) string { return uid + "\x00" + code }
 
@@ -63,10 +71,15 @@ func (p *Panel) rescueBlocked(uid, code string) bool {
 
 // markRescueBlocked 把一批任务码记进补给退避表（覆盖写，续期到 now+TTL）。
 func (p *Panel) markRescueBlocked(uid string, codes []string) {
+	p.markRescueBlockedFor(uid, codes, rescueRetryTTL)
+}
+
+// markRescueBlockedFor 带 TTL 的退避登记（429 走短退避，见 rescueRateTTL）。
+func (p *Panel) markRescueBlockedFor(uid string, codes []string, ttl time.Duration) {
 	if len(codes) == 0 {
 		return
 	}
-	until := time.Now().Add(rescueRetryTTL)
+	until := time.Now().Add(ttl)
 	p.rescueMu.Lock()
 	defer p.rescueMu.Unlock()
 	if p.rescueStuck == nil {
@@ -182,9 +195,15 @@ func (p *Panel) runRescuePlan(a *auth.Auth, uid string,
 	for _, t := range plan {
 		msg, err := p.runGrowthQueued(a, t.TaskCode)
 		if err != nil {
-			p.markRescueBlocked(uid, []string{t.TaskCode})
+			// 429/网络抖动 ≠ 任务做不动：短退避，下一轮就重试；只有真正的
+			// 「跑了没点亮」才罚满 45 分钟。
+			ttl := rescueRetryTTL
+			if upstreamTransient(err) {
+				ttl = rescueRateTTL
+			}
+			p.markRescueBlockedFor(uid, []string{t.TaskCode}, ttl)
 			log.Printf("panel: %s uid=%s code=%s 失败（退避 %s）: %v",
-				label, uid, t.TaskCode, rescueRetryTTL, err)
+				label, uid, t.TaskCode, ttl, err)
 			continue
 		}
 		// 只有回读确认 claimed 才算回血成功；上报 200 不等于进度点亮

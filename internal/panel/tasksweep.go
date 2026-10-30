@@ -40,6 +40,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 // TaskSweepStats 一轮补领清扫的汇总（供日志与潜在的未来 HTTP 回执）。
@@ -54,8 +55,9 @@ type TaskSweepStats struct {
 	Discovered int   `json:"discovered"` // 本轮首次发现的新任务数（任务目录 diff）
 	NewAuto    int   `json:"new_auto"`   // 新任务中具备自动动作的个数
 	Rescued    int   `json:"rescued"`    // 零积分账号免生成任务补跑并成功领取的条数
-	// Sequential 非零积分账号经分片轮转推进 Sequential 链并成功领取的条数。
-	// 与 Rescued 分开记：一个衡量「死号回血」，一个衡量「链推进」，混在一起
+	// Sequential 本轮经分片轮转选中的链推进**候选**数（动作在清扫收尾后由
+	// 独立批次执行，成败见日志里的「Sequential 推进 uid=...」行）。
+	// 与 Rescued 分开记：一个衡量「死号回血」，一个衡量「链覆盖」，混在一起
 	// 就看不出「有些号总会漏」有没有真的被修掉。
 	Sequential int `json:"sequential"`
 	// RescueBackoff 零积分补给里因「上轮跑过没点亮」退避而跳过的条数
@@ -77,6 +79,9 @@ func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 	var st TaskSweepStats
 	var mu sync.Mutex
 	var wg sync.WaitGroup
+	// 链推进候选：清扫阶段只收集，wg.Wait 之后交给独立 goroutine 错峰执行。
+	var seqJobs []seqJob
+	var seqMu sync.Mutex
 	// 目录是否尚未建立（升级/新机器首轮）：首轮所有码都「没见过」，若据此触发执行，
 	// 会在生产上一把跑掉全账号的待办（每个含真实对话）。所以首轮只登记不触发，
 	// 由每日成长队列或手动按钮接手；从第二轮起，真正的新码才即时执行。
@@ -117,7 +122,11 @@ func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 			st.Discovered += r.discovered
 			st.NewAuto += r.newAuto
 			st.Rescued += r.rescued
-			st.Sequential += r.seqRescued
+			if len(r.seqTasks) > 0 {
+				seqMu.Lock()
+				seqJobs = append(seqJobs, seqJob{a: a, uid: uid, tasks: r.seqTasks})
+				seqMu.Unlock()
+			}
 			st.RescueBackoff += r.rescueBlocked
 			st.AcceptBackoff += r.acceptBackoff
 			st.newCodes = append(st.newCodes, r.newCodes...)
@@ -141,6 +150,11 @@ func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 		}
 	}
 
+	// 链推进放到清扫收尾之后再起：此时列表/accept/claim 阶段已经跑完，动作不再与
+	// 它抢同一份上游配额；独立 goroutine + 独立低并发池，不拖 ticker。
+	st.Sequential = len(seqJobs)
+	p.startSequentialRescue(seqJobs)
+
 	codes := dedupeCodes(st.newCodes)
 	switch {
 	case len(codes) == 0:
@@ -156,7 +170,7 @@ func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 	}
 
 	if st.Claims() > 0 || st.Errors > 0 || st.Accepted > 0 || st.Discovered > 0 || st.Rescued > 0 || st.Sequential > 0 || st.AcceptBackoff > 0 || st.RescueBackoff > 0 {
-		log.Printf("panel: 任务补领清扫：%d 个账号（跳过 %d）· 新任务 %d（可自动 %d）· 接受 %d · accept退避 %d · 领奖 %d · 零积分补给 %d · Sequential 推进 %d（退避 %d）· +%d 分 +%d 能 · 出错 %d",
+		log.Printf("panel: 任务补领清扫：%d 个账号（跳过 %d）· 新任务 %d（可自动 %d）· 接受 %d · accept退避 %d · 领奖 %d · 零积分补给 %d · Sequential 候选 %d（退避 %d）· +%d 分 +%d 能 · 出错 %d",
 			st.Accounts, st.Skipped, st.Discovered, st.NewAuto, st.Accepted, st.AcceptBackoff, st.Claimed, st.Rescued, st.Sequential, st.RescueBackoff, st.Credits, st.Energy, st.Errors)
 	}
 	return st
@@ -229,7 +243,8 @@ type sweepResult struct {
 	accounts, skipped, accepted, claimed, errors int
 	discovered, newAuto                          int
 	rescued                                      int
-	seqRescued                                   int // 非零积分号推进 Sequential 链的条数
+	seqTasks                                     []upstream.Task // 本轮轮到推进的链任务（最多 1 条）
+
 	rescueBlocked                                int
 	acceptBackoff                                int
 	newCodes                                     []string // 新发现且具备自动动作的码
@@ -314,25 +329,25 @@ func (p *Panel) sweepAccountWithRescue(a *auth.Auth, uid string, rescueAllFree b
 		p.settleAcceptBackoff(a, uid, attempted)
 	}
 
-	// 补给：零积分号跑全部免生成动作；其余号按分片轮转推进 Sequential 链一环。
-	// 已达标项不重跑，留给下方阶段二统一领奖；判定细节见 tasksweep_rescue.go。
-	seqOnly := false
-	if !rescueAllFree && p.shouldRunDiscovered() && sequentialRescueSelected(uid) {
-		seqOnly = true
-	}
-	if rescueAllFree || seqOnly {
-		rescued, blocked, credit, energy := p.runRescuePlan(a, uid, tasks, seqOnly)
-		// 两个口径分开计数：Rescued 衡量「死号回血」，seqRescued 衡量「链推进」。
-		// 混在一个数里就看不出「有些号总会漏」有没有真被修掉。
-		if seqOnly {
-			res.seqRescued += rescued
-		} else {
-			res.rescued += rescued
-		}
+	// 补给分两段，别合并：
+	//   1. 零积分号就地跑全部免生成动作（死号回血的唯一通路，动作短）；
+	//   2. 其余号按分片轮转推进 Sequential 链——**只收集候选、不执行**。链的动作
+	//      按真人节奏 45s/条、最长 8 分钟，就地跑会占满清扫的 8 路信号量并与
+	//      列表扫描抢同一份配额（详见 tasksweep_sequential.go）。
+	// 已达标项不重跑，留给下方阶段二统一领奖。
+	if rescueAllFree {
+		rescued, blocked, credit, energy := p.runRescuePlan(a, uid, tasks, false)
+		res.rescued += rescued
 		res.claimed += rescued
 		res.rescueBlocked += blocked
 		res.credit += credit
 		res.energy += energy
+	} else if p.shouldRunDiscovered() && sequentialRescueSelected(uid) {
+		if plan, _ := sequentialRescuePlan(tasks, func(code string) bool {
+			return p.rescueBlocked(uid, code)
+		}); len(plan) > 0 {
+			res.seqTasks = plan
+		}
 	}
 
 	// 阶段二：领取已达标的奖励。claim 幂等（重复领 already_claimed → 0 分 0 能），

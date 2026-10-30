@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -175,11 +176,14 @@ func TestSequentialRescueRunsForFundedAccount(t *testing.T) {
 
 	st := p.RunTaskSweepOnce()
 	if st.Sequential != 1 {
-		t.Fatalf("Sequential = %d, want 1（有余额号的链应被推进一步；stats=%+v）", st.Sequential, st)
+		t.Fatalf("Sequential = %d, want 1（有余额号的链应被收集为候选；stats=%+v）", st.Sequential, st)
 	}
 	if st.Rescued != 0 {
 		t.Errorf("Rescued = %d, want 0（零积分补给不该参与）", st.Rescued)
 	}
+	// 动作在清扫收尾后的独立批次里跑（tasksweep_sequential.go）：等它收工
+	// 再断言结果，否则看的是「刚收集完、还没执行」的中间态。
+	waitSequentialBatch(t)
 	if !claimed["Sequential_Tasks_1"] {
 		t.Error("Sequential_Tasks_1 未被领取")
 	}
@@ -193,5 +197,17 @@ func TestSequentialRescueRunsForFundedAccount(t *testing.T) {
 	// 第二轮：链已 claimed → 不再重复推进。
 	if second := p.RunTaskSweepOnce(); second.Sequential != 0 {
 		t.Errorf("second Sequential = %d, want 0（已领取不重复跑）", second.Sequential)
+	}
+}
+
+// waitSequentialBatch 等后台链推进批次收尾（有界等待，避免测试挂死）。
+func waitSequentialBatch(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for sequentialRescueBusy.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("后台 Sequential 批次 15s 内未收尾")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
