@@ -1211,6 +1211,11 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 			resp["claimed"] = true
 			resp["credit"] = credit
 			resp["energy"] = energy
+			// 手动领奖也要同步余额快照：面板余额与额度闸门（walletExhausted）
+			// 读的都是这份快照，不同步的话刚挣到的分要等下一次余额刷新才看得见
+			// ——2026-10-30 实测：Valorant 领奖 +100 后面板仍显示旧值，要手动
+			// 点一次「查余额」才对上。
+			p.refreshCreditsQuiet(uid)
 			if credit > 0 || energy > 0 {
 				resp["message"] = msg + fmt.Sprintf("；已自动领奖 +%d 分 +%d 能", credit, energy)
 			} else {
@@ -1866,7 +1871,10 @@ func (p *Panel) accountTaskAutoAll(w http.ResponseWriter, r *http.Request) {
 	done := make(chan []map[string]any, 1)
 	go func() {
 		defer p.unlockAccount(uid) // 流水线真正结束（而非 HTTP 超时返回）才放锁
-		done <- p.runAutoAll(a)
+		res := p.runAutoAll(a)
+		// 一轮可能领到多条奖励，统一在结束时同步一次余额（每项刷新会上游请求倍增）。
+		p.refreshCreditsQuiet(uid)
+		done <- res
 	}()
 	select {
 	case results := <-done:
