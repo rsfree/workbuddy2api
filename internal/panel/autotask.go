@@ -1142,6 +1142,8 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 	// taskByCode 已双口径（mp 专属码自动回落 mp 列表）。
 	before, err := p.taskByCode(a, body.TaskCode)
 	if err != nil {
+		// 列表都读不出来 = 凭证多半已死：回写标签（invalid_token 才命中）。
+		p.markCredsDeadFromErr(a.UID, err)
 		writeErr(w, http.StatusBadGateway, "list tasks: "+err.Error())
 		return
 	}
@@ -1171,6 +1173,9 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		// 凭证失效（invalid_token）时回写账号池：单任务入口也要能把号标死，
+		// 否则同一个号会被反复点、反复 401。
+		p.markCredsDeadFromErr(a.UID, err)
 		writeErr(w, http.StatusBadGateway, "执行失败: "+err.Error())
 		return
 	}
@@ -1733,6 +1738,8 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 				item["status"] = "blocked"
 			}
 			item["message"] = err.Error()
+			// 一键完成同样回写账号池：凭证失效的号在本轮剩下的每一项里都会同样失败。
+			p.markCredsDeadFromErr(a.UID, err)
 			out = append(out, item)
 			continue
 		}

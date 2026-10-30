@@ -133,12 +133,18 @@ func (s *Scheduler) CompensationStatusAll() []CompensationRow {
 			st, err := s.cfg.Upstream.GetCompensationStatus(t.a)
 			if err != nil {
 				row.Error = err.Error()
-				// 顺带记一次「会话已死」：这里只计数不禁用（阈值见 pool.NoteSessionDead），
-				// 与 keepalive 的 12153 共用同一计数——死凭证攒够次数后账号自动禁用，
-				// 不用等人盯着补偿面板发现。
+				// 顺带记一次「会话已死」：invalid_token 是确定性终态 → 打标签 + 禁用
+				// （面板可一键剔除）；12153 只计数不禁用（阈值见 pool.NoteSessionDead）。
+				// 两者与 keepalive 共用同一套判据，死凭证不会因为「走的是补偿链路」
+				// 而在账号表上留不下任何痕迹。
 				var ue *upstream.Error
-				if ps, ok := s.cfg.Pool.Status(t.uid); errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead && ok && !ps.Disabled {
-					s.cfg.Pool.NoteSessionDead(t.uid)
+				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+					if upstream.IsCredsDead(err) {
+						s.cfg.Pool.MarkCredsDead(t.uid, ue.Msg)
+						log.Printf("compensation %s: 401 invalid_token 凭证已失效 — 已打标签并禁用（面板可一键剔除）", logfmt.Label(t.uid, t.nick))
+					} else if ps, ok := s.cfg.Pool.Status(t.uid); ok && !ps.Disabled {
+						s.cfg.Pool.NoteSessionDead(t.uid)
+					}
 				}
 			} else {
 				row.Status = st

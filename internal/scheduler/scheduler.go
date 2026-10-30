@@ -658,9 +658,14 @@ func (s *Scheduler) RunKeepaliveNow() {
 		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
 			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+			// invalid_token 是确定性终态（refresh 换不回来）：一次即打「凭证已失效」
+			// 标签并禁用，面板可一键剔除；12153 才走连续计数（可能误报）。
 			var ue *upstream.Error
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead && !st.Disabled {
-				if s.cfg.Pool.NoteSessionDead(st.UID) {
+				if upstream.IsCredsDead(err) {
+					s.cfg.Pool.MarkCredsDead(st.UID, ue.Msg)
+					log.Printf("keepalive %s: 401 invalid_token 凭证已失效 — 已打标签并禁用（面板可一键剔除）", logfmt.Label(st.UID, st.Nickname))
+				} else if s.cfg.Pool.NoteSessionDead(st.UID) {
 					log.Printf("keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
 				}
 			}

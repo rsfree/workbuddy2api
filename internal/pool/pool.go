@@ -453,6 +453,22 @@ func (p *Pool) upsertLocked(a *auth.Auth) {
 	// LoadDir 已按文件 mtime 填过的号不会被覆盖（幂等，保持"第一次进池"语义）。
 	a.EnsureImportedAt(time.Now())
 	if e, ok := p.byUID[a.UID]; ok {
+		// 凭证真的换了（重新登录 / 换号重新导入）是「凭证已失效」标签唯一的**自动**
+		// 解除条件：同一份 token 被重新扫描到（启动 SyncToDir、反复 import 同一个号）
+		// 不算证据，否则重启一次标签就没了，"一键剔除"永远凑不齐人。
+		oldToken := ""
+		if e.a != nil {
+			oldToken = e.a.AccessTokenValue()
+		}
+		// oldToken == "" 只出现在「刚从 state.json 恢复、还没挂上凭证」的时刻：
+		// 那时没有旧凭证可比，不能凭"空 vs 非空"判定用户重新登录过——否则每次
+		// 重启后的首次 Add 都会把所有标签清光（标签持久化就白做了）。
+		if e.credsDead && oldToken != "" && oldToken != a.AccessTokenValue() {
+			e.credsDead = false
+			e.credsDeadAt = time.Time{}
+			e.credsDeadMsg = ""
+			p.dirty.Store(true)
+		}
 		e.a = a // 保留 credits/cooling 状态
 		return
 	}

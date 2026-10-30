@@ -137,6 +137,29 @@ var softRateMarkers = []string{
 
 var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
 
+// credsDeadMarker 是「凭证已死」的确定性标记：APISIX 对**上游已终止的会话**回
+// 401 + `WWW-Authenticate: Bearer ..., error="invalid_token"`，doJSON 会把该形态
+// 归一化成一句带 invalid_token 的中文文案（见 doJSON 的 401 分支）。
+//
+// 与 12153 的区别是**确定性**：12153 会被临时性触发（网络抖动/上游闪断/refresh
+// 竞态，故有连续 3 次阈值），invalid_token 是上游对死会话的固定答复，access token
+// 报 invalid_token、refresh 同时报 12153 invalid_grant，refresh 换不回来，一次即终态。
+const credsDeadMarker = "invalid_token"
+
+// IsCredsDead 报告该错误是否属于「凭证已死、只有重新登录能救」的终态
+// （Kind=ErrSessionDead 且文案带 invalid_token）。nil / 非 *Error 的传输层错误
+// 一律 false——没有确定性证据就不该给账号打「凭证失效」标签。
+func IsCredsDead(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ue *Error
+	if !errors.As(err, &ue) || ue == nil {
+		return false
+	}
+	return ue.Kind == ErrSessionDead && strings.Contains(strings.ToLower(ue.Msg), credsDeadMarker)
+}
+
 // isQueueFullBody 判定渠道级容量满载文案（6021 queue.full.title 家族）。
 // 该形态表明上游推理集群排队队列打满，与具体账号无关；换号在任何时刻都会撞
 // 同一堵墙，正确处置是不罚号不轮转（见 Classify 的 6021 分支）。子串口径但

@@ -1386,7 +1386,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				lastErr = err
 				var ue *upstream.Error
 				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
-					h.cfg.Pool.Disable(acct.UID, "refresh session dead")
+					// refresh 失败的两种死法分开记：invalid_token 是确定性终态 → 打
+					// 「凭证已失效」标签（面板可一键剔除）；12153 沿用原禁用原因。
+					if upstream.IsCredsDead(err) {
+						h.cfg.Pool.MarkCredsDead(acct.UID, ue.Msg)
+					} else {
+						h.cfg.Pool.Disable(acct.UID, "refresh session dead")
+					}
 				} else {
 					h.cfg.Pool.NoteError(acct.UID)
 				}
@@ -1985,7 +1991,8 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 //     起 · softStreak 指数、封顶 soft_rate_max 的既有 CooldownSoftRate 有界退避。
 //     基数经 jitterDur 抖动（防多账号同相位冷却到期再聚团）。
 //   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s)：短冷却防雪崩。
-//   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
+//   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。其中 401
+//     invalid_token（upstream.IsCredsDead）额外打「凭证已失效」标签，面板可一键剔除。
 //   - ErrContentBlocked → 不罚账号；passthrough 首遇触发降级重试，最终仍拦则回 400。
 //   - ErrBadParams → 不罚账号，且与 ErrPromptTooLong/ErrImageInvalid 同待遇：
 //     调用方在轮转循环内即刻 400 透传原文终止（换号必然同样失败）。
@@ -2050,6 +2057,14 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		}
 		h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Time{}, "waf 403 block")
 	case upstream.ErrSessionDead:
+		// 两种 session 死亡的处置不同（见 upstream.IsCredsDead）：
+		//   - 401 invalid_token：上游已终止该会话，refresh 也换不回来，是**确定性终态**。
+		//     打「凭证已失效」标签（MarkCredsDead 顺手禁用），面板据此一键剔除；
+		//   - 12153 offline session：可能被临时性触发，沿用原判（禁用，见 issue P0-1）。
+		if uerr != nil && upstream.IsCredsDead(uerr) {
+			h.cfg.Pool.MarkCredsDead(uid, uerr.Msg)
+			return
+		}
 		h.cfg.Pool.Disable(uid, "12153 session dead")
 	case upstream.ErrNotFound:
 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：

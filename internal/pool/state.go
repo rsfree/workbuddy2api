@@ -52,6 +52,15 @@ func (p *Pool) ClearSessionDead(uid string) {
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		e.sessionDeadFails = 0
+		// refresh 成功 = 凭证确实还能换出新 token，「凭证已失效」标签必须一并撤掉：
+		// 留着会让一个已经活过来的号继续出现在「可剔除」清单里（账号解禁了标签还在，
+		// 运维会以为面板坏了）。同样清 credsDead 的时刻/文案，避免下次打标时残留旧证据。
+		if e.credsDead {
+			e.credsDead = false
+			e.credsDeadAt = time.Time{}
+			e.credsDeadMsg = ""
+			p.dirty.Store(true)
+		}
 	}
 }
 
@@ -66,6 +75,11 @@ func (p *Pool) ReviveDisabled(uid string) {
 		e.disabled = false
 		e.reason = ""
 		e.sessionDeadFails = 0
+		// 人工复活 = 运维已干预（多半是重新登录过）：一并撤掉「凭证已失效」标签，
+		// 否则解禁后行的状态列会同时显示「可用」和「凭证失效」，自相矛盾。
+		e.credsDead = false
+		e.credsDeadAt = time.Time{}
+		e.credsDeadMsg = ""
 		p.dirty.Store(true)
 	}
 }
@@ -92,6 +106,10 @@ func (p *Pool) Revive(uid string) bool {
 	e.fails = 0
 	e.retryCount = 0
 	e.breakerUntil = time.Time{}
+	// 解冻是全清：凭证失效标签一并不留（同上，避免「可用 + 凭证失效」并存）。
+	e.credsDead = false
+	e.credsDeadAt = time.Time{}
+	e.credsDeadMsg = ""
 	p.dirty.Store(true)
 	return true
 }
@@ -184,6 +202,13 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.sessionDeadFails = 0
 		e.consecutiveFails = 0
 		e.degradeUntil = time.Time{}
+		// 请求成功是「凭证还能用」的最强证据：撤掉凭证失效标签（正常流程里带标签的
+		// 号已被禁用、接不到请求，这里兜的是「标签来自任务路径而账号仍可用」的窗口）。
+		if e.credsDead {
+			e.credsDead = false
+			e.credsDeadAt = time.Time{}
+			e.credsDeadMsg = ""
+		}
 		p.dirty.Store(true)
 	}
 }
@@ -680,6 +705,17 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 	if st.Disabled {
 		// 禁用账号透出禁用原因（运维看不到为什么死）。
 		st.DisabledReason = e.reason
+	}
+	// 「凭证已失效」标签：显式打标（MarkCredsDead）优先；否则从禁用原因反推——
+	// 本次改动前就被 session_dead 禁掉的老号 reason 里只有 "12153 session dead"
+	// 这类文案，没有标签就永远进不了「一键剔除」清单（见 IsSessionDeadReason）。
+	if e.credsDead {
+		st.SessionDead = true
+		st.SessionDeadAt = e.credsDeadAt
+		st.SessionDeadMsg = e.credsDeadMsg
+	} else if st.Disabled && IsSessionDeadReason(e.reason) {
+		st.SessionDead = true
+		st.SessionDeadMsg = e.reason
 	}
 	if st.Cooling {
 		// 冷却剩余秒数（向上取整，避免 0 显示为已到期）。

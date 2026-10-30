@@ -25,10 +25,10 @@ try { accFilter = localStorage.getItem(LS_ACC_FILTER) || 'all'; } catch (e) {}
    标签只写 localStorage（wb2api.acctags.v1），不进凭证文件、不上传。 */
 const LS_ACC_TAGS = 'wb2api.acctags.v1';
 const LS_ACC_VIEW = 'wb2api.accview.v1';
-const ACC_STATUS = ['all', 'issue', 'ok', 'cool', 'paused', 'off', 'ent', 'global'];
+const ACC_STATUS = ['all', 'issue', 'ok', 'cool', 'paused', 'off', 'dead', 'ent', 'global'];
 const ACC_STATUS_LABEL = {
   all: '全部', issue: '需处理', ok: '可用', cool: '冷却',
-  paused: '暂停', off: '禁用', ent: '企业版', global: '国际版',
+  paused: '暂停', off: '禁用', dead: '凭证失效', ent: '企业版', global: '国际版',
 };
 /* 排序表：每个比较器都以「导入时间倒序」做二级键，保证同值时顺序稳定
    （不稳定排序会让表格每 5 秒抖一次，运维以为数据在变）。 */
@@ -581,7 +581,7 @@ function accRowSig(s, maxCred) {
     return r.model + '/' + r.kind + '/' + (r.reason || '') + '/' + (d > now ? Math.ceil((d - now) / 60000) : 0);
   }).join(',');
   return [
-    s.disabled ? 1 : 0, s.paused ? 1 : 0,
+    s.disabled ? 1 : 0, s.paused ? 1 : 0, s.session_dead ? 1 : 0,
     s.credits, s.credits_total, accCredPct(s, maxCred),
     s.in_flight, s.last_success, s.consecutive_fails, s.success_count, s.err_total,
     rateSig,
@@ -605,6 +605,15 @@ function accRowHtml(s, maxCred) {
     tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
   } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
   const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
+  /* 「凭证失效」红标（后端 Status.SessionDead）：401 invalid_token，上游终止了会话、
+     refresh 也换不回来，只能重新登录。它与主状态标签**并排**而不是替换：一个号可以
+     既是「已禁用」又是「凭证失效」（MarkCredsDead 会顺手禁用），运维要能同时看到
+     "为什么不能用" 和 "最该怎么修"。title 里放上游原文，省掉再翻日志那一步。 */
+  const deadTag = s.session_dead
+    ? '<span class="tag bad" style="margin-left:6px" title="' +
+      esc(s.session_dead_msg || '凭证已失效（401 invalid_token）：会话被上游终止，需重新登录') +
+      '">凭证失效</span>'
+    : '';
   const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now());
   const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
   // 企业版不限量：上游 limitNum == -1，网关以 credits_total=-1 透出（见 upstream
@@ -650,7 +659,7 @@ function accRowHtml(s, maxCred) {
       esc(s.uid) + '"' + (accSel.has(s.uid) ? ' checked' : '') + ' aria-label="选择该账号"></td>' +
     '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + tagDot + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') +
       (entSession.has(s.uid) ? ' <span class="realm-tag warn" title="该凭证绑定企业租户/企业版：行为事件被上游静默丢弃（200 不计分），成长任务与签到不会入账，面板会拦截任务动作。修法：在浏览器退出企业空间，以个人身份重新登录后重新导入。">企业会话·不计分</span>' : '') + '</div><div class="id">' + esc(short) + '</div>' + (s.egress ? '<div class="id egress" title="出口 ' + esc(s.egress) + '">出口 ' + esc(s.egress) + '</div>' : '') + '</td>' +
-    '<td>' + tag + note + rateLimits + '</td>' +
+    '<td>' + tag + deadTag + note + rateLimits + '</td>' +
     '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
     '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
     '<td class="num">' + (s.in_flight || 0) + '</td>' +
@@ -968,6 +977,12 @@ async function loadOverview(quiet, metricsOnly) {
       const bn = d.banned || 0;
       $('btnPruneBanned').textContent = bn ? '剔除封禁号(' + bn + ')' : '剔除封禁号';
     }
+    // 「剔除失效号」同理：session_dead 是「凭证已失效（401 invalid_token）」标签，
+    // 与 banned 并列的另一类可一键剔除的账号（口径都在后端，前端只显示计数）。
+    if ($('btnPruneDead')) {
+      const sd = d.session_dead || 0;
+      $('btnPruneDead').textContent = sd ? '剔除失效号(' + sd + ')' : '剔除失效号';
+    }
     // 暂停选号单列（issue #125）：它只关选号、照常签到保活，与禁用是两种状态。
     if ($('sPaused')) $('sPaused').textContent = d.paused == null ? '-' : d.paused;
     const remSum = (d.accounts || []).reduce((a, s) => a + (s.credits || 0), 0);
@@ -1094,33 +1109,56 @@ $('btnActivityAll').onclick = async () => {
   try { await api('activity_all', { method: 'POST' }); toast('活跃上报已开始，结果见日志', 'ok'); }
   catch (e) { toast(e.message, 'err'); }
 };
-/* 剔除封禁号：两段式（预演 → 确认 → 按确认清单执行）。
-   单段式「点一下就删」在这个接口上不可接受：一次可能删掉上百个账号的凭证，
-   而运维看不出到底删的是哪些。预演回的是逐号 uid/昵称/原因/积分，确认框把它们
-   摊开，真删时再把这份 uid 清单回传，后端只动这批（期间新封的号留到下次）。 */
+/* 批量剔除的通用两段式（预演 → 确认 → 按确认清单执行）。
+   封禁号 / 凭证失效号共用：单段式「点一下就删」在这类接口上不可接受——一次可能
+   删掉上百个账号的凭证，而运维看不出到底删的是哪些。预演回的是逐号 uid/昵称/原因/
+   积分，确认框把它们摊开，真删时再把这份 uid 清单回传，后端只动这批（期间新命中的
+   号留到下次）。 */
+async function pruneFlow(path, o) {
+  const pre = await api(path, { method: 'POST', body: JSON.stringify({ dry_run: true }) });
+  if (!pre.count) { toast(o.empty, 'ok'); return; }
+  const lines = (pre.accounts || []).slice(0, 6).map(s => '· ' + (s.nickname || String(s.uid).slice(0, 12)));
+  if (pre.count > lines.length) lines.push('… 等共 ' + pre.count + ' 个');
+  const msg = '将剔除 ' + pre.count + ' 个' + o.noun + '：\n\n' + lines.join('\n')
+    + '\n\n冻结积分合计 ' + (pre.frozen_credits || 0) + '（剔除后不再计入池内余额）'
+    + '\n凭证文件不删除，归档到：\n' + (pre.archive_dir || '(auths-pruned/)')
+    + '\n\n' + o.scope + '\n\n确认剔除？';
+  if (!confirm(msg)) return;
+  const r = await api(path, {
+    method: 'POST',
+    body: JSON.stringify({ dry_run: false, uids: (pre.accounts || []).map(s => s.uid) }),
+  });
+  const bad = (r.failed || []).length;
+  toast('已剔除 ' + r.removed + ' 个' + o.noun
+    + (r.archived ? '，凭证已归档 ' + r.archived + ' 份' : '')
+    + (bad ? '；' + bad + ' 个凭证归档失败（见日志，重启会把它们载回池子）' : ''),
+    bad ? 'err' : 'ok');
+}
+
 $('btnPruneBanned').onclick = async ev => {
   const b = ev.currentTarget;
   b.disabled = true;
   try {
-    const pre = await api('accounts/prune_banned', { method: 'POST', body: JSON.stringify({ dry_run: true }) });
-    if (!pre.count) { toast('当前没有因上游封禁而废掉的账号', 'ok'); return; }
-    const lines = (pre.accounts || []).slice(0, 6).map(s => '· ' + (s.nickname || String(s.uid).slice(0, 12)));
-    if (pre.count > lines.length) lines.push('… 等共 ' + pre.count + ' 个');
-    const msg = '将剔除 ' + pre.count + ' 个被上游封禁的账号：\n\n' + lines.join('\n')
-      + '\n\n冻结积分合计 ' + (pre.frozen_credits || 0) + '（剔除后不再计入池内余额）'
-      + '\n凭证文件不删除，归档到：\n' + (pre.archive_dir || '(auths-pruned/)')
-      + '\n\n只处理上游封禁号（11140 request illegal 等）；人工禁用、14017 试用未激活、'
-      + '冷却中的账号不受影响。\n\n确认剔除？';
-    if (!confirm(msg)) return;
-    const r = await api('accounts/prune_banned', {
-      method: 'POST',
-      body: JSON.stringify({ dry_run: false, uids: (pre.accounts || []).map(s => s.uid) }),
+    await pruneFlow('accounts/prune_banned', {
+      noun: '被上游封禁的账号',
+      empty: '当前没有因上游封禁而废掉的账号',
+      scope: '只处理上游封禁号（11140 request illegal 等）；人工禁用、14017 试用未激活、冷却中的账号不受影响。',
     });
-    const bad = (r.failed || []).length;
-    toast('已剔除 ' + r.removed + ' 个封禁号'
-      + (r.archived ? '，凭证已归档 ' + r.archived + ' 份' : '')
-      + (bad ? '；' + bad + ' 个凭证归档失败（见日志，重启会把它们载回池子）' : ''),
-      bad ? 'err' : 'ok');
+  } catch (e) { toast(e.message, 'err'); }
+  finally { b.disabled = false; loadOverview(true); }
+};
+/* 剔除「凭证已失效」的号（401 invalid_token：上游终止了会话、refresh 换不回来，
+   只能重新登录）。这类号此前在面板上既不是 banned 也不是冷却，任务队列里每个动作
+   都以同一句 401 结束，运维只能翻日志手工找——所以给它一个独立的标签与出口。 */
+$('btnPruneDead').onclick = async ev => {
+  const b = ev.currentTarget;
+  b.disabled = true;
+  try {
+    await pruneFlow('accounts/prune_session_dead', {
+      noun: '凭证已失效的账号',
+      empty: '当前没有凭证失效的账号',
+      scope: '只处理凭证已失效（401 invalid_token，上游已终止会话、需重新登录）的账号；封禁号、人工禁用、14017 试用未激活不受影响。',
+    });
   } catch (e) { toast(e.message, 'err'); }
   finally { b.disabled = false; loadOverview(true); }
 };
@@ -4807,6 +4845,9 @@ function accMatches(s) {
     case 'cool': if (s.disabled || !(cool > 0)) return false; break;
     case 'paused': if (!s.paused) return false; break;
     case 'off': if (!s.disabled) return false; break;
+    // 凭证失效是独立于 disabled 的标签（后端 Status.SessionDead）：前端只认这个
+    // 布尔，不重复解析禁用原因文案——两套正则必然漂移（"哪条文案算死"改一处漏一处）。
+    case 'dead': if (!s.session_dead) return false; break;
     case 'ent': if (!s.enterprise) return false; break;
     case 'global': if (s.realm !== 'global') return false; break;
     default: break;
@@ -4878,7 +4919,7 @@ function syncAccControls() {
 function renderAccStatusChips(all) {
   const box = $('accStatusChips');
   if (!box) return;
-  const cnt = { all: all.length, issue: 0, ok: 0, cool: 0, paused: 0, off: 0, ent: 0, global: 0 };
+  const cnt = { all: all.length, issue: 0, ok: 0, cool: 0, paused: 0, off: 0, dead: 0, ent: 0, global: 0 };
   all.forEach(s => {
     const cool = accCool(s).cool;
     // 计数口径与行内状态标签一致：已禁用优先（禁用的号即使还在冷却也只算禁用）。
@@ -4887,6 +4928,9 @@ function renderAccStatusChips(all) {
     else if (cool > 0) cnt.cool++;
     else cnt.ok++;
     if (s.disabled || cool > 0) cnt.issue++;
+    // 凭证失效与上面三个状态正交（MarkCredsDead 会顺手禁用，但标签也会出现在
+    // 「仅由历史禁用原因反推」的老号上），所以单独累加，不进 else-if 链。
+    if (s.session_dead) cnt.dead++;
     if (s.enterprise) cnt.ent++;
     if (s.realm === 'global') cnt.global++;
   });

@@ -74,6 +74,10 @@ func growthPending(t upstream.Task) bool {
 func (p *Panel) listTasksBoth(a *auth.Auth) (tasks []upstream.Task, mpOnly map[string]bool, err error) {
 	tasks, err = p.cfg.Upstream.ListTasks(a)
 	if err != nil {
+		// 任务列表调用是「账号还能不能用」的最便宜探针（队列 accept、任务页、
+		// 清扫发现都先走它）：这里就 401 invalid_token 的号就地打标签，
+		// 不用等某个具体动作失败才被发现。
+		p.markCredsDeadFromErr(a.UID, err)
 		return nil, nil, err
 	}
 	mpOnly = map[string]bool{}
@@ -589,6 +593,9 @@ func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurren
 							attempt, queueRetryAttempts-1, err.Error()))
 					time.Sleep(queueRetryBackoff(err, attempt))
 				}
+				// 回写账号池：invalid_token 的号要立刻退出选号（并打「凭证失效」标签），
+				// 否则同一轮里后续每一项、下一轮每一个动作都会以同一句 401 结束。
+				p.markCredsDeadFromErr(one.a.UID, err)
 				switch {
 				case err == nil:
 					p.queueMarkAt(i, "done", msg)

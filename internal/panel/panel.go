@@ -221,6 +221,9 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.accountBalance))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.withAuth(p.accountRemove))
 	p.mux.HandleFunc("POST /panel/api/accounts/prune_banned", p.withAuth(p.accountPruneBanned))
+	// 凭证已失效（401 invalid_token）的一键剔除：与封禁号同一套两段式语义
+	// （预演 → 确认 → 按确认清单执行），凭证归档而非删除。
+	p.mux.HandleFunc("POST /panel/api/accounts/prune_session_dead", p.withAuth(p.accountPruneSessionDead))
 	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/tasks", p.withAuth(p.accountTasks))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept", p.withAuth(p.accountTaskAccept))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept_all", p.withAuth(p.taskAcceptAll))
@@ -323,9 +326,15 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	// 这种自相矛盾的展示。计数口径与 Pool.Banned 一致（同用 IsUpstreamBannedReason）。
 	accounts := p.cfg.Pool.List()
 	banned := 0
+	sessionDead := 0
 	for _, st := range accounts {
 		if st.Disabled && pool.IsUpstreamBannedReason(st.DisabledReason) {
 			banned++
+		}
+		// 凭证已失效（401 invalid_token）：与 banned 并列的另一类「可一键剔除」。
+		// 口径 = Status.SessionDead，与 prune_session_dead 的命中集合同源。
+		if st.SessionDead {
+			sessionDead++
 		}
 	}
 	// 两类企业相关凭证，展示口径不同（2026-10-23 实测修正后）：
@@ -365,7 +374,12 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		// banned 是 disabled 的子集：其中因上游 11140 等硬处置封停、面板可一键剔除的。
 		// 前端据此禁用/标注「剔除封禁号」按钮；两类分开是因为人工禁用与 14017
 		// 试用未激活都还能救，混在一起剔会误伤。
-		"banned":         banned,
+		"banned": banned,
+		// session_dead 是另一类「可一键剔除」：凭证已失效（401 invalid_token，上游
+		// 终止了会话、refresh 换不回来，只能重新登录）。与 disabled 交叉——标签
+		// 描述「观测到死凭证」，禁用描述「已退出选号」，两者通常同时成立但语义不同，
+		// 所以单独给一个计数而不是塞进 disabled 的子集（banned 那种）。
+		"session_dead":   sessionDead,
 		"paused":         paused,
 		"in_flight_full": inFlightFull,
 		"accounts":       accounts,
@@ -941,49 +955,104 @@ func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
-// 批量剔除封禁号
+// 批量剔除（封禁号 / 凭证失效号）
 // ---------------------------------------------------------------------------
 
-// pruneBannedRequest 一键剔除「上游封禁」账号的请求体。
+// pruneAccountsRequest 一键剔除的请求体。
 //
 // dry_run 用指针而不是 bool：接口会删凭证，默认必须是安全的那一侧。空 body、
 // 非法 JSON、字段缺省一律落到「只读预演」，只有显式 "dry_run": false 才真删。
 //
 // uids 是前端确认框里展示给运维的那批账号（预演结果原样回传）。带上它能把
 // 「看到 3 个 → 点下去删了 99 个」这类 TOCTOU 差异压到零：真删时只动这批 uid，
-// 期间新被封的号留到下一次剔除。为空时退化为「处理当前全部命中账号」，供
+// 期间新命中的号留到下一次剔除。为空时退化为「处理当前全部命中账号」，供
 // curl / 脚本使用。
-type pruneBannedRequest struct {
+type pruneAccountsRequest struct {
 	DryRun *bool    `json:"dry_run"`
 	UIDs   []string `json:"uids"`
 }
 
-// pruneBannedRow 预演/执行结果的单行（前端确认框直接渲染）。
-type pruneBannedRow struct {
+// pruneAccountRow 预演/执行结果的单行（前端确认框直接渲染）。
+type pruneAccountRow struct {
 	UID      string `json:"uid"`
 	Nickname string `json:"nickname,omitempty"`
-	Reason   string `json:"reason"`
-	Credits  int64  `json:"credits"`
+	// Reason 命中原因：封禁号给 disabled_reason，凭证失效号给 invalid_token 的证据
+	// 文案（老号是从禁用原因反推的，没有 MarkCredsDead 写的时刻/原文）。
+	Reason  string `json:"reason"`
+	Credits int64  `json:"credits"`
+	// At 命中时刻（仅凭证失效号且由 MarkCredsDead 打标时非零，RFC3339）。
+	At string `json:"at,omitempty"`
+}
+
+// pruneScope 一类「可整批剔除」的账号。
+//
+// 两类（上游封禁 / 凭证失效）除了命中口径与文案之外，处置完全同构：出池走
+// Pool.Remove、凭证归档到 auths-pruned/<日期>/、两段式确认（预演 → 白名单真删）。
+// 所以只留差异点，**不复制两份删号逻辑**——复制过的东西迟早只修一半，而这三件事
+// 任何一处走偏都是不可逆事故。
+type pruneScope struct {
+	// key 日志里的类别标识（prune_banned / prune_session_dead）。
+	key string
+	// what 人类可读的类别名（「上游封禁号」/「凭证失效号」）。
+	what string
+	// pick 返回当前命中的账号快照（只读，不改池状态）。
+	pick func() []pool.Status
+	// reasonOf 从账号状态取「为什么命中」，逐号进确认框。
+	reasonOf func(pool.Status) string
+	// atOf 命中时刻（可为 nil）。
+	atOf func(pool.Status) string
 }
 
 // accountPruneBanned 一键剔除被封号（上游 11140 request illegal 等硬禁用）。
 //
+// 命中口径只有 pool.IsUpstreamBannedReason：人工禁用（manual disable）、14017
+// 试用未激活、积分/软冷却一律不动——那些都还能救。
+func (p *Panel) accountPruneBanned(w http.ResponseWriter, r *http.Request) {
+	p.pruneAccounts(w, r, pruneScope{
+		key:      "prune_banned",
+		what:     "上游封禁号",
+		pick:     p.cfg.Pool.Banned,
+		reasonOf: func(st pool.Status) string { return st.DisabledReason },
+	})
+}
+
+// accountPruneSessionDead 一键剔除「凭证已失效」的账号（401 invalid_token：上游
+// 已终止会话，refresh 也换不回来，只能重新登录）。
+//
+// 命中口径 = Status.SessionDead：显式标签（MarkCredsDead，chat/refresh/keepalive/
+// 补偿/任务链路观测到 invalid_token 时打）+ 从历史禁用原因反推的老号
+// （"12153 session dead" / "refresh session dead"，见 pool.IsSessionDeadReason）。
+func (p *Panel) accountPruneSessionDead(w http.ResponseWriter, r *http.Request) {
+	p.pruneAccounts(w, r, pruneScope{
+		key:      "prune_session_dead",
+		what:     "凭证失效号",
+		pick:     p.cfg.Pool.SessionDeadAccounts,
+		reasonOf: func(st pool.Status) string { return st.SessionDeadMsg },
+		atOf: func(st pool.Status) string {
+			if st.SessionDeadAt.IsZero() {
+				return ""
+			}
+			return st.SessionDeadAt.Format(time.RFC3339)
+		},
+	})
+}
+
+// pruneAccounts 两类批量剔除的共同实现。
+//
 // 语义：
-//   - 命中口径只有 pool.IsUpstreamBannedReason：人工禁用（manual disable）、
-//     14017 试用未激活、积分/软冷却一律不动——那些都还能救；
 //   - 出池走 Pool.Remove（与单号「移除」同一条路径：立即落盘 state，在途请求的
 //     Release 对已删条目是 no-op）；
 //   - 凭证文件**不删**，移到 <auth_dir 父目录>/auths-pruned/<YYYY-MM-DD>/。
-//     被封号仍有申诉价值（上游解除后原凭证可再用），删了就真没了；该目录与
-//     auth_dir 并列而非其子目录，确保 auth.LoadDir 的 auth_dir/workbuddy*.json
-//     glob 永远扫不到归档，重启不会把刚剔掉的号又载回池子。
-func (p *Panel) accountPruneBanned(w http.ResponseWriter, r *http.Request) {
-	var req pruneBannedRequest
+//     封禁号仍有申诉价值（上游解除后原凭证可再用）、失效号重新登录时也还要用它
+//     当底稿，删了就真没了；该目录与 auth_dir 并列而非其子目录，确保 auth.LoadDir
+//     的 auth_dir/workbuddy*.json glob 永远扫不到归档，重启不会把刚剔掉的号又载回池子。
+func (p *Panel) pruneAccounts(w http.ResponseWriter, r *http.Request, scope pruneScope) {
+	var req pruneAccountsRequest
 	// 解析失败按零值处理（= 预演）：这个接口的默认动作必须是不可逆操作的反面。
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	dryRun := req.DryRun == nil || *req.DryRun
 
-	banned := p.cfg.Pool.Banned()
+	hits := scope.pick()
 	if len(req.UIDs) > 0 {
 		want := make(map[string]bool, len(req.UIDs))
 		for _, u := range req.UIDs {
@@ -991,26 +1060,30 @@ func (p *Panel) accountPruneBanned(w http.ResponseWriter, r *http.Request) {
 				want[u] = true
 			}
 		}
-		// 只认「既在确认清单里、此刻仍被封」的交集：确认后已被人手工解冻/移除的
+		// 只认「既在确认清单里、此刻仍命中」的交集：确认后已被人手工解冻/移除的
 		// 账号自动出列，不会因为清单过期而误删。
 		sel := make([]pool.Status, 0, len(want))
-		for _, st := range banned {
+		for _, st := range hits {
 			if want[st.UID] {
 				sel = append(sel, st)
 			}
 		}
-		banned = sel
+		hits = sel
 	}
 
-	rows := make([]pruneBannedRow, 0, len(banned))
+	rows := make([]pruneAccountRow, 0, len(hits))
 	var frozen int64
-	for _, st := range banned {
-		rows = append(rows, pruneBannedRow{
+	for _, st := range hits {
+		row := pruneAccountRow{
 			UID:      st.UID,
 			Nickname: st.Nickname,
-			Reason:   st.DisabledReason,
+			Reason:   scope.reasonOf(st),
 			Credits:  st.Credits,
-		})
+		}
+		if scope.atOf != nil {
+			row.At = scope.atOf(st)
+		}
+		rows = append(rows, row)
 		frozen += st.Credits
 	}
 	archiveDir := p.pruneArchiveDir()
@@ -1031,7 +1104,7 @@ func (p *Panel) accountPruneBanned(w http.ResponseWriter, r *http.Request) {
 	removed := 0
 	archived := 0
 	failed := make([]map[string]string, 0)
-	for _, st := range banned {
+	for _, st := range hits {
 		a := p.cfg.Pool.Remove(st.UID)
 		if a == nil {
 			continue // 已被并发移除/剔除（另一页签、脚本），跳过而非报错
@@ -1048,8 +1121,8 @@ func (p *Panel) accountPruneBanned(w http.ResponseWriter, r *http.Request) {
 		}
 		archived++
 	}
-	log.Printf("panel: prune_banned 剔除 %d 个上游封禁号（归档凭证 %d，失败 %d，归档目录 %s）",
-		removed, archived, len(failed), archiveDir)
+	log.Printf("panel: %s 剔除 %d 个%s（归档凭证 %d，失败 %d，归档目录 %s）",
+		scope.key, removed, scope.what, archived, len(failed), archiveDir)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":          true,
 		"dry_run":     false,

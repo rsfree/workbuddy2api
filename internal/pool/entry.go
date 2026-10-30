@@ -106,6 +106,17 @@ type Status struct {
 	Enterprise     bool   `json:"enterprise,omitempty"`
 	Disabled       bool   `json:"disabled"`
 	DisabledReason string `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+	// SessionDead 凭证已失效标签（401 invalid_token：上游已终止会话，refresh 也换
+	// 不回来，只有重新登录能救）。面板据此在账号行打「凭证失效」红标，并提供
+	// 「剔除失效号」一键批量剔扣除（POST /panel/api/accounts/prune_session_dead）。
+	//
+	// 与 disabled 正交不重合：标签是**观测证据**（谁见过 invalid_token），disabled
+	// 是**处置结果**（退出选号）。两者通常同时成立（MarkCredsDead 顺手禁用），但
+	// 标签可由历史禁用原因反推（老 state 里的 "12153 session dead" 这类），此时
+	// 未必有 MarkCredsDead 写的时刻戳——所以 SessionDeadAt 可能为零值。
+	SessionDead    bool      `json:"session_dead"`
+	SessionDeadAt  time.Time `json:"session_dead_at,omitempty"`
+	SessionDeadMsg string    `json:"session_dead_msg,omitempty"`
 	// Paused 暂停选号：退出选号候选（与 disabled 一样不参与选号），但**照常参与**
 	// 签到 / 活跃上报 / 保活 / 余额刷新四类保号任务。与 disabled 正交——disabled 是
 	// 「授权/session 终态，需人工 revive」，paused 是「运维临时让位」（多号轮换场景），
@@ -261,6 +272,14 @@ type entry struct {
 	// 重学（再吃 2 次失败才禁用，期间每次都白打一轮上游）；清零点（refresh/chat 成功、
 	// 手工复活）同样落盘，重启后不残留旧计数。
 	sessionDeadFails int
+	// credsDead 凭证已失效标签 + 观测时刻 + 证据文案（见 Status.SessionDead）。
+	// 与 sessionDeadFails（「疑似、可能误报」的连续计数）互补：这里是**终态**，
+	// 由 MarkCredsDead 一次成立；清零点 = 重新登录（凭证变化，见 upsertLocked）、
+	// 任意成功、人工复活。持久化：上游判死的号跨重启仍是死的，重启后标签不该失忆
+	// （否则面板上看不出这批号，一键剔除也就无从下手）。
+	credsDead    bool
+	credsDeadAt  time.Time
+	credsDeadMsg string
 	// consecutiveFails 连续失败计数（连败降权，issue #114）——「不知道原因的兜底」：
 	// 覆盖 ErrClient（未知 4xx）与传输层失败（连不上上游）这类 applyErrorPolicy
 	// default 分支不罚号的形态。与 sessionDeadFails 同构但独立计数：12153 的终态
@@ -468,6 +487,12 @@ type stateAccount struct {
 	// SessionDeadFails 连续 12153 计数（判定 session 死亡的进度）。持久化以保留
 	// 「重启后连续计数继续累计」。
 	SessionDeadFails int `json:"session_dead_fails"`
+	// CredsDead / CredsDeadAt / CredsDeadMsg 凭证已失效标签（见 entry.credsDead）。
+	// 持久化理由同 SessionDeadFails：死号跨重启仍是死的，标签失忆会让面板上
+	// 「哪些号要重新登录」这件事重新变成靠翻日志猜。
+	CredsDead    bool      `json:"creds_dead,omitempty"`
+	CredsDeadAt  time.Time `json:"creds_dead_at,omitempty"`
+	CredsDeadMsg string    `json:"creds_dead_msg,omitempty"`
 	// ConsecutiveFails 连续失败计数（连败降权进度，见 entry.consecutiveFails）。
 	ConsecutiveFails int `json:"consecutive_fails"`
 	// DegradeUntil 连败降权截止（issue #114）。仅未过期才持久化（落盘/恢复均惰性
