@@ -79,6 +79,11 @@ func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 	p.pruneAcceptStuck()
 	p.pruneRescueBlocked()
 
+	// 并发闸：223 个账号原先是一次性铺开，每号 2 次列表请求 → 2 秒内 400+ 个
+	// 请求打上游，mp 口径（X-Client-Platform: miniprogram）最先被 429
+	// （2026-10-30 14:31 实测：4 个号在补给时直接 soft_rate）。压到 8 路并发，
+	// 整轮从 ~2 秒拉长到 ~1 分钟，仍在 15 分钟周期内，换来的是限流不再自伤。
+	sem := make(chan struct{}, sweepConcurrency)
 	for _, ps := range p.cfg.Pool.List() {
 		if ps.Disabled {
 			continue // 禁用账号不参与（与任务中心扫描同口径）
@@ -90,6 +95,8 @@ func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 		wg.Add(1)
 		go func(a *auth.Auth, uid string, credits, creditsTotal int64) {
 			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 			rescue := credits <= 0 && creditsTotal > 0 && p.shouldRunDiscovered()
 			r := p.sweepAccountWithRescue(a, uid, rescue)
 			mu.Lock()
@@ -147,6 +154,10 @@ func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 	}
 	return st
 }
+
+// sweepConcurrency 清扫的账号级并发上限。上游对列表/接任务的限流很敏感
+// （mp 口径尤其），一次铺开全部账号只会互相踩；8 路已能在一分钟内扫完 200+ 号。
+var sweepConcurrency = 8
 
 // shouldRunDiscovered 新发现的可自动任务是否应立即执行。
 // 两个否决条件：成长排程被显式关闭（尊重 schedule.growth_enabled），
