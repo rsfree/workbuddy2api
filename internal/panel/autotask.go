@@ -1211,11 +1211,6 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 			resp["claimed"] = true
 			resp["credit"] = credit
 			resp["energy"] = energy
-			// 手动领奖也要同步余额快照：面板余额与额度闸门（walletExhausted）
-			// 读的都是这份快照，不同步的话刚挣到的分要等下一次余额刷新才看得见
-			// ——2026-10-30 实测：Valorant 领奖 +100 后面板仍显示旧值，要手动
-			// 点一次「查余额」才对上。
-			p.refreshCreditsQuiet(uid)
 			if credit > 0 || energy > 0 {
 				resp["message"] = msg + fmt.Sprintf("；已自动领奖 +%d 分 +%d 能", credit, energy)
 			} else {
@@ -1226,6 +1221,12 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 			resp["message"] = msg + "；达标但领奖失败，可在任务列表手动点「领取」重试"
 		}
 	}
+	// 余额快照同步：面板余额与额度闸门（walletExhausted）读的都是这份快照。
+	// 必须放在这里而不是领奖分支里——2026-10-30 实测：Valorant 的奖是**动作内部**
+	// 自己领的（runExpertExperience 达标即 claimTaskReward），handler 回读到
+	// claimable=false 就跳过了自己的领奖分支，挂在分支里的刷新永远不执行，
+	// 表现为「+100 到账了但面板余额不动，要手点查余额才更新」。
+	p.refreshCreditsQuiet(uid)
 	log.Printf("panel: 任务动作 uid=%s code=%s progress %s -> %s claimable=%v claimed=%v",
 		uid, act.TaskCode, progressBefore, progressAfter, claimable, resp["claimed"])
 	writeJSON(w, http.StatusOK, resp)
