@@ -351,8 +351,10 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 							one.grow = append(one.grow, t)
 						}
 					}
-					sort.Slice(one.grow, func(i, j int) bool { // 按 autoActions 顺序（依赖前置）
-						return autoActionIndex(one.grow[i].TaskCode) < autoActionIndex(one.grow[j].TaskCode)
+					// Sequential 链置顶（族内 N 升序），其余按 autoActions 依赖序：
+					// 每号一天只有一环 unlocked，排在付费动作之后就会被永久饿死。
+					sort.Slice(one.grow, func(i, j int) bool {
+						return taskPriorityLess(one.grow[i], one.grow[j])
 					})
 					// 零积分号：免生成任务先跑。理由——付费动作在余额 0 时会被
 					// runAction 的额度闸门挡下（或直接 429 14018），先跑也拿不到分；
@@ -637,7 +639,8 @@ func sortGrowthFreeFirst(tasks []upstream.Task) {
 		if pi != pj {
 			return !pi
 		}
-		return autoActionIndex(tasks[i].TaskCode) < autoActionIndex(tasks[j].TaskCode)
+		// 同组内 Sequential 链优先（族内 N 升序），再按 autoActions 依赖序。
+		return taskPriorityLess(tasks[i], tasks[j])
 	})
 }
 

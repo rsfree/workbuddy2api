@@ -114,11 +114,32 @@ func (p *Panel) pruneRescueBlocked() {
 // 截断到 limit，返回计划与「因退避被跳过」的条数。
 func zeroCreditRescuePlan(tasks []upstream.Task,
 	blocked func(code string) bool, limit int) (plan []upstream.Task, skipped int) {
+	return rescuePlan(tasks, blocked, limit, false)
+}
+
+// sequentialRescuePlan 非零积分账号的 Sequential 链推进计划。
+//
+// 与零积分口径的差别只有两点：只收 Sequential 族（其余免生成任务有余额的号
+// 会在成长队列里跑到，不必让清扫替它们做）；单轮最多 1 条——链是串行的，上游
+// 同一时刻只有一环 unlocked，多收只是把同一环重复上报（反作弊面）。
+func sequentialRescuePlan(tasks []upstream.Task,
+	blocked func(code string) bool) (plan []upstream.Task, skipped int) {
+	return rescuePlan(tasks, blocked, 1, true)
+}
+
+// rescuePlan 补给计划通用实现。seqOnly=true 时只收 Sequential 链。
+func rescuePlan(tasks []upstream.Task,
+	blocked func(code string) bool, limit int, seqOnly bool) (plan []upstream.Task, skipped int) {
 	for _, t := range tasks {
 		// 进度达标的不重跑动作（Claimable 由解析层算好，这里再按 progress 兜一次：
 		// 手搓的 Task / 其它来源的快照不一定带 Claimable）。
 		if t.Claimed || t.Locked || t.Claimable || (t.Target > 0 && t.Current >= t.Target) {
 			continue
+		}
+		if seqOnly {
+			if _, ok := sequentialTaskIndex(t.TaskCode); !ok {
+				continue
+			}
 		}
 		act := actionForTask(t)
 		if act == nil || act.Paid {
@@ -131,7 +152,7 @@ func zeroCreditRescuePlan(tasks []upstream.Task,
 		plan = append(plan, t)
 	}
 	sort.SliceStable(plan, func(i, j int) bool {
-		return autoActionIndex(plan[i].TaskCode) < autoActionIndex(plan[j].TaskCode)
+		return taskPriorityLess(plan[i], plan[j])
 	})
 	if limit > 0 && len(plan) > limit {
 		plan = plan[:limit]
@@ -145,17 +166,25 @@ func zeroCreditRescuePlan(tasks []upstream.Task,
 //   - credit/energy：本轮补给带来的奖励增量（按任务登记的 reward 计）。
 //
 // 数据源是调用方刚拉到的任务快照（本轮 accept 之后的那个），避免重复拉列表。
-func (p *Panel) runZeroCreditRescue(a *auth.Auth, uid string,
-	tasks []upstream.Task) (rescued, skipped int, credit, energy int64) {
-	plan, skipped := zeroCreditRescuePlan(tasks, func(code string) bool {
-		return p.rescueBlocked(uid, code)
-	}, zeroCreditRescueMax)
+func (p *Panel) runRescuePlan(a *auth.Auth, uid string,
+	tasks []upstream.Task, seqOnly bool) (rescued, skipped int, credit, energy int64) {
+	blocked := func(code string) bool { return p.rescueBlocked(uid, code) }
+	var plan []upstream.Task
+	if seqOnly {
+		plan, skipped = sequentialRescuePlan(tasks, blocked)
+	} else {
+		plan, skipped = zeroCreditRescuePlan(tasks, blocked, zeroCreditRescueMax)
+	}
+	label := "零积分补给"
+	if seqOnly {
+		label = "Sequential 推进"
+	}
 	for _, t := range plan {
 		msg, err := p.runGrowthQueued(a, t.TaskCode)
 		if err != nil {
 			p.markRescueBlocked(uid, []string{t.TaskCode})
-			log.Printf("panel: 零积分补给 uid=%s code=%s 失败（退避 %s）: %v",
-				uid, t.TaskCode, rescueRetryTTL, err)
+			log.Printf("panel: %s uid=%s code=%s 失败（退避 %s）: %v",
+				label, uid, t.TaskCode, rescueRetryTTL, err)
 			continue
 		}
 		// 只有回读确认 claimed 才算回血成功；上报 200 不等于进度点亮
@@ -163,16 +192,16 @@ func (p *Panel) runZeroCreditRescue(a *auth.Auth, uid string,
 		after, rerr := p.taskByCode(a, t.TaskCode)
 		if rerr != nil || after == nil || !after.Claimed {
 			p.markRescueBlocked(uid, []string{t.TaskCode})
-			log.Printf("panel: 零积分补给 uid=%s code=%s: %s（未点亮，退避 %s）",
-				uid, t.TaskCode, msg, rescueRetryTTL)
+			log.Printf("panel: %s uid=%s code=%s: %s（未点亮，退避 %s）",
+				label, uid, t.TaskCode, msg, rescueRetryTTL)
 			continue
 		}
 		rescued++
 		credit += t.Credit
 		energy += t.Energy
 		p.clearRescueBlocked(uid, []string{t.TaskCode})
-		log.Printf("panel: 零积分补给 uid=%s code=%s: %s（+%d 分 +%d 能）",
-			uid, t.TaskCode, msg, t.Credit, t.Energy)
+		log.Printf("panel: %s uid=%s code=%s: %s（+%d 分 +%d 能）",
+			label, uid, t.TaskCode, msg, t.Credit, t.Energy)
 	}
 	return rescued, skipped, credit, energy
 }

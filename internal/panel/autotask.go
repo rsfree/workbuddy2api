@@ -32,6 +32,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -213,6 +214,49 @@ func autoActionIndex(code string) int {
 		}
 	}
 	return 1 << 20
+}
+
+// sequentialTaskPrefix Sequential 串行链的码前缀。上游每日零点解锁一环
+// （Sequential_Tasks_1 → _2 → …），走完最后一环不再下发新环（线上实测：
+// 7 环全 claimed 的账号列表里不再出现第 8 环，n 恒为 7）。
+const sequentialTaskPrefix = "Sequential_Tasks_"
+
+// sequentialTaskIndex 解析 Sequential 链序号 N；非该族返回 ok=false。
+//
+// 为什么不复用 autoActionIndex：上游随时会加环（活动期加过 _7）。代码里没登记
+// 的环在 autoActionIndex 下返回大值，会被排到所有已登记动作之后——于是「链还
+// 没解锁到它」和「它不可自动化」混成一件事。按 N 排则任何编号的环都置顶，
+// 族内严格 N 升序（不破坏 N 依赖 N-1 的解锁语义）。
+func sequentialTaskIndex(code string) (int, bool) {
+	s := strings.TrimSpace(code)
+	if !strings.HasPrefix(s, sequentialTaskPrefix) {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(s, sequentialTaskPrefix))
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// taskPriorityLess 任务执行优先级：Sequential 链置顶（族内 N 升序），
+// 其余按 autoActions 注册序（依赖前置）。
+//
+// 为什么链必须置顶：队列与清扫都是「轮到某个账号 → 按序做它的任务」。一个号
+// 一天里只有一环 unlocked，若前面压着十几条付费动作（真实对话，单条几十秒到
+// 几分钟），这一环就被挤到下一轮；下一轮又从该号第一位重新开始，于是同一批号
+// 永远排在链前面、链永远推进不了。线上抽样 25 号里 18 号卡在 S1/S2/S3 正是
+// 这个形状——零积分号因「免生成优先」侥幸躲过，有余额的号才是有系统性的漏。
+func taskPriorityLess(a, b upstream.Task) bool {
+	ia, oka := sequentialTaskIndex(a.TaskCode)
+	ib, okb := sequentialTaskIndex(b.TaskCode)
+	if oka != okb {
+		return oka // 链族恒在前
+	}
+	if oka && ia != ib {
+		return ia < ib
+	}
+	return autoActionIndex(a.TaskCode) < autoActionIndex(b.TaskCode)
 }
 
 // ---------------------------------------------------------------------------

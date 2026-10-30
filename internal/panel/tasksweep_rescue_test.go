@@ -21,7 +21,8 @@ import (
 )
 
 // TestZeroCreditRescuePlan 计划筛选：已领取 / 锁定 / 已达标 / 未适配 /
-// 付费动作 / 退避中的一律不进计划；顺序按 autoActions 下标；超上限截断。
+// 付费动作 / 退避中的一律不进计划；Sequential 链置顶（族内 N 升序）、
+// 其余按 autoActions 下标；超上限截断。
 func TestZeroCreditRescuePlan(t *testing.T) {
 	tasks := []upstream.Task{
 		{TaskCode: "chat_5", Target: 5, Current: 2},                     // 免生成、未达标 → 收
@@ -41,7 +42,7 @@ func TestZeroCreditRescuePlan(t *testing.T) {
 	for _, t2 := range plan {
 		codes = append(codes, t2.TaskCode)
 	}
-	want := "chat_5,Sequential_Tasks_1"
+	want := "Sequential_Tasks_1,chat_5"
 	if strings.Join(codes, ",") != want {
 		t.Fatalf("plan = %v, want %s", codes, want)
 	}
@@ -49,10 +50,10 @@ func TestZeroCreditRescuePlan(t *testing.T) {
 		t.Errorf("skipped = %d, want 1（Sequential_Tasks_3 在退避期）", skipped)
 	}
 
-	// 上限截断：只留前 1 条（顺序上 chat_5 在 Sequential_Tasks_1 之前）。
+	// 上限截断：只留前 1 条（Sequential 链置顶，所以留下的是链的第一环）。
 	plan, _ = zeroCreditRescuePlan(tasks, nil, 1)
-	if len(plan) != 1 || plan[0].TaskCode != "chat_5" {
-		t.Errorf("limit=1 plan = %+v, want [chat_5]", plan)
+	if len(plan) != 1 || plan[0].TaskCode != "Sequential_Tasks_1" {
+		t.Errorf("limit=1 plan = %+v, want [Sequential_Tasks_1]", plan)
 	}
 }
 
@@ -192,7 +193,7 @@ func TestZeroCreditRescueRunsFreeTasks(t *testing.T) {
 }
 
 // TestSortGrowthFreeFirst 零积分号的任务顺序：免生成在前、付费在后，
-// 同组内保持 autoActions 下标序（Sequential 链依赖前置）。
+// 同组内 Sequential 链置顶（族内 N 升序），其余按 autoActions 下标序。
 func TestSortGrowthFreeFirst(t *testing.T) {
 	tasks := []upstream.Task{
 		{TaskCode: "expert_5"},           // 付费
@@ -201,7 +202,7 @@ func TestSortGrowthFreeFirst(t *testing.T) {
 	}
 	sortGrowthFreeFirst(tasks)
 	got := []string{tasks[0].TaskCode, tasks[1].TaskCode, tasks[2].TaskCode}
-	want := []string{"chat_5", "Sequential_Tasks_2", "expert_5"}
+	want := []string{"Sequential_Tasks_2", "chat_5", "expert_5"}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("order = %v, want %v", got, want)

@@ -33,9 +33,11 @@
 package panel
 
 import (
+	"hash/fnv"
 	"log"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
@@ -52,6 +54,10 @@ type TaskSweepStats struct {
 	Discovered int   `json:"discovered"` // 本轮首次发现的新任务数（任务目录 diff）
 	NewAuto    int   `json:"new_auto"`   // 新任务中具备自动动作的个数
 	Rescued    int   `json:"rescued"`    // 零积分账号免生成任务补跑并成功领取的条数
+	// Sequential 非零积分账号经分片轮转推进 Sequential 链并成功领取的条数。
+	// 与 Rescued 分开记：一个衡量「死号回血」，一个衡量「链推进」，混在一起
+	// 就看不出「有些号总会漏」有没有真的被修掉。
+	Sequential int `json:"sequential"`
 	// RescueBackoff 零积分补给里因「上轮跑过没点亮」退避而跳过的条数
 	// （见 tasksweep_rescue.go）。它正常应>0：说明确实有做不动的任务在被压制，
 	// 而不是每 15 分钟反复重放同一条事件。
@@ -97,8 +103,8 @@ func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			rescue := credits <= 0 && creditsTotal > 0 && p.shouldRunDiscovered()
-			r := p.sweepAccountWithRescue(a, uid, rescue)
+			rescueAllFree := credits <= 0 && creditsTotal > 0 && p.shouldRunDiscovered()
+			r := p.sweepAccountWithRescue(a, uid, rescueAllFree)
 			mu.Lock()
 			defer mu.Unlock()
 			st.Accounts += r.accounts
@@ -111,6 +117,7 @@ func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 			st.Discovered += r.discovered
 			st.NewAuto += r.newAuto
 			st.Rescued += r.rescued
+			st.Sequential += r.seqRescued
 			st.RescueBackoff += r.rescueBlocked
 			st.AcceptBackoff += r.acceptBackoff
 			st.newCodes = append(st.newCodes, r.newCodes...)
@@ -148,9 +155,9 @@ func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 		go p.runDiscoveredTasks(codes)
 	}
 
-	if st.Claims() > 0 || st.Errors > 0 || st.Accepted > 0 || st.Discovered > 0 || st.Rescued > 0 || st.AcceptBackoff > 0 || st.RescueBackoff > 0 {
-		log.Printf("panel: 任务补领清扫：%d 个账号（跳过 %d）· 新任务 %d（可自动 %d）· 接受 %d · accept退避 %d · 领奖 %d · 零积分补给 %d（退避 %d）· +%d 分 +%d 能 · 出错 %d",
-			st.Accounts, st.Skipped, st.Discovered, st.NewAuto, st.Accepted, st.AcceptBackoff, st.Claimed, st.Rescued, st.RescueBackoff, st.Credits, st.Energy, st.Errors)
+	if st.Claims() > 0 || st.Errors > 0 || st.Accepted > 0 || st.Discovered > 0 || st.Rescued > 0 || st.Sequential > 0 || st.AcceptBackoff > 0 || st.RescueBackoff > 0 {
+		log.Printf("panel: 任务补领清扫：%d 个账号（跳过 %d）· 新任务 %d（可自动 %d）· 接受 %d · accept退避 %d · 领奖 %d · 零积分补给 %d · Sequential 推进 %d（退避 %d）· +%d 分 +%d 能 · 出错 %d",
+			st.Accounts, st.Skipped, st.Discovered, st.NewAuto, st.Accepted, st.AcceptBackoff, st.Claimed, st.Rescued, st.Sequential, st.RescueBackoff, st.Credits, st.Energy, st.Errors)
 	}
 	return st
 }
@@ -158,6 +165,34 @@ func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 // sweepConcurrency 清扫的账号级并发上限。上游对列表/接任务的限流很敏感
 // （mp 口径尤其），一次铺开全部账号只会互相踩；8 路已能在一分钟内扫完 200+ 号。
 var sweepConcurrency = 8
+
+// sequentialRescueShard 每轮清扫推进 Sequential 链的账号分片数。
+//
+// 为什么要分片：有 Sequential 待办的号是千级，而每推进一环要几十秒到几分钟
+// （Sequential_Tasks_6 要按真人节奏补 10 条事件 ≈ 8 分钟）。全量铺开会让一轮
+// 清扫跑成小时级，把「补领」这条链路一起拖死（清扫是同步 ticker 调用）。
+// 按 uid 哈希取 1/shard，分片下标随轮次轮转 ⇒ 每轮约 N/shard 个号
+// （1256 号、shard=100 ≈ 12 个，一天 ~96 轮 ≈ 覆盖全量一遍），
+// 最坏 shard 轮覆盖全量。
+var sequentialRescueShard = 100
+
+// sequentialRescueSlot 当前轮到哪个分片。用时间片（15 分钟一格，与默认清扫
+// 周期同尺度）而不是进程内计数器：重启不丢轮转位置，多实例也不会各自从 0 起。
+func sequentialRescueSlot() uint32 {
+	return uint32(time.Now().Unix() / int64(15*time.Minute/time.Second))
+}
+
+// sequentialRescueSelected 该账号本轮是否轮到推进 Sequential 链。
+// 纯函数式判定（无状态、无锁），可以放心并发调用。
+func sequentialRescueSelected(uid string) bool {
+	if sequentialRescueShard <= 1 {
+		return true // 测试或小账号池：不分片
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(uid))
+	return int(h.Sum32()%uint32(sequentialRescueShard)) ==
+		int(sequentialRescueSlot()%uint32(sequentialRescueShard))
+}
 
 // shouldRunDiscovered 新发现的可自动任务是否应立即执行。
 // 两个否决条件：成长排程被显式关闭（尊重 schedule.growth_enabled），
@@ -194,6 +229,7 @@ type sweepResult struct {
 	accounts, skipped, accepted, claimed, errors int
 	discovered, newAuto                          int
 	rescued                                      int
+	seqRescued                                   int // 非零积分号推进 Sequential 链的条数
 	rescueBlocked                                int
 	acceptBackoff                                int
 	newCodes                                     []string // 新发现且具备自动动作的码
@@ -206,10 +242,14 @@ func (p *Panel) sweepAccount(a *auth.Auth, uid string) sweepResult {
 	return p.sweepAccountWithRescue(a, uid, false)
 }
 
-// sweepAccountWithRescue 在普通补领之外，仅对零积分且允许成长任务的账号
-// 补跑 Sequential_Tasks_7。whitelist 收窄到这一条纯事件任务，避免周期清扫
-// 意外提前执行专家对话、夜间对话等其他付费/高风险行为链。
-func (p *Panel) sweepAccountWithRescue(a *auth.Auth, uid string, zeroCreditRescue bool) (res sweepResult) {
+// sweepAccountWithRescue 在普通补领之外执行补给动作，两个口径：
+//   - rescueAllFree（零积分号）：全部免生成动作，是死号回血的唯一通路；
+//   - 其余号：本轮分片若轮到该 uid，**只推 Sequential 链一环**。这是「有些号
+//     总会漏」的正解——链一天只解锁一环，靠每小时一次的成长队列（全量串行，
+//     千级账号跑不完一轮）根本轮不到有余额的号；清扫是全量覆盖的唯一通路，
+//     而链是免生成动作，放这里不花额度。
+// 付费/高风险行为链（专家对话、夜间对话）仍然只走队列，不由清扫触发。
+func (p *Panel) sweepAccountWithRescue(a *auth.Auth, uid string, rescueAllFree bool) (res sweepResult) {
 	res.accounts = 1
 	if !p.tryLockAccount(uid) {
 		res.skipped = 1
@@ -274,11 +314,21 @@ func (p *Panel) sweepAccountWithRescue(a *auth.Auth, uid string, zeroCreditRescu
 		p.settleAcceptBackoff(a, uid, attempted)
 	}
 
-	// 零积分补给：全部免生成动作都进计划（付费动作余额 0 必然 14018，排除）。
+	// 补给：零积分号跑全部免生成动作；其余号按分片轮转推进 Sequential 链一环。
 	// 已达标项不重跑，留给下方阶段二统一领奖；判定细节见 tasksweep_rescue.go。
-	if zeroCreditRescue {
-		rescued, blocked, credit, energy := p.runZeroCreditRescue(a, uid, tasks)
-		res.rescued += rescued
+	seqOnly := false
+	if !rescueAllFree && p.shouldRunDiscovered() && sequentialRescueSelected(uid) {
+		seqOnly = true
+	}
+	if rescueAllFree || seqOnly {
+		rescued, blocked, credit, energy := p.runRescuePlan(a, uid, tasks, seqOnly)
+		// 两个口径分开计数：Rescued 衡量「死号回血」，seqRescued 衡量「链推进」。
+		// 混在一个数里就看不出「有些号总会漏」有没有真被修掉。
+		if seqOnly {
+			res.seqRescued += rescued
+		} else {
+			res.rescued += rescued
+		}
 		res.claimed += rescued
 		res.rescueBlocked += blocked
 		res.credit += credit
