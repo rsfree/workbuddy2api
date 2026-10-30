@@ -24,6 +24,7 @@ package panel
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -44,7 +45,13 @@ type autoAction struct {
 	TaskCode string // 目标任务 code
 	Desc     string // 展示用说明
 	Attempt  bool   // true = 尝试型（上游未证实可脚本化，跑了可能不点亮）
-	run      func(p *Panel, a *auth.Auth) (string, error)
+	// Paid true = 动作要发起**真实模型对话**（消耗账号额度）。余额 0 的号跑它
+	// 必然 429 code=14018「额度已用尽」：白打一次请求、白占十几秒队列时间，
+	// 进度一动不动。零积分账号的执行路径据此只跑免生成动作
+	// （见 runAction 的额度闸门与 tasksweep_rescue.go）。默认 false：
+	// /v2/report、/v2/user-asset 这类纯事件上报不花额度。
+	Paid bool
+	run  func(p *Panel, a *auth.Auth) (string, error)
 	// runTask 需要任务上下文（标题/进度/口径）的动作走这里，nil 时回落到 run。
 	// 族模式动作（如 expert_use_*「体验指定专家」）由任务标题解析专家名，故必须
 	// 拿到 Task 本体；精确表动作只认 code，保持原签名不动。
@@ -67,6 +74,7 @@ var autoActions = []autoAction{
 	{
 		TaskCode: "Model_chat_GLM5.2",
 		Desc:     "接受任务 → glm-5.2 真实对话一次 → 对齐模型上报",
+		Paid:     true,
 		run:      runModelChat,
 	},
 	{
@@ -112,11 +120,13 @@ var autoActions = []autoAction{
 	{
 		TaskCode: "expert_5",
 		Desc:     "真实专家召唤+使用链 ×5（专家市场列表+真实 chat，已验证：三账号点亮）",
+		Paid:     true,
 		run:      runExpertUse,
 	},
 	{
 		TaskCode: "Expert_team_use_3",
 		Desc:     "真实专家团召唤+使用链 ×3（已验证：三账号点亮）",
+		Paid:     true,
 		run:      runExpertTeamUse,
 	},
 	{
@@ -127,16 +137,19 @@ var autoActions = []autoAction{
 	{
 		TaskCode: "skill_1",
 		Desc:     "真实对话 + skill_info 技能加载事件（已验证：人杰2 点亮）",
+		Paid:     true,
 		run:      runSkillFresh,
 	},
 	{
 		TaskCode: "Expert_lighthouse",
 		Desc:     "真实轻量云专家召唤+使用链（chat 链带 has_expert，已验证：两账号点亮）",
+		Paid:     true,
 		run:      runExpertLighthouse,
 	},
 	{
 		TaskCode: "black_cat",
 		Desc:     "夜猫子：23:00–08:00 窗口内 glm-5.2 对话补足（窗口外提示稍后再试）",
+		Paid:     true,
 		Attempt:  true,
 		run:      runBlackCat,
 	},
@@ -230,6 +243,7 @@ func actionForTask(t upstream.Task) *autoAction {
 		return &autoAction{
 			TaskCode: code,
 			Desc:     "体验指定专家（族模式：jump_url 的 expertId 或标题专家名 → 召唤 + 真实对话 + actual_use）",
+			Paid:     true, // 判据是真实 chat 的 requestId，余额 0 的号跑不了
 			runTask:  runExpertExperience,
 		}
 	}
@@ -283,11 +297,40 @@ func expertIDFromJump(t upstream.Task) string {
 	return ""
 }
 
+// errWalletEmpty 付费动作被「额度已用尽」闸门挡下。**不是失败**：调用方应记
+// blocked/skipped，而不是 error——否则死号每天的队列都会报一堆"失败"，把真正的
+// 异常埋在噪音里（线上 0 分号约 30 个，每个 5 条付费动作）。
+var errWalletEmpty = errors.New("额度已用尽（余额 0）")
+
+// walletExhausted 账号余额已耗尽（credits<=0 且总额已知）。
+// 口径与 scheduler.TaskMuted 的「积分清光放行」、清扫的零积分补给完全一致：
+// CreditsTotal==0 表示「总额未知」（旧 state / 查询失败），不能当成没钱。
+func (p *Panel) walletExhausted(uid string) bool {
+	if p.cfg.Pool == nil || uid == "" {
+		return false
+	}
+	st, ok := p.cfg.Pool.Status(uid)
+	if !ok {
+		return false
+	}
+	return st.Credits <= 0 && st.CreditsTotal > 0
+}
+
+// actionIsPaid 任务对应的动作是否需要真实模型生成（未知动作按"不花钱"处理：
+// 免生成动作最坏结果是上游多收一条无效事件，误挡付费动作才是真损失）。
+func actionIsPaid(t upstream.Task) bool {
+	act := actionForTask(t)
+	return act != nil && act.Paid
+}
+
 // runAction 统一执行入口：族动作带任务上下文，精确动作用原签名。
 func runAction(act *autoAction, p *Panel, a *auth.Auth, t upstream.Task) (string, error) {
 	switch {
 	case act == nil:
 		return "", fmt.Errorf("任务 %s 无自动动作", t.TaskCode)
+	case act.Paid && p.walletExhausted(a.UID):
+		return "", fmt.Errorf("%w：跳过「%s」这类要真实对话的动作，先跑免生成任务回血",
+			errWalletEmpty, act.Desc)
 	case act.runTask != nil:
 		return act.runTask(p, a, t)
 	case act.run != nil:
@@ -322,8 +365,8 @@ type expertCacheEntry struct {
 // 跨轮次隔几分钟重拉一次即可（专家市场排序变化不影响按名匹配）。
 var expertCacheTTL = 5 * time.Minute
 
-// marketExpertSnapshot 拉取（带缓存）该账号可见的**全量**专家市场列表。
-// 逐页翻到不足一页为止，最多 expertSnapshotPages 页——定向专家常不在推荐首屏。
+// marketExpertSnapshot 拉取（带缓存）该账号可见的推荐前 N 页，仅作搜索失败时的兜底。
+// 这不是全量市场：2026-10-30 上游 total_count 已达 30551，绝不能再用页数推断专家下线。
 const expertSnapshotPages = 8
 
 func (p *Panel) marketExpertSnapshot(a *auth.Auth) ([]upstream.MarketExpert, error) {
@@ -362,21 +405,15 @@ func (p *Panel) marketExpertSnapshot(a *auth.Auth) ([]upstream.MarketExpert, err
 	return all, nil
 }
 
-// resolveMarketExpert 按展示名匹配市场专家：先精确（展示名/职业名），再包含匹配。
-// 未命中返回零值（ExpertID == ""），由调用方决定跳过而不是硬编 id。
-func (p *Panel) resolveMarketExpert(a *auth.Auth, name string) (upstream.MarketExpert, error) {
-	list, err := p.marketExpertSnapshot(a)
-	if err != nil {
-		return upstream.MarketExpert{}, err
-	}
-	name = strings.TrimSpace(name)
+// matchMarketExpert 按展示名匹配：先精确（展示名/职业名），再包含匹配。
+func matchMarketExpert(list []upstream.MarketExpert, name string) upstream.MarketExpert {
 	var fuzzy upstream.MarketExpert
 	for _, e := range list {
 		if e.ExpertID == "" {
 			continue
 		}
 		if e.DisplayNameZH == name || e.ProfessionZH == name {
-			return e, nil
+			return e
 		}
 		// 包含匹配只对 2 字以上的名字生效，避免「AI」这类短词误命中。
 		if len([]rune(name)) >= 2 &&
@@ -386,7 +423,26 @@ func (p *Panel) resolveMarketExpert(a *auth.Auth, name string) (upstream.MarketE
 			}
 		}
 	}
-	return fuzzy, nil
+	return fuzzy
+}
+
+// resolveMarketExpert 先用上游 keyword 定向检索，再退回推荐分页快照。
+// 未命中返回零值（ExpertID == ""），由调用方决定跳过而不是硬编 id。
+func (p *Panel) resolveMarketExpert(a *auth.Auth, name string) (upstream.MarketExpert, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return upstream.MarketExpert{}, nil
+	}
+	if searched, err := p.cfg.Upstream.MarketExpertSearch(a, name); err == nil {
+		if e := matchMarketExpert(searched, name); e.ExpertID != "" {
+			return e, nil
+		}
+	}
+	list, err := p.marketExpertSnapshot(a)
+	if err != nil {
+		return upstream.MarketExpert{}, err
+	}
+	return matchMarketExpert(list, name), nil
 }
 
 // resolveTaskExpert 解析任务指向的专家，优先级：
@@ -1107,6 +1163,14 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 	}
 	msg, err := runAction(act, p, a, *before)
 	if err != nil {
+		// 额度闸门不是失败：回 200 + skipped，前端按提示 toast（502 会被读成
+		// "动作坏了"，让人反复重试一个注定 429 的链路）。
+		if errors.Is(err, errWalletEmpty) {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok": true, "skipped": true, "message": err.Error(),
+			})
+			return
+		}
 		writeErr(w, http.StatusBadGateway, "执行失败: "+err.Error())
 		return
 	}
@@ -1655,9 +1719,13 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 			out = append(out, item)
 			continue
 		}
-		msg, err := act.run(p, a)
+		msg, err := runAction(&act, p, a, *before)
 		if err != nil {
+			// 额度闸门不是失败：标 blocked，别混进 error 统计里。
 			item["status"] = "error"
+			if errors.Is(err, errWalletEmpty) {
+				item["status"] = "blocked"
+			}
 			item["message"] = err.Error()
 			out = append(out, item)
 			continue
@@ -1740,6 +1808,9 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 			msg, rerr := runAction(act, p, a, t)
 			if rerr != nil {
 				item["status"] = "error"
+				if errors.Is(rerr, errWalletEmpty) {
+					item["status"] = "blocked"
+				}
 				item["message"] = rerr.Error()
 				out = append(out, item)
 				continue

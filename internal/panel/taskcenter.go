@@ -11,6 +11,7 @@ package panel
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -313,9 +314,9 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 			continue
 		}
 		wg.Add(1)
-		go func(a *auth.Auth, credits int64) {
+		go func(a *auth.Auth, credits, creditsTotal int64) {
 			defer wg.Done()
-			one := queueAccount{a: a, credits: credits}
+			one := queueAccount{a: a, credits: credits, creditsTotal: creditsTotal}
 			// D4 门控：global 账号无 CN 成长任务体系，不发起任何上游调用。
 			if a.IsGlobal() {
 				return
@@ -349,6 +350,13 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 					sort.Slice(one.grow, func(i, j int) bool { // 按 autoActions 顺序（依赖前置）
 						return autoActionIndex(one.grow[i].TaskCode) < autoActionIndex(one.grow[j].TaskCode)
 					})
+					// 零积分号：免生成任务先跑。理由——付费动作在余额 0 时会被
+					// runAction 的额度闸门挡下（或直接 429 14018），先跑也拿不到分；
+					// 而免生成任务每点亮一条就是 +100~300 分，跑完后面的付费动作
+					// 当轮就有机会真的执行。
+					if one.credits <= 0 && one.creditsTotal > 0 {
+						sortGrowthFreeFirst(one.grow)
+					}
 				}
 			}
 			if len(one.grow) > 0 {
@@ -356,7 +364,7 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 				accts = append(accts, one)
 				mu.Unlock()
 			}
-		}(a, st.Credits)
+		}(a, st.Credits, st.CreditsTotal)
 	}
 	wg.Wait()
 
@@ -478,6 +486,50 @@ func (p *Panel) runDiscoveredTasks(codes []string) {
 	wg.Wait()
 }
 
+// queueRetryAttempts 单项最多尝试次数（含首次）。取 2 而不是更大：
+// 队列是串行 + 每项本来十几秒，重试代价按指数放大；限流通常几十秒就恢复，
+// 一次退避重试足够把「瞬时 429」捞回来。
+var queueRetryAttempts = 2
+
+// queueRetryBaseGap / queueRetryMaxGap 重试退避的基准与上限。
+var (
+	queueRetryBaseGap = 20 * time.Second
+	queueRetryMaxGap  = 2 * time.Minute
+)
+
+// upstreamTransient 错误是否属于「等一会儿再来」类：限流、上游 5xx、网关抖动。
+// 与「任务做不动」（额度不足 / 专家定位失败 / accept 不落账）必须分开——后者
+// 重试一百次也一样，只会把队列拖长。
+func upstreamTransient(err error) bool {
+	var ue *upstream.Error
+	if !errors.As(err, &ue) {
+		return false
+	}
+	switch ue.Kind {
+	case upstream.ErrSoftRate, upstream.ErrUpstreamBusy, upstream.ErrServer,
+		upstream.ErrNotFound, upstream.ErrWafBlock, upstream.ErrEgress:
+		return true
+	}
+	return false
+}
+
+// queueRetryBackoff 第 attempt 次失败后的等待：上游明示 Retry-After 就听它的
+// （钳到上限，避免一个夸张的 header 把队列挂住），否则 20s 起翻倍。
+func queueRetryBackoff(err error, attempt int) time.Duration {
+	var ue *upstream.Error
+	if errors.As(err, &ue) && ue.RetryAfter > 0 {
+		if ue.RetryAfter > queueRetryMaxGap {
+			return queueRetryMaxGap
+		}
+		return ue.RetryAfter
+	}
+	d := queueRetryBaseGap << (attempt - 1)
+	if d > queueRetryMaxGap {
+		d = queueRetryMaxGap
+	}
+	return d
+}
+
 // runQueueItems 队列执行主体：按账号分组，账号内串行（per-account 锁），
 // 账号间并发（信号量）。每项结果写回队列状态。
 func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurrency int) {
@@ -519,14 +571,33 @@ func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurren
 				p.queueMarkAt(i, "running", "")
 				var msg string
 				var err error
-				switch kind {
-				case "growth":
-					msg, err = p.runGrowthQueued(one.a, code)
+				// 限流/上游抖动重试：2026-10-30 线上 205 项里 97 项以
+				// 「upstream soft_rate (http 429)」结束，全部集中在 mp 口径任务
+				// （Sequential_Tasks_1..6）——一次失败就记 error，等于这批任务
+				// 当天被漏掉（下次机会是次日 01:00 的队列）。这里退避后重试，
+				// 把「瞬时 429」和「任务本身做不动」区分开。
+				for attempt := 1; ; attempt++ {
+					switch kind {
+					case "growth":
+						msg, err = p.runGrowthQueued(one.a, code)
+					}
+					if err == nil || !upstreamTransient(err) || attempt >= queueRetryAttempts {
+						break
+					}
+					p.queueMarkAt(i, "running",
+						fmt.Sprintf("上游限流/抖动，第 %d/%d 次重试（%s）",
+							attempt, queueRetryAttempts-1, err.Error()))
+					time.Sleep(queueRetryBackoff(err, attempt))
 				}
-				if err != nil {
-					p.queueMarkAt(i, "error", err.Error())
-				} else {
+				switch {
+				case err == nil:
 					p.queueMarkAt(i, "done", msg)
+				case errors.Is(err, errWalletEmpty):
+					// 余额 0 的号跑付费动作：不是失败，是「这轮不该跑」
+					// （先靠免生成任务回血，下一轮自动恢复）。
+					p.queueMarkAt(i, "blocked", err.Error())
+				default:
+					p.queueMarkAt(i, "error", err.Error())
 				}
 				time.Sleep(reportGap) // 项间节流
 			}
@@ -542,6 +613,25 @@ type queueAccount struct {
 	// credits 入队时的余额快照，仅用于排队顺序（见 sortQueueByCredits）。
 	// 不用实时值：扫描期间余额会变，保持"同一时刻的快照"才能得到稳定排序。
 	credits int64
+	// creditsTotal 总额快照，与 credits 一起判定「零积分号」（credits<=0 且
+	// creditsTotal>0）：它的任务顺序要改成免生成优先（见 sortGrowthFreeFirst）。
+	creditsTotal int64
+}
+
+// sortGrowthFreeFirst 零积分账号的任务排序：免生成动作（纯事件上报）排前，
+// 付费动作（真实对话）排后；同组内保持 autoActions 顺序（Sequential 链依赖前置）。
+//
+// 为什么只对零积分号改顺序：有余额的号两种动作都能跑，顺序只影响谁先谁后；
+// 而余额 0 的号付费动作必然 14018 失败，先跑它纯属浪费队列时间——把能拿分的
+// 提到前面，才可能在同轮里把余额挣回来继续跑。
+func sortGrowthFreeFirst(tasks []upstream.Task) {
+	sort.SliceStable(tasks, func(i, j int) bool {
+		pi, pj := actionIsPaid(tasks[i]), actionIsPaid(tasks[j])
+		if pi != pj {
+			return !pi
+		}
+		return autoActionIndex(tasks[i].TaskCode) < autoActionIndex(tasks[j].TaskCode)
+	})
 }
 
 // sortQueueByCredits 按余额升序排列账号（0 积分最前），稳定排序保证同余额时
@@ -649,6 +739,10 @@ func (p *Panel) runGrowthQueued(a *auth.Auth, code string) (string, error) {
 		}
 		if cerr == nil && (credit > 0 || energy > 0) {
 			msg += fmt.Sprintf("；自动领奖 +%d 分 +%d 能", credit, energy)
+			// 余额快照同步：零积分号的付费动作靠它解锁（runAction 的额度闸门
+			// 读的就是这份快照）。不同步的话，本轮刚靠免生成任务挣到 300 分，
+			// 同一账号后面的付费动作仍会被判「余额 0」挡下，白等一个周期。
+			p.refreshCreditsQuiet(a.UID)
 		}
 	}
 	if after != nil {

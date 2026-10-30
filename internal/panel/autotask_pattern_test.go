@@ -159,14 +159,49 @@ func TestResolveMarketExpert(t *testing.T) {
 	if err != nil || e2.ExpertID != "ex_dy" {
 		t.Errorf("包含匹配 = %+v err=%v, want ex_dy", e2, err)
 	}
-	// 未命中：零值，不报错。
+	// 未命中：定向搜索后再走一次分页兜底，返回零值，不报错。
 	e3, err := p.resolveMarketExpert(a, "不存在的专家")
 	if err != nil || e3.ExpertID != "" {
 		t.Errorf("未命中应返回零值，got %+v err=%v", e3, err)
 	}
-	// 三次查询只打一次上游（快照缓存）。
+	if got := hits.Load(); got != 4 {
+		t.Errorf("专家市场请求数 = %d, want 4（三次定向搜索 + 未命中的一次分页兜底）", got)
+	}
+}
+
+// TestResolveMarketExpertUsesKeywordBeforeSnapshot 回归 2026-10-30 线上故障：
+// 推荐前 160 条没有目标、全市场有 30551 条时，必须靠 keyword 一发命中，
+// 不能把推荐分页当成全量并误报专家下线。
+func TestResolveMarketExpertUsesKeywordBeforeSnapshot(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		if body["keyword"] != "无畏契约拼豆专家" {
+			t.Errorf("首请求 keyword=%v，不应进入无关键词推荐分页", body["keyword"])
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"code": 0, "msg": "OK",
+			"data": map[string]any{"total_count": 1, "experts": []map[string]any{{
+				"expert_id": "ex_xQHHD1u5Jkua", "expert_type": "agent",
+				"display_name_zh": "无畏契约拼豆专家", "profession_zh": "无畏契约拼豆专家",
+			}}},
+		})
+	}))
+	defer srv.Close()
+
+	p := &Panel{cfg: Config{Upstream: &upstream.Client{
+		HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL, WebBaseCN: srv.URL,
+	}}}
+	e, err := p.resolveMarketExpert(&auth.Auth{UID: "u1", AccessToken: "at"}, "无畏契约拼豆专家")
+	if err != nil || e.ExpertID != "ex_xQHHD1u5Jkua" {
+		t.Fatalf("keyword 命中 = %+v err=%v", e, err)
+	}
 	if got := hits.Load(); got != 1 {
-		t.Errorf("专家市场请求数 = %d, want 1（应复用快照）", got)
+		t.Errorf("请求数=%d want 1（命中后不得再扫推荐分页）", got)
 	}
 }
 

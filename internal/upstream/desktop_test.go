@@ -119,3 +119,43 @@ func TestSetAppearanceTheme(t *testing.T) {
 		t.Errorf("body=%v want kind=theme resource_key=theme-tkmw7j", got)
 	}
 }
+
+// TestMarketExpertSearchUsesKeyword 定向专家不能再靠推荐分页猜测：上游 list
+// 端点的 keyword 会把数万条市场记录过滤到目标，请求必须带该字段。
+func TestMarketExpertSearchUsesKeyword(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/portal/operation-platform/market/expert/list" {
+			t.Errorf("path=%s want expert list", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"code": 0, "msg": "OK",
+			"data": map[string]any{
+				"total_count": 1,
+				"experts": []map[string]any{{
+					"expert_id": "ex_xQHHD1u5Jkua", "expert_type": "agent",
+					"display_name_zh": "无畏契约拼豆专家", "profession_zh": "无畏契约拼豆专家",
+				}},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	c := &Client{HTTP: srv.Client(), ChatBaseCN: srv.URL}
+	experts, err := c.MarketExpertSearch(&auth.Auth{AccessToken: "at", UID: "u1"}, "无畏契约拼豆专家")
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if got["keyword"] != "无畏契约拼豆专家" {
+		t.Errorf("keyword=%v want 无畏契约拼豆专家", got["keyword"])
+	}
+	if got["page"] != float64(1) || got["page_size"] != float64(50) {
+		t.Errorf("page/page_size=%v/%v want 1/50", got["page"], got["page_size"])
+	}
+	if len(experts) != 1 || experts[0].ExpertID != "ex_xQHHD1u5Jkua" {
+		t.Errorf("experts=%+v want Valorant expert", experts)
+	}
+}

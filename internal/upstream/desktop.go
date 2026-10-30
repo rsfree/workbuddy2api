@@ -397,10 +397,21 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 	return c.MarketExpertListPaged(a, expertType, 1, 20)
 }
 
-// MarketExpertListPaged 分页拉取专家市场列表（page 从 1 开始，pageSize 夹取 [1,50]）。
-// 「体验指定专家」类任务（expert_use_<slug>）只能按**展示名**反查专家 id，而定向
-// 专家不一定落在推荐排序第一页——调用方需要翻页覆盖整个市场。
+// MarketExpertListPaged 分页拉取专家市场推荐列表（page 从 1 开始，pageSize 夹取 [1,50]）。
+// 该列表在 2026-10-30 已有 30551 条，分页只能作兜底；定位指定专家必须用 MarketExpertSearch。
 func (c *Client) MarketExpertListPaged(a *auth.Auth, expertType string, page, pageSize int) ([]MarketExpert, error) {
+	return c.marketExpertList(a, expertType, page, pageSize, "")
+}
+
+// MarketExpertSearch 按展示名/职业名搜索专家市场。
+// 2026-10-30 抓包实证：同一 list 端点接受 keyword；「无畏契约拼豆专家」从
+// total_count=30551 精确过滤为 1（ex_xQHHD1u5Jkua）。此前只扫推荐前 8 页（160 条），
+// 市场扩容后会把仍在线的专家误判成「定向/下线」。
+func (c *Client) MarketExpertSearch(a *auth.Auth, keyword string) ([]MarketExpert, error) {
+	return c.marketExpertList(a, "", 1, 50, keyword)
+}
+
+func (c *Client) marketExpertList(a *auth.Auth, expertType string, page, pageSize int, keyword string) ([]MarketExpert, error) {
 	if page < 1 {
 		page = 1
 	}
@@ -410,6 +421,9 @@ func (c *Client) MarketExpertListPaged(a *auth.Auth, expertType string, page, pa
 	body := map[string]any{"page": page, "page_size": pageSize, "sort_by": "reco_rank", "sort_order": "desc"}
 	if expertType != "" {
 		body["expert_type"] = expertType
+	}
+	if keyword != "" {
+		body["keyword"] = keyword
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {

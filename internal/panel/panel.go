@@ -119,6 +119,12 @@ type Panel struct {
 	acceptStuckMu sync.Mutex
 	acceptStuck   map[string]time.Time
 
+	// rescueStuck 零积分补给的失败退避（tasksweep_rescue.go）：key 同 acceptStuck，
+	// value = 退避到期时间。免生成任务点亮是异步的，回读没动不代表重放能成功——
+	// 不压着就会每 15 分钟往上游重发同一批事件（反作弊面 + 白跑 45s/条）。
+	rescueMu    sync.Mutex
+	rescueStuck map[string]time.Time
+
 	// 专家市场快照（autotask.go）：定向专家任务按名字匹配专家，一次快照多任务
 	// 复用，避免逐任务重拉分页列表。uid → 快照，TTL 见 expertCacheTTL。
 	expertMu    sync.Mutex
