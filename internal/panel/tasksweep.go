@@ -37,6 +37,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -180,23 +181,33 @@ func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 // （mp 口径尤其），一次铺开全部账号只会互相踩；8 路已能在一分钟内扫完 200+ 号。
 var sweepConcurrency = 8
 
-// sequentialRescueShard 每轮清扫推进 Sequential 链的账号分片数。
+// sequentialRescueShard 每小时一批的账号分片数。
 //
-// 为什么要分片：有 Sequential 待办的号是千级，而每推进一环要几十秒到几分钟
-// （Sequential_Tasks_6 要按真人节奏补 10 条事件 ≈ 8 分钟）。全量铺开会让一轮
-// 清扫跑成小时级，把「补领」这条链路一起拖死（清扫是同步 ticker 调用）。
-// 按 uid 哈希取 1/shard，分片下标随轮次轮转 ⇒ 每轮约 N/shard 个号
-// （1256 号、shard=100 ≈ 12 个，一天 ~96 轮 ≈ 覆盖全量一遍），
-// 最坏 shard 轮覆盖全量。
-var sequentialRescueShard = 100
+// 为什么分片：有 Sequential 待办的号是千级，而每推进一环要几十秒到几分钟
+// （Sequential_Tasks_6 要按真人节奏补 10 条事件 ≈ 8 分钟）。全量铺开会让一批
+// 跑成小时级。按 uid 哈希取 1/shard，分片下标随小时轮转 ⇒ 每批约 N/shard 个号
+// （1256 号、shard=52 ≈ 24 个，一小时一批 ≈ 580 号/天，全量约 2 天覆盖一遍）。
+var sequentialRescueShard = 52
 
-// sequentialRescueSlot 当前轮到哪个分片。用时间片（15 分钟一格，与默认清扫
-// 周期同尺度）而不是进程内计数器：重启不丢轮转位置，多实例也不会各自从 0 起。
+// sequentialRescueSlot 当前轮到哪个分片。用**小时**时间片而不是进程内计数器：
+// 重启不丢轮转位置，多实例也不会各自从 0 起。粒度就是「每小时一批」的节奏
+// （05:xx 那一小时固定同一片，靠 sequentialRescueDue 保证只排一批）。
 func sequentialRescueSlot() uint32 {
-	return uint32(time.Now().Unix() / int64(15*time.Minute/time.Second))
+	return uint32(time.Now().Unix() / int64(time.Hour/time.Second))
 }
 
-// sequentialRescueSelected 该账号本轮是否轮到推进 Sequential 链。
+// sequentialRescueHour 上一个已经排过批次的小时槽。清扫本身是 15 分钟一轮
+// （补领需要这个频率），链推进不要跟着它跑——每 4 轮才轮到一次新分片，靠这个
+// 槽位把动作节奏压到每小时一批。
+var sequentialRescueHour atomic.Int64
+
+// sequentialRescueDue 本小时是否还需要排一批（同小时重复调用返回 false）。
+// 纯函数式：调用即占槽，由清扫的单 ticker goroutine 串行调用，无需额外加锁。
+func sequentialRescueDue(hour int64) bool {
+	return sequentialRescueHour.Swap(hour) != hour
+}
+
+// sequentialRescueSelected 该账号本小时是否轮到推进 Sequential 链。
 // 纯函数式判定（无状态、无锁），可以放心并发调用。
 func sequentialRescueSelected(uid string) bool {
 	if sequentialRescueShard <= 1 {

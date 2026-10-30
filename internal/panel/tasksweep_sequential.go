@@ -20,6 +20,7 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
@@ -45,12 +46,27 @@ var sequentialRescueConcurrency = 3
 var sequentialRescueBusy atomic.Bool
 
 // startSequentialRescue 在后台推进一批候选（不阻塞清扫 ticker）。
+//
+// 节奏是**每小时一批**，不是每轮清扫一批：清扫 15 分钟一轮（补领需要这个频率），
+// 若跟着排，同一小时会重复推同一片账号，把 mp 配额白白烧在同一批人身上。
+// 判定顺序不能换——先看上一批是否还在跑（在跑就不占小时槽，让本小时后面几轮
+// 清扫再试），再占小时槽，最后才抢 busy：
+//  1. busy 检查在前且**不占槽**：批次顺延时本小时仍有补救机会；
+//  2. 抢槽成功才算"本小时已排"，避免空转把槽占掉。
 func (p *Panel) startSequentialRescue(jobs []seqJob) {
 	if len(jobs) == 0 {
 		return
 	}
+	if sequentialRescueBusy.Load() {
+		log.Printf("panel: Sequential 推进：上一批未跑完，%d 个候选留在本小时后续清扫重试", len(jobs))
+		return
+	}
+	hour := time.Now().Unix() / int64(time.Hour/time.Second)
+	if !sequentialRescueDue(hour) {
+		return // 本小时已经排过一批（清扫每 15 分钟一轮，这里把它压成 1 小时）
+	}
 	if !sequentialRescueBusy.CompareAndSwap(false, true) {
-		log.Printf("panel: Sequential 推进：上一批未跑完，本轮 %d 个候选顺延到下一轮", len(jobs))
+		log.Printf("panel: Sequential 推进：上一批未跑完，%d 个候选留在本小时后续清扫重试", len(jobs))
 		return
 	}
 	go func() {

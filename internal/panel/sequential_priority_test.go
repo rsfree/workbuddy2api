@@ -126,9 +126,13 @@ func TestSequentialRescueSelected(t *testing.T) {
 // 链真正推进一步，且不顺手跑其他免生成任务（chat_5 留给成长队列）。
 func TestSequentialRescueRunsForFundedAccount(t *testing.T) {
 	fastPlaybookTest(t) // reportGap / claimPollGap 归零
-	oldGap, oldShard := mpChatEventGap, sequentialRescueShard
+	oldGap, oldShard, oldHour := mpChatEventGap, sequentialRescueShard, sequentialRescueHour.Load()
 	mpChatEventGap, sequentialRescueShard = 0, 1 // 不分片：本轮必然轮到
-	t.Cleanup(func() { mpChatEventGap, sequentialRescueShard = oldGap, oldShard })
+	sequentialRescueHour.Store(0)                // 清小时槽：否则与其它用例串扰（每小时只排一批）
+	t.Cleanup(func() {
+		mpChatEventGap, sequentialRescueShard = oldGap, oldShard
+		sequentialRescueHour.Store(oldHour)
+	})
 
 	claimed := map[string]bool{}
 	var lit atomic.Bool // mini 对话事件上报后进度点亮
@@ -197,6 +201,25 @@ func TestSequentialRescueRunsForFundedAccount(t *testing.T) {
 	// 第二轮：链已 claimed → 不再重复推进。
 	if second := p.RunTaskSweepOnce(); second.Sequential != 0 {
 		t.Errorf("second Sequential = %d, want 0（已领取不重复跑）", second.Sequential)
+	}
+}
+
+// TestSequentialRescueDue 每小时只排一批：同小时重复调用必须返回 false，
+// 否则清扫每 15 分钟一轮会把同一片账号连推 4 次（白烧 mp 配额）。
+func TestSequentialRescueDue(t *testing.T) {
+	old := sequentialRescueHour.Load()
+	sequentialRescueHour.Store(0)
+	t.Cleanup(func() { sequentialRescueHour.Store(old) })
+
+	const hour int64 = 480000
+	if !sequentialRescueDue(hour) {
+		t.Fatal("本小时首次应返回 true")
+	}
+	if sequentialRescueDue(hour) {
+		t.Fatal("同一小时第二次应返回 false（每小时只排一批）")
+	}
+	if !sequentialRescueDue(hour + 1) {
+		t.Fatal("跨小时应再排一批")
 	}
 }
 
