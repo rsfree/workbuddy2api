@@ -5,6 +5,9 @@
 //   - app.js      全部前端逻辑（独立文件而非内联，为了启用无需 unsafe-inline 的严格 CSP）
 //   - mobile.css  手机端（≤760px）适配样式（本仓库自有，上游不维护 → 同步上游不冲突）
 //   - mobile.js   手机端联动逻辑（抽屉开合、宽表卡片化字段名），须在 app.js 之后加载
+//   - favicon.svg 站点图标（WorkBuddy 官方 logo，取自 workbuddy.cn 的 <link rel=icon>）
+//     单独成文件而不是内联 data URI：原图 4.1KB（含渐变 + 高斯模糊滤镜），
+//     base64/百分号编码后会把 index.html 撑着，且改图就得改 HTML。
 //
 // 安全头对"面板页面与全部 /panel/api/* 响应"统一生效：CSP 限制脚本只能来自本服务，
 // 禁止被 iframe 嵌套（防点击劫持），禁 MIME 嗅探，并声明不泄露 Referer 出去。
@@ -30,6 +33,9 @@ var mobileCSS []byte
 
 //go:embed mobile.js
 var mobileJS []byte
+
+//go:embed favicon.svg
+var faviconSVG []byte
 
 // csp 内容安全策略（严格版，无需 unsafe-inline）：
 //   - default-src 'none'        默认全禁，逐个开口
@@ -92,7 +98,9 @@ func versionedIndexHTML(ver string) []byte {
 	}
 	out := indexHTML
 	// 只改属性值，不碰正文里提到文件名的注释（如「由 app.js 切 .on」）。
-	for _, ref := range []string{`src="app.js"`, `src="mobile.js"`, `href="mobile.css"`} {
+	// favicon 两个都要：<link href> 指标签页图标，<img src> 指侧栏品牌标。
+	for _, ref := range []string{`src="app.js"`, `src="mobile.js"`, `href="mobile.css"`,
+		`href="favicon.svg"`, `src="favicon.svg"`} {
 		out = bytes.ReplaceAll(out, []byte(ref), []byte(ref[:len(ref)-1]+"?v="+ver+`"`))
 	}
 	return out
@@ -115,6 +123,13 @@ func (p *Panel) appScript(w http.ResponseWriter, r *http.Request) {
 func (p *Panel) mobileStyle(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
 	writeStatic(w, r, "text/css; charset=utf-8", mobileCSS)
+}
+
+// favicon 输出站点图标（同源 SVG，CSP img-src 'self' 允许）。
+// Content-Type 必须是 image/svg+xml：配 nosniff 时浏览器不会猜类型，给错就整张不显示。
+func (p *Panel) favicon(w http.ResponseWriter, r *http.Request) {
+	setSecurityHeaders(w)
+	writeStatic(w, r, "image/svg+xml", faviconSVG)
 }
 
 // mobileScript 输出手机端联动逻辑（同源脚本，须在 app.js 之后加载）。
