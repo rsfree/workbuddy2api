@@ -136,6 +136,10 @@ func deriveAccountStableID(uid, purpose string) string {
 // injectAccountStableHeaders 在 req 注入 X-Machine-ID / X-Session-ID：按 uid 稳定
 // 派生，跨重启固定、账号间互异。uid 为空时不注入（匿名请求无设备标识，上游不要求）。
 func (c *Client) injectAccountStableHeaders(req *http.Request, a *auth.Auth) {
+	// 默认不发：见 Client.LegacyDeviceHeaders 注释（真客户端 chat 无此两头）。
+	if c == nil || !c.LegacyDeviceHeaders {
+		return
+	}
 	if a == nil || a.UID == "" {
 		return
 	}
@@ -232,6 +236,8 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	}
 	// 用量归属头：默认伪造 WorkBuddy 桌面端指纹（client_name="SaaS" 还原旧行为）。
 	c.injectAttribution(req)
+	// 桌面端身份头：官方 buildVlmGatewayHeaders/applyGatewayHeaders 的固定集合。
+	c.injectDesktopIdentity(req, a)
 	// 客户端 IP 透传（仅 PassthroughIP=true 且本次请求带 IP）。
 	c.injectClientIP(req, clientIP)
 	// 设备风控头：auth 每号 > config 全局 > 文件兜底；空则不注入。
@@ -299,6 +305,19 @@ func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 	req.Header.Set("X-B3-TraceId", b3Trace)
 	req.Header.Set("X-B3-SpanId", messageID[:16])
 	req.Header.Set("X-B3-Sampled", "1")
+	// W3C traceparent + B3 单头：真客户端 applyTraceHeaders 是**两套同时发**
+	// （traceparent 走 W3C，b3 走 zipkin 单头，外加 X-B3-* 三兄弟）。
+	// 只发 X-B3-* 不发这两个单头，同样是可识别的缺失。
+	spanID := messageID[:16]
+	parentID := session.NewMessageID()[:16]
+	// traceparent 的 trace-id 必须是 32 hex；b3Trace 可能只有 16（合法 B3 短形），
+	// 这里按确定性方式补齐，不做随机，保持与 X-B3-TraceId 可对齐。
+	tpTrace := b3Trace
+	if len(tpTrace) == 16 {
+		tpTrace = tpTrace + tpTrace
+	}
+	req.Header.Set("traceparent", "00-"+tpTrace+"-"+spanID+"-01")
+	req.Header.Set("b3", b3Trace+"-"+spanID+"-1-"+parentID)
 }
 
 // validTraceID 判断 B3 TraceId 是否合法：16 或 32 位 hex（大小写均可）。
@@ -344,6 +363,43 @@ func (c *Client) injectAttribution(req *http.Request) {
 	req.Header.Set("X-IDE-Type", name)
 	req.Header.Set("X-IDE-Version", c.clientVersion())
 	req.Header.Set("X-Product", name)
+}
+
+// injectDesktopIdentity 注入官方桌面端 chat 的固定身份头。
+// 依据（2026-11-01 app.asar 反解 buildVlmGatewayHeaders / applyGatewayHeaders）：
+//   - X-Private-Data: true   隐私数据标记，真客户端每请求恒定发
+//   - X-Agent-Intent: craft  agent 意图，真客户端每请求恒定发
+//   - acp-connection-id      本地 ACP 连接 ID（UUID 形态，连接级稳定）
+//
+// 这三头真客户端"每个 chat 请求都带"，网关此前一个都没有——**缺失本身即是特征**。
+func (c *Client) injectDesktopIdentity(req *http.Request, a *auth.Auth) {
+	req.Header.Set("X-Private-Data", "true")
+	req.Header.Set("X-Agent-Intent", "craft")
+	if a != nil && a.UID != "" {
+		req.Header.Set("acp-connection-id", deriveAccountUUID(a.UID, "acp"))
+	}
+}
+
+// deriveAccountUUID 按 uid + 用途盐派生 UUID 形态标识（8-4-4-4-12，v4 变体位）。
+// 与 deriveAccountStableID 同源（sha256 + 固定盐 "wb2a:"），差异只在输出形态：
+// 本函数产出真客户端 randomUUID 的形状（带连字符），用于 acp-connection-id 这类
+// 视觉上必须是 UUID 的头。跨重启稳定、账号间互异、同 uid 同用途恒同值。
+func deriveAccountUUID(uid, purpose string) string {
+	sum := sha256.Sum256([]byte("wb2a:" + purpose + ":" + uid))
+	b := sum[:16]
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant RFC 4122
+	dst := make([]byte, 36)
+	hex.Encode(dst[0:8], b[0:4])
+	dst[8] = '-'
+	hex.Encode(dst[9:13], b[4:6])
+	dst[13] = '-'
+	hex.Encode(dst[14:18], b[6:8])
+	dst[18] = '-'
+	hex.Encode(dst[19:23], b[8:10])
+	dst[23] = '-'
+	hex.Encode(dst[24:36], b[10:16])
+	return string(dst)
 }
 
 // injectClientIP 在 PassthroughIP 开启时把 clientIP 参数透传给上游（三等价头）。

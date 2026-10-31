@@ -803,6 +803,16 @@ type Client struct {
 	// DeviceTokenFile 设备 token 文件路径兜底（宿主落盘的桌面端 token，5 分钟读取缓存）。
 	DeviceTokenFile string
 
+	// LegacyDeviceHeaders 是否继续注入 X-Machine-ID / X-Session-ID（默认 false = 不发）。
+	//
+	// 2026-11-01 取证结论（app.asar 静态反解）：官方桌面端 chat 主路径
+	// （buildVlmGatewayHeaders + applyGatewayHeaders）**从不发这两个头**；
+	// 真客户端只有 feedback 端点发 `X-Machine-Id`（小写 d），
+	// 而 `X-Session-ID` 在 181MB asar 里一次都不存在。
+	// ⇒ 网关此前"按 uid 派生假设备指纹"的做法，值改得再像，头名本身就是
+	// 一条真客户端没有的特征。默认关闭，保留开关便于 A/B 回溯。
+	LegacyDeviceHeaders bool
+
 	ChatBaseCN    string
 	BillingBaseCN string
 	// WebBaseCN 官网（workbuddy.cn）域：部分「任务领奖」类接口只在此域提供

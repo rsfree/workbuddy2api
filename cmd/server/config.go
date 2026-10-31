@@ -263,6 +263,9 @@ type Config struct {
 		DeviceTokenFile string `json:"device_token_file"`
 		// PassthroughIP 是否透传客户端 IP 给上游（默认 false，反代安全边界）。
 		PassthroughIP bool `json:"passthrough_ip"`
+		// LegacyDeviceHeaders 是否继续注入 X-Machine-ID / X-Session-ID（默认 false）。
+		// 真客户端 chat 主路径从不发这两个头，发了等于自报网关身份，见 Client 字段注释。
+		LegacyDeviceHeaders bool `json:"legacy_device_headers"`
 	} `json:"upstream"`
 
 	Features struct {
@@ -616,6 +619,11 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_PASSTHROUGH_IP"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Upstream.PassthroughIP = b
+		}
+	}
+	if v := os.Getenv("WB2A_LEGACY_DEVICE_HEADERS"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Upstream.LegacyDeviceHeaders = b
 		}
 	}
 	if v := os.Getenv("WB2A_SANITIZE_FINGERPRINTS"); v != "" {
