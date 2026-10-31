@@ -78,6 +78,12 @@ type TaskSweepStats struct {
 // 由 scheduler 的 ticker 调用（详见 scheduler.StartTaskSweep）。
 func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 	var st TaskSweepStats
+	// 风控熔断闸门：清扫是 15 分钟一轮的全池扫描（每号 2 次列表请求），
+	// 熔断期继续扫不仅白烧配额，还会把没被点到的号继续暴露给上游名单。
+	// 直接返回空统计：本轮什么都没做，比伪装成"扫了但没任务"更诚实。
+	if p.riskBlocked("任务清扫") {
+		return st
+	}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	// 链推进候选：清扫阶段只收集，wg.Wait 之后交给独立 goroutine 错峰执行。

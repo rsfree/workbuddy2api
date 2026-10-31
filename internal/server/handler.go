@@ -2080,6 +2080,15 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// Classify 分流到 ErrChannelRefused，走不到这里。
 		if upstream.IsAccountRestricted(body) {
 			h.cfg.Pool.Disable(uid, "account restricted by upstream (11140 request illegal); appeal in WorkBuddy (submit feedback) to lift the restriction")
+			// 风控熔断：11140 是账号级批量处置的信号，不是单号故障。
+			// 2026-11-01 实测 00:04 一分钟 139 个号同时 11140、峰值一秒 34 个，
+			// 且此前 3 分钟零请求 ⇒ 上游持名单一次性执行。窗口内达到阈值就整体
+			// 叫停自动化，避免把剩下没被点到的号一个个撞出来。
+			if h.cfg.Pool.NoteUpstreamBan(time.Now()) {
+				st := h.cfg.Pool.RiskState(time.Now())
+				log.Printf("RISK: 上游风控熔断已触发（%ds 内 %d 个账号被 11140 限制，阈值 %d，累计 %d 次/熔断 %d 次）→ 自动化任务暂停 %ds；最后一次命中 acct=%s",
+					st.WindowSec, st.WindowHits, st.Threshold, st.Bans, st.Trips, st.CooldownS, uid)
+			}
 			return
 		}
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.softCooldown(), "account fault (14017)")

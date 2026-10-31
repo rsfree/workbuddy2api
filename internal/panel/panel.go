@@ -382,6 +382,11 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		// 所以单独给一个计数而不是塞进 disabled 的子集（banned 那种）。
 		"session_dead":   sessionDead,
 		"paused":         paused,
+		// risk_breaker 上游风控熔断状态（11140 成批处置的止损开关）。
+		// tripped=true 时三条自动化通路（成长队列 / 任务清扫 / 新任务即时执行）
+		// 都会跳过。必须透出，否则运维看到「任务不动」会去查账号、查配置，
+		// 而真实原因是熔断在挡 —— 那种排查成本比故障本身还高。
+		"risk_breaker":   p.cfg.Pool.RiskState(time.Now()),
 		"in_flight_full": inFlightFull,
 		"accounts":       accounts,
 		// 企业相关凭证清单（uid）+ 计数：只影响展示，不改变选号/执行口径。

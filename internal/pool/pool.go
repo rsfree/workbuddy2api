@@ -19,6 +19,10 @@ type Pool struct {
 	// store 池状态快照镜像（redisstore.Store）；nil = 无需镜像（未配置 Redis / Noop 之外也可能 nil）。
 	// SaveState/LoadState 经它接线，与本地 state.json 并存作启动恢复备份。
 	store StoreSnapshotter
+	// risk 上游风控熔断：窗口内 11140 成批出现时整体叫停自动化（见 riskguard.go）。
+	// 懒初始化，保证零值 Pool 也能用（测试里大量 `&Pool{}`）。
+	riskOnce sync.Once
+	risk     *RiskGuard
 	// 熔断器调优（SetBreaker 注入；默认值见 defaultBreaker*）。
 	breakerThreshold   int
 	breakerCooldown    time.Duration

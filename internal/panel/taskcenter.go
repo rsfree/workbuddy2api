@@ -273,6 +273,11 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 // 已在执行（冲突）；started=false 时 msg 为无可执行待办的说明。并发夹取
 // [1,4]；growth 开关同 HTTP 入参语义。
 func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, total int, seq int, msg string) {
+	// 风控熔断闸门：必须在最前面。放在建队列之后等于扫描请求已经打出去了，
+	// 而扫描本身就是批量请求（每号 2 次列表），熔断期再扫一遍毫无意义。
+	if p.riskBlocked("成长队列") {
+		return false, 0, 0, "上游风控熔断中，已暂停自动化任务（等冷却期结束）"
+	}
 	if concurrency < 1 {
 		concurrency = 1
 	}
@@ -432,6 +437,10 @@ func (p *Panel) RunGrowthQueueOnce() {
 // 并发与队列同口径：账号间并发（上限 4），账号内串行，共用 per-account 锁。
 func (p *Panel) runDiscoveredTasks(codes []string) {
 	if len(codes) == 0 {
+		return
+	}
+	// 风控熔断闸门：新任务即时执行是"全账号铺开"的通路，熔断期必须整条拦下。
+	if p.riskBlocked("新任务即时执行") {
 		return
 	}
 	want := make(map[string]bool, len(codes))
