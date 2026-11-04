@@ -51,6 +51,13 @@ var rescueRetryTTL = 45 * time.Minute
 // 候选里 10+ 个瞬间 429，全被罚 45 分钟）。5 分钟小于清扫周期，下一轮就能重试。
 var rescueRateTTL = 5 * time.Minute
 
+// rescueTaskGap 同一账号相邻两条补给之间的间隔。
+//
+// 2026-11-04 10:46 实线实测：同一号连续 3 条补给（间隔 <1s），第 1 条点亮成功后
+// 第 2、3 条立刻 soft_rate 429——是网关对同源连发请求的限流，不是任务本身做不动。
+// 批次级 2 路并发解决了「多号同时打」，这条补的是「同号内连打」。
+var rescueTaskGap = 4 * time.Second
+
 // rescueKey 退避表键（与 acceptStuckKey 同构：NUL 分隔，避免拼接歧义）。
 func rescueKey(uid, code string) string { return uid + "\x00" + code }
 
@@ -194,7 +201,11 @@ func (p *Panel) runRescuePlan(a *auth.Auth, uid string,
 	if seqOnly {
 		label = "Sequential 推进"
 	}
-	for _, t := range plan {
+	for i, t := range plan {
+		if i > 0 {
+			// 同号相邻两条拉开间隔（见 rescueTaskGap：连发会被网关 429）。
+			time.Sleep(rescueTaskGap)
+		}
 		msg, err := p.runGrowthQueued(a, t.TaskCode)
 		if err != nil {
 			// 429/网络抖动 ≠ 任务做不动：短退避，下一轮就重试；只有真正的
