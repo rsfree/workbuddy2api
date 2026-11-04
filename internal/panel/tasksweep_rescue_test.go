@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -168,12 +169,13 @@ func TestZeroCreditRescueRunsFreeTasks(t *testing.T) {
 	}}
 
 	st := p.RunTaskSweepOnce()
-	if st.Rescued != 1 {
-		t.Fatalf("rescued = %d, want 1（chat_5 应被补跑并领奖；stats=%+v）", st.Rescued, st)
+	if st.Free != 1 {
+		t.Fatalf("free candidates = %d, want 1（chat_5 应被列入补给候选；stats=%+v）", st.Free, st)
 	}
-	if st.Credits != 100 || st.Energy != 5 {
-		t.Errorf("credits=%d energy=%d, want 100/5", st.Credits, st.Energy)
-	}
+	// 补给自 2026-11-04 起从清扫信号量内移到收尾后的独立低并发批次（同
+	// Sequential 错峰，避免与列表扫描抢配额撞 429），清扫阶段不再同步执行，
+	// 实际点亮/领奖要看批次跑完后的上游状态。
+	waitFreeRescueBatch(t)
 	if !claimed["chat_5"] {
 		t.Error("chat_5 未被领取")
 	}
@@ -207,5 +209,22 @@ func TestSortGrowthFreeFirst(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("order = %v, want %v", got, want)
 		}
+	}
+}
+
+// waitFreeRescueBatch 等后台零积分补给批次跑完。
+//
+// 补给改为清扫收尾后的异步批次后，清扫阶段的 st.Rescued/st.Credits 恒为 0，
+// 实际结果要等批次执行完再看。
+func waitFreeRescueBatch(t *testing.T) {
+	t.Helper()
+	// 先给批次启动留一拍：RunTaskSweepOnce 返回时 goroutine 未必已抢到 busy。
+	time.Sleep(20 * time.Millisecond)
+	deadline := time.Now().Add(10 * time.Second)
+	for freeRescueBusy.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("零积分补给批次超时未完成")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

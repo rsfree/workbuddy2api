@@ -25,6 +25,8 @@ package panel
 import (
 	"log"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -223,4 +225,76 @@ func (p *Panel) runRescuePlan(a *auth.Auth, uid string,
 			label, uid, t.TaskCode, msg, t.Credit, t.Energy)
 	}
 	return rescued, skipped, credit, energy
+}
+
+// rescueJob 零积分补给候选：tasks 是清扫阶段拿到的任务快照（本轮 accept 之后），
+// 由收尾后的独立批次重新算计划执行。
+type rescueJob struct {
+	a     *auth.Auth
+	uid   string
+	tasks []upstream.Task
+}
+
+// freeRescueConcurrency 零积分补给的批次并发。取 2 而不是跟清扫的 8：
+// 补给每条都是真实行为上报（Sequential 族还要按真人节奏补 5~10 条事件），
+// 8 路同时打上游会直接撞 mp 限流——2026-11-04 10:17 实测 8 个零积分号
+// 同时补给全 soft_rate 429，一条都没点亮。
+var freeRescueConcurrency = 2
+
+// freeRescueGap 批次内相邻任务的间隔：补给是真实事件上报，连续打容易触发
+// 反作弊/限流，拉开 3 秒让上游有时间落账。
+var freeRescueGap = 3 * time.Second
+
+// freeRescueBusy 上一批还在跑时不再叠加新批。清扫 15 分钟一轮，一批最坏
+// （每号 3 条、2 并发、单条 4 分钟）可能超过一轮；叠加只会自己造 429。
+var freeRescueBusy atomic.Bool
+
+// startFreeRescue 在后台跑一批零积分补给（不阻塞清扫 ticker）。
+//
+// 与 startSequentialRescue 同款错峰理由：清扫阶段只收集候选，这里独立 goroutine +
+// 独立低并发池执行，不占清扫的 8 路信号量、不与列表扫描同一瞬间抢配额。
+func (p *Panel) startFreeRescue(jobs []rescueJob) {
+	if len(jobs) == 0 {
+		return
+	}
+	if !freeRescueBusy.CompareAndSwap(false, true) {
+		log.Printf("panel: 零积分补给：上一批未跑完，%d 个候选顺延到下一轮清扫", len(jobs))
+		return
+	}
+	go func() {
+		defer freeRescueBusy.Store(false)
+		sem := make(chan struct{}, freeRescueConcurrency)
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		var okN int
+		var totC, totE int64
+		for _, j := range jobs {
+			wg.Add(1)
+			go func(j rescueJob) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				// 清扫阶段已释放账号锁；这里重新拿。拿不到说明该号正被队列/
+				// 手动入口占用，跳过（下一轮自然再轮到）。
+				if !p.tryLockAccount(j.uid) {
+					return
+				}
+				defer p.unlockAccount(j.uid)
+				rescued, _, credit, energy := p.runRescuePlan(j.a, j.uid, j.tasks, false)
+				if rescued > 0 {
+					mu.Lock()
+					okN += rescued
+					totC += credit
+					totE += energy
+					mu.Unlock()
+					log.Printf("panel: 零积分补给批次：uid=%s +%d 分 +%d 能", j.uid, credit, energy)
+				}
+				time.Sleep(freeRescueGap)
+			}(j)
+		}
+		wg.Wait()
+		if okN > 0 {
+			log.Printf("panel: 零积分补给批次收尾：%d 条点亮 · +%d 分 +%d 能", okN, totC, totE)
+		}
+	}()
 }

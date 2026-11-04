@@ -167,11 +167,13 @@ func TestTaskSweepZeroCreditPlaybookRescue(t *testing.T) {
 				p.cfg.Scheduler = scheduler.New(scheduler.Config{GrowthDisabled: true})
 			}
 			st := p.RunTaskSweepOnce()
+			if st.Free != tc.wantRescued {
+				t.Fatalf("free candidates=%d want %d（stats=%+v）", st.Free, tc.wantRescued, st)
+			}
+			// 补给改为清扫收尾后的异步批次：等它跑完再断言实际上报/领奖。
+			waitFreeRescueBatch(t)
 			if f.desktopReports.Load() != tc.wantReports || f.mpReports.Load() != 0 {
 				t.Fatalf("desktop=%d mp=%d, want desktop=%d mp=0", f.desktopReports.Load(), f.mpReports.Load(), tc.wantReports)
-			}
-			if st.Rescued != tc.wantRescued || st.Claimed != tc.wantClaimed || st.Credits != tc.wantCreditTotal || st.Energy != tc.wantCreditTotal/100 {
-				t.Fatalf("stats=%+v", st)
 			}
 			if got := f.webClaims.Load(); got != int32(tc.wantClaimed) {
 				t.Fatalf("web claims=%d want %d", got, tc.wantClaimed)

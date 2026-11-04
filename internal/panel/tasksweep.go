@@ -61,6 +61,9 @@ type TaskSweepStats struct {
 	// 与 Rescued 分开记：一个衡量「死号回血」，一个衡量「链覆盖」，混在一起
 	// 就看不出「有些号总会漏」有没有真的被修掉。
 	Sequential int `json:"sequential"`
+	// Free 本轮零积分补给候选数（动作在清扫收尾后由独立低并发批次执行，
+	// 与 Sequential 同款错峰：就地跑会占满清扫信号量并撞上游限流）。
+	Free int `json:"free"`
 	// RescueBackoff 零积分补给里因「上轮跑过没点亮」退避而跳过的条数
 	// （见 tasksweep_rescue.go）。它正常应>0：说明确实有做不动的任务在被压制，
 	// 而不是每 15 分钟反复重放同一条事件。
@@ -89,6 +92,9 @@ func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 	// 链推进候选：清扫阶段只收集，wg.Wait 之后交给独立 goroutine 错峰执行。
 	var seqJobs []seqJob
 	var seqMu sync.Mutex
+	// 零积分补给候选：同上（就地跑会占满 8 路信号量并撞 429）。
+	var freeJobs []rescueJob
+	var freeMu sync.Mutex
 	// 目录是否尚未建立（升级/新机器首轮）：首轮所有码都「没见过」，若据此触发执行，
 	// 会在生产上一把跑掉全账号的待办（每个含真实对话）。所以首轮只登记不触发，
 	// 由每日成长队列或手动按钮接手；从第二轮起，真正的新码才即时执行。
@@ -134,6 +140,11 @@ func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 				seqJobs = append(seqJobs, seqJob{a: a, uid: uid, tasks: r.seqTasks})
 				seqMu.Unlock()
 			}
+			if len(r.freeTasks) > 0 {
+				freeMu.Lock()
+				freeJobs = append(freeJobs, rescueJob{a: a, uid: uid, tasks: r.freeTasks})
+				freeMu.Unlock()
+			}
 			st.RescueBackoff += r.rescueBlocked
 			st.AcceptBackoff += r.acceptBackoff
 			st.newCodes = append(st.newCodes, r.newCodes...)
@@ -161,6 +172,10 @@ func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 	// 它抢同一份上游配额；独立 goroutine + 独立低并发池，不拖 ticker。
 	st.Sequential = len(seqJobs)
 	p.startSequentialRescue(seqJobs)
+	// 零积分补给同样放到清扫收尾之后：列表/accept/claim 已跑完，补给不再与它们
+	// 抢同一份上游配额（2026-11-04 10:17 实测：就地 8 路并发补齐全 soft_rate 429）。
+	st.Free = len(freeJobs)
+	p.startFreeRescue(freeJobs)
 
 	codes := dedupeCodes(st.newCodes)
 	switch {
@@ -177,8 +192,8 @@ func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 	}
 
 	if st.Claims() > 0 || st.Errors > 0 || st.Accepted > 0 || st.Discovered > 0 || st.Rescued > 0 || st.Sequential > 0 || st.AcceptBackoff > 0 || st.RescueBackoff > 0 {
-		log.Printf("panel: 任务补领清扫：%d 个账号（跳过 %d）· 新任务 %d（可自动 %d）· 接受 %d · accept退避 %d · 领奖 %d · 零积分补给 %d · Sequential 候选 %d（退避 %d）· +%d 分 +%d 能 · 出错 %d",
-			st.Accounts, st.Skipped, st.Discovered, st.NewAuto, st.Accepted, st.AcceptBackoff, st.Claimed, st.Rescued, st.Sequential, st.RescueBackoff, st.Credits, st.Energy, st.Errors)
+		log.Printf("panel: 任务补领清扫：%d 个账号（跳过 %d）· 新任务 %d（可自动 %d）· 接受 %d · accept退避 %d · 领奖 %d · 零积分补给候选 %d · Sequential 候选 %d（退避 %d）· +%d 分 +%d 能 · 出错 %d",
+			st.Accounts, st.Skipped, st.Discovered, st.NewAuto, st.Accepted, st.AcceptBackoff, st.Claimed, st.Free, st.Sequential, st.RescueBackoff, st.Credits, st.Energy, st.Errors)
 	}
 	return st
 }
@@ -261,6 +276,7 @@ type sweepResult struct {
 	discovered, newAuto                          int
 	rescued                                      int
 	seqTasks                                     []upstream.Task // 本轮轮到推进的链任务（最多 1 条）
+	freeTasks                                    []upstream.Task // 零积分补给候选的任务快照（收尾后独立批次执行）
 
 	rescueBlocked                                int
 	acceptBackoff                                int
@@ -353,12 +369,15 @@ func (p *Panel) sweepAccountWithRescue(a *auth.Auth, uid string, rescueAllFree b
 	//      列表扫描抢同一份配额（详见 tasksweep_sequential.go）。
 	// 已达标项不重跑，留给下方阶段二统一领奖。
 	if rescueAllFree {
-		rescued, blocked, credit, energy := p.runRescuePlan(a, uid, tasks, false)
-		res.rescued += rescued
-		res.claimed += rescued
-		res.rescueBlocked += blocked
-		res.credit += credit
-		res.energy += energy
+		// 只收集候选，不就地执行：补给每条是 10s~4min 的真实行为上报，就地跑
+		// 会占满清扫的 8 路信号量、并与列表扫描抢同一份上游配额。2026-11-04
+		// 10:17 实测：8 个零积分号同时补齐全 soft_rate 429，一条未点亮。
+		if plan, skipped := zeroCreditRescuePlan(tasks, func(code string) bool {
+			return p.rescueBlocked(uid, code)
+		}, zeroCreditRescueMax); len(plan) > 0 {
+			res.freeTasks = tasks
+			res.rescueBlocked += skipped
+		}
 	} else if p.shouldRunDiscovered() && sequentialRescueSelected(uid) {
 		if plan, _ := sequentialRescuePlan(tasks, func(code string) bool {
 			return p.rescueBlocked(uid, code)
