@@ -17,7 +17,11 @@
   /* --ink-3 承载表头 / .k 标签 / 时间戳 / hint，全部是 11.5px 小字，必须过 AA 4.5:1。
      原 #6b7488 在 --surface 上实测 3.82:1（不达标），换 #7c8599 后 4.84:1。 */
   --ink: #e8ebf2; --ink-2: #a8b0c2; --ink-3: #7c8599;
-  --accent: #5b7cfa; --accent-ink: #ffffff; --accent-soft: rgba(91,124,250,.13);
+  --accent: #5b7cfa;
+  /* 实心按钮专用：accent 本身白字仅 3.68:1 不达 AA；此色 4.64:1。
+     accent 仍用于文字/链接（深底上 4.88:1），两者分工不同不可合并。 */
+  --accent-solid: #4a6ae8;
+  --accent-ink: #ffffff; --accent-soft: rgba(91,124,250,.13);
   --ok: #3ddc97; --ok-soft: rgba(61,220,151,.12);
   --warn: #f5b544; --warn-soft: rgba(245,181,68,.12);
   --bad: #f0655f; --bad-soft: rgba(240,101,95,.12);
@@ -30,10 +34,12 @@
   --line: #e2e5ec; --line-soft: #eceef3;
   /* 浅色下这两个色原来都不达标（实测 on --surface）：--ink-3 #8b93a5 仅 3.08:1、
      --ok #0f9d63 仅 3.49:1，而它们分别用于 11.5px 标签与 .tag.ok 状态文字。
-     改 #6f7789 → 4.49:1、#0a7a4c → 5.38:1。--ok-soft 同步换基色，避免实色与
-     浅底来自两个不同的绿。 */
-  --ink: #14171f; --ink-2: #545c6e; --ink-3: #6f7789;
-  --accent: #3d5fe0; --accent-ink: #ffffff; --accent-soft: rgba(61,95,224,.09);
+     改 #666E7F → 白底 5.12:1 / 灰底 4.70:1（上一版 #6f7789 只有 4.49，差 0.01 仍不达标）、
+     #0a7a4c → 5.38:1。--ok-soft 同步换基色，避免实色与浅底来自两个不同的绿。 */
+  --ink: #14171f; --ink-2: #545c6e; --ink-3: #666E7F;
+  --accent: #3d5fe0;
+  --accent-solid: #3d5fe0;
+  --accent-ink: #ffffff; --accent-soft: rgba(61,95,224,.09);
   --ok: #0a7a4c; --ok-soft: rgba(10,122,76,.1);
   --warn: #b47611; --warn-soft: rgba(180,118,17,.11);
   --bad: #cf3b34; --bad-soft: rgba(207,59,52,.09);
@@ -1033,6 +1039,145 @@ body.bulk-on { padding-bottom: 88px; }
   .bulkbar input { flex: 1; min-width: 80px; }
   .pager { flex-wrap: wrap; }
 }
+
+/* ══════════════════════════════════════════════════════════════════════════
+   视觉与交互精修（2026-11-06）
+   只处理实测有问题的地方，不重做已经合格的令牌与组件：
+   1) 实心按钮白字 3.68:1 → 4.64:1（accent 保留给文字/链接）
+   2) KPI 满屏 0 却绿/黄/红三色抢眼 → 0 值统一回中性，有值才上色
+   3) 28px 高的小按钮在密集工具条里难点 → 31px
+   4) 空态占掉近 200px 首屏 → 收紧
+   5) 顶栏滚动时与内容糊在一起 → 玻璃材质分层
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* 1. 实心按钮专用强调色：--accent 本体在深底上白字只有 3.68:1 */
+/* 必须写成 button.primary：基样式是 button.primary（0,1,1），单类选择器会输 */
+button.primary { background: var(--accent-solid, var(--accent)); border-color: var(--accent-solid, var(--accent)); }
+button.primary:hover:not(:disabled) { filter: brightness(1.06); }
+button.primary:not(:disabled):active { transform: scale(.97); }
+
+/* 2. KPI 零值中性化：语义色只标注「有东西要注意」。
+      .zero 由 app.js 的 markZeroStats() 在每次 loadOverview 后按实际值挂载。 */
+.stat.zero .v { color: var(--ink); }
+.stat.zero .k { color: var(--ink-3); }
+/* 零值卡片的底部强调条（若有）一并压掉，避免 0 也带彩色底纹 */
+.stat.zero::after { opacity: 0 !important; }
+
+/* 3. 小按钮命中区：28px 在指针设备上偏小，31px 仍不破坏 44px 行高节奏。
+      同样必须带上元素名，否则被 button.xs / select.xs 压住。 */
+button.xs, select.xs { padding: 5.5px 10px; }
+/* 表单控件统一 32px：搜索/排序/页大小是每个视图都会碰的主控件 */
+input:not([type="checkbox"]):not([type="radio"]), select { min-height: 32px; }
+/* 行内标签 chip 不是主控件，但也要能点中：28px 是标签行的上限 */
+button.xs.chip { min-height: 28px; }
+
+/* 4. 空态：40px 上下留白 + 两行说明在 900px 首屏里挤掉真实信息 */
+.empty { padding: 26px 20px; }
+.empty .big { margin-bottom: 4px; }
+
+/* 5. 顶栏玻璃材质：滚动内容从下方经过时能看出层级，而不是一块实色贴条 */
+.topbar {
+  background: var(--surface);
+  background: color-mix(in srgb, var(--surface) 82%, transparent);
+  -webkit-backdrop-filter: blur(16px) saturate(150%);
+  backdrop-filter: blur(16px) saturate(150%);
+}
+/* 不支持 color-mix / backdrop-filter 的浏览器回落到实色（上面第一条声明即为兜底） */
+
+/* 6. 统一按压反馈：此前只有部分按钮有 :active，手感想一致就得全覆盖 */
+button:not(:disabled):active,
+.nav a:active,
+.chip:active { transform: scale(.97); }
+button, .nav a, .chip {
+  transition: transform var(--dur-1, .18s) var(--spring-snap, cubic-bezier(.32,.72,0,1)),
+              background-color var(--dur-1, .18s) ease,
+              border-color var(--dur-1, .18s) ease,
+              color var(--dur-1, .18s) ease;
+}
+
+/* 7. 减弱动效：按压缩放属于「装饰性动效」，prefers-reduced-motion 下一律取消 */
+@media (prefers-reduced-motion: reduce) {
+  button:active, .nav a:active, .chip:active { transform: none; }
+  .topbar { backdrop-filter: none; -webkit-backdrop-filter: none; background: var(--surface); }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   信息架构层（2026-11-06）
+   A 侧栏 8 个入口分 3 组，降低"平铺权重"
+   B 账号池工具条按「日常 → 维护 → 危险」分组，危险动作默认中性、悬停显红
+   C 四个容量 KPI 变成筛选入口（.linked 由 app.js linkStatFilters 挂载）
+   D 空态给出真正的下一步
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* A. 侧栏分组标签 */
+.nav .nav-h {
+  margin: 12px 0 5px; padding: 0 11px;
+  font-size: 11px; font-weight: 600; letter-spacing: .06em;
+  color: var(--ink-3); list-style: none; user-select: none;
+}
+.nav .nav-h.first { margin-top: 0; }
+.nav a svg { width: 16px; height: 16px; opacity: .9; }
+.nav a.on svg { opacity: 1; }
+
+/* B. 工具条分组：分隔线代替"挤在一起"，危险动作降到与普通动作同形 */
+.tgroup { display: inline-flex; align-items: center; gap: 6px; flex: none; }
+.tsep { width: 1px; height: 18px; background: var(--line); flex: none; }
+.box > header { flex-wrap: wrap; row-gap: 8px; }
+button.xs.danger { color: var(--ink-2); border-color: var(--line); background: none; }
+button.xs.danger:hover:not(:disabled) { color: var(--bad); border-color: var(--bad); background: var(--bad-soft); }
+
+/* C. KPI 作为筛选入口：可点、可聚焦、有选中态 */
+.stat.linked { cursor: pointer; }
+.stat.linked:hover { background: var(--surface-2); }
+.stat.linked:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.stat.on { background: var(--accent-soft); }
+.stat.on .k { color: var(--ink-2); }
+.stat.on::after {
+  content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 2px;
+  background: var(--accent);
+}
+
+/* D. 空态的下一步 */
+.empty-act { margin-top: 12px; }
+
+/* E. 空卡片不占首屏：expList 只有占位文案时（app.js foldEmptyCards 挂 .is-empty），
+      把内容区收起，只保留标题行——它原比账号表还显眼却一条数据都没有。 */
+#expBox.is-empty #expPad { display: none; }
+#expBox.is-empty header { border-bottom: 0; padding-bottom: 12px; }
+/* 空的时候「收起」这个动作本身没有对象，说明文字也失去上下文 */
+#expBox.is-empty #btnExpFold,
+#expBox.is-empty header .note { display: none; }
+
+/* 信息徽标：实心强调色，替掉此前占用警告黄的「新」 */
+.tag.new { background: var(--accent-solid, var(--accent)); color: #fff; border-color: transparent; }
+
+/* F. KPI 可点的可发现性：悬停时标签尾部浮出一个轻量指示，不常驻、不抢数字 */
+.stat.linked .k::after {
+  content: "›"; margin-left: 4px; opacity: .3;
+  transition: opacity .15s ease, transform .15s ease;
+  display: inline-block; transform: translateX(-2px);
+}
+.stat.linked:hover .k::after, .stat.linked:focus-visible .k::after { opacity: .65; transform: translateX(0); }
+
+/* G. 窄屏：工具条会换行，分隔线落在行尾会变成"悬空竖线"，直接不显示 */
+@media (max-width: 900px) {
+  .tsep { display: none; }
+  .tgroup { flex-wrap: wrap; }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   窄屏溢出修（2026-11-06，有数据才暴露）
+   现象：390 视口整页 scrollWidth 555。定位到 #alertBar 里的计数 chips
+   （全部/需处理/可用/冷却…）是 inline-flex 且不换行，570px 宽 max-content
+   直接把页面顶出去。空池时 #alertBar 隐藏，所以此前审计全绿——这类问题
+   只有「有账号」才看得见。
+   ══════════════════════════════════════════════════════════════════════════ */
+#alertBar { flex-wrap: wrap; row-gap: 6px; }
+#alertBar .chips { flex-wrap: wrap; min-width: 0; row-gap: 4px; }
+/* 真正的溢出源：账号表筛选 chips（全部/需处理 N/可用 N/…）。
+   .chips 是 inline-flex，flex 项不会自动收缩，max-content 宽 535px 顶破 390 视口。
+   给它自身换行 + 允许收缩，父行 .row 本来就有 flex-wrap，两处配合才生效。 */
+.acc-tools .chips { flex-wrap: wrap; min-width: 0; max-width: 100%; row-gap: 4px; }
 </style>
 <!-- 移动端适配：独立文件，必须在主 <style> 之后（@media 覆盖依赖层叠顺序） -->
 <link rel="stylesheet" href="mobile.css">
@@ -1048,29 +1193,32 @@ body.bulk-on { padding-bottom: 88px; }
       </div>
     </div>
     <ul>
-      <li><a href="#accounts" data-view="accounts" class="on">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="5.5" r="2.6"/><path d="M2.8 13.5c.6-2.6 2.7-4 5.2-4s4.6 1.4 5.2 4"/></svg>
+      <li class="nav-h first">运营</li>
+      <li class="nav-i"><a href="#accounts" data-view="accounts" class="on">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="5.5" r="2.5"/><path d="M3 13.3c.7-2.6 2.7-3.9 5-3.9s4.3 1.3 5 3.9"/></svg>
         账号池</a></li>
-      <li><a href="#usage" data-view="usage">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 13.5h12"/><path d="M4.5 13.5V8.2M8 13.5V3.5M11.5 13.5v-3"/></svg>
-        用量</a></li>
-      <li><a href="#capacity" data-view="capacity">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 13.5h12M3 11l3-3 2.5 2L13 4.5"/><path d="M10 4.5h3v3"/></svg>
-        容量规划</a></li>
-      <li><a href="#packages" data-view="packages">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.2 5.4 8 2.5l5.8 2.9v5.2L8 13.5l-5.8-2.9z"/><path d="M2.2 5.4 8 8.3l5.8-2.9M8 8.3v5.2"/></svg>
-        积分构成</a></li>
-      <li><a href="#taskscenter" data-view="taskscenter">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 2.5h10v9H8l-3 3v-3H3z"/><path d="M6 6.5h4M6 9h2.5"/></svg>
+      <li class="nav-i"><a href="#taskscenter" data-view="taskscenter">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.4" y="2.9" width="11.2" height="8.1" rx="1.7"/><path d="M5.7 11v2.3L8.2 11"/><path d="M5.4 6h5.2M5.4 8.3h3"/></svg>
         任务中心</a></li>
-      <li><a href="#models" data-view="models">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 1.8 14 5v6L8 14.2 2 11V5z"/><path d="M2 5l6 3.2L14 5M8 8.2v6"/></svg>
+      <li class="nav-h">观测</li>
+      <li class="nav-i"><a href="#usage" data-view="usage">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.6 13.4h10.8"/><path d="M4.9 13.4V8.7M8 13.4V4.4M11.1 13.4v-3.2"/></svg>
+        用量</a></li>
+      <li class="nav-i"><a href="#capacity" data-view="capacity">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.6 13.4h10.8"/><path d="M3.8 10.4l3-3 2.3 2 3.6-4"/><path d="M10.2 5.3h2.6v2.6"/></svg>
+        容量规划</a></li>
+      <li class="nav-i"><a href="#packages" data-view="packages">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="8" cy="5" rx="4.7" ry="2.1"/><path d="M3.3 5v3.3c0 1.2 2.1 2.1 4.7 2.1s4.7-.9 4.7-2.1V5"/><path d="M3.3 8.3v3.3c0 1.2 2.1 2.1 4.7 2.1s4.7-.9 4.7-2.1V8.3"/></svg>
+        积分构成</a></li>
+      <li class="nav-h">配置</li>
+      <li class="nav-i"><a href="#models" data-view="models">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 1.9l5.2 2.9v6.3L8 14.1 2.8 11.1V4.8z"/><path d="M2.8 4.8L8 7.7l5.2-2.9M8 7.7v6.4"/></svg>
         模型与档位</a></li>
-      <li><a href="#config" data-view="config">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.6v1.9M8 12.5v1.9M1.6 8h1.9M12.5 8h1.9M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3"/></svg>
+      <li class="nav-i"><a href="#config" data-view="config">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.6 5.4h10.8M2.6 10.6h10.8"/><circle cx="6" cy="5.4" r="1.7"/><circle cx="10" cy="10.6" r="1.7"/></svg>
         配置</a></li>
-      <li><a href="#logs" data-view="logs">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.5 3.5h11M2.5 8h11M2.5 12.5h7"/></svg>
+      <li class="nav-i"><a href="#logs" data-view="logs">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.2" y="2.9" width="11.6" height="10.2" rx="1.7"/><path d="M5.1 6.4l1.9 1.7-1.9 1.7M8.7 10.1h2.5"/></svg>
         运行日志</a></li>
     </ul>
     <div class="sig">
@@ -1083,14 +1231,14 @@ body.bulk-on { padding-bottom: 88px; }
     <div class="topbar">
       <!-- 汉堡按钮：桌面端由 .nav-btn{display:none} 隐藏，手机端才出现 -->
       <button class="icon ghost nav-btn" id="navBtn" aria-label="打开导航" aria-controls="navDrawer" aria-expanded="false">
-        <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M2.5 4h11M2.5 8h11M2.5 12h11"/></svg>
+        <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" aria-hidden="true"><path d="M2.5 4h11M2.5 8h11M2.5 12h11"/></svg>
       </button>
       <h2 id="ttl">账号池</h2>
       <span class="sep">/</span>
       <span class="meta" id="subMeta">-</span>
       <div class="grow"></div>
       <button class="icon ghost" id="btnTheme" title="切换明暗（跟随系统 → 浅色 → 深色）" aria-label="切换主题">
-        <svg id="icoTheme" viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/></svg>
+        <svg id="icoTheme" viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"><path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/></svg>
       </button>
       <button id="btnRefresh">刷新</button>
       <button class="primary" id="btnAdd">添加账号</button>
@@ -1156,27 +1304,31 @@ body.bulk-on { padding-bottom: 88px; }
           <h3>账号池</h3>
           <span class="grow"></span>
           <span class="note" id="accNote"></span>
-          <!-- 一键剔除被封号（上游 11140 request illegal 等硬禁用）：两段式——先预演
-               出清单+确认框，再按确认过的 uid 真删；凭证不删、归档到 auths-pruned/。
-               人工禁用 / 14017 试用未激活 / 冷却中的号不在命中范围。 -->
-          <button class="xs danger" id="btnPruneBanned" title="剔除因上游封禁（11140 request illegal 等）废掉的账号：出池 + 凭证归档到 auths-pruned/，不影响人工禁用与冷却中的号">剔除封禁号</button>
-          <!-- 一键剔除「凭证已失效」号（401 invalid_token：上游已终止会话、refresh 换不
-               回来，只能重新登录）。这类号不是封禁也不是冷却，任务队列里每个动作都以
-               同一句 401 结束。同样两段式：预演清单 → 确认 → 按 uid 真删；凭证归档到
-               auths-pruned/（不删除）。封禁号 / 人工禁用 / 14017 不在命中范围。 -->
-          <button class="xs danger" id="btnPruneDead" title="剔除凭证已失效（401 invalid_token，上游已终止会话、需重新登录）的账号：出池 + 凭证归档到 auths-pruned/，不影响封禁号、人工禁用与冷却中的号">剔除失效号</button>
-          <button class="xs" id="btnRemarks">备注</button>
-          <button class="xs" id="btnCheckinAll">全部签到</button>
-          <button class="xs" id="btnTravelAll">旅行巡检</button>
-          <button class="xs" id="btnActivityAll">活跃上报</button>
-          <button class="xs" id="btnKeepaliveAll">全部保活</button>
+          <!-- 批量动作按「日常 → 维护 → 危险」分组：高频安全动作靠前；
+               破坏性动作独立到最右，默认中性色、悬停才显红，避免与「备注」同权重并排。
+               顺序变了，但 id 与事件绑定不变（全部按 id 取元素）。 -->
+          <span class="tgroup">
+            <button class="xs" id="btnCheckinAll">全部签到</button>
+            <button class="xs" id="btnKeepaliveAll">全部保活</button>
+            <button class="xs" id="btnActivityAll">活跃上报</button>
+            <button class="xs" id="btnTravelAll">旅行巡检</button>
+          </span>
+          <span class="tsep" aria-hidden="true"></span>
+          <span class="tgroup">
+            <button class="xs" id="btnRemarks">备注</button>
+          </span>
+          <span class="tsep" aria-hidden="true"></span>
+          <span class="tgroup">
+            <button class="xs danger" id="btnPruneBanned" title="剔除因上游封禁（11140 request illegal 等）废掉的账号：出池 + 凭证归档到 auths-pruned/，不影响人工禁用与冷却中的号">剔除封禁号</button>
+            <button class="xs danger" id="btnPruneDead" title="剔除凭证已失效（401 invalid_token，上游已终止会话、需重新登录）的账号：出池 + 凭证归档到 auths-pruned/，不影响封禁号、人工禁用与冷却中的号">剔除失效号</button>
+          </span>
         </header>
         <!-- 工具栏：全部是内存运算（在已有的 overview 快照上过滤/排序/分页），
              不发新请求，也不改 5 秒轮询节奏。 -->
         <div class="acc-tools">
           <div class="row">
             <div class="acc-search" id="accSearch">
-              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="7" cy="7" r="4.4"/><path d="M10.4 10.4L14 14" stroke-linecap="round"/></svg>
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" aria-hidden="true"><circle cx="7" cy="7" r="4.4"/><path d="M10.4 10.4L14 14" stroke-linecap="round"/></svg>
               <input id="accQ" type="search" placeholder="搜索昵称 / uid / 备注 / 标签" autocomplete="off" spellcheck="false" aria-label="搜索账号">
               <button class="clr" id="accQClear" type="button" title="清空搜索" aria-label="清空搜索">×</button>
             </div>
@@ -1208,9 +1360,9 @@ body.bulk-on { padding-bottom: 88px; }
         <div class="tbl-wrap">
         <table class="acc dense">
           <thead><tr>
-            <th class="c-chk"><input type="checkbox" id="accChkAll" title="全选当前页（批量打标签用）" aria-label="全选当前页"></th>
-            <th>账号</th><th>状态</th><th>积分</th>
-            <th>成功 / 失败</th><th>在途</th><th>用量</th><th>最近成功</th><th>导入</th><th class="c-acts"></th>
+            <th scope="col" class="c-chk"><input type="checkbox" id="accChkAll" title="全选当前页（批量打标签用）" aria-label="全选当前页"></th>
+            <th scope="col">账号</th><th scope="col">状态</th><th scope="col">积分</th>
+            <th scope="col">成功 / 失败</th><th scope="col">在途</th><th scope="col">用量</th><th scope="col">最近成功</th><th scope="col">导入</th><th scope="col" class="c-acts"></th>
           </tr></thead>
           <tbody id="accBody"></tbody>
         </table>
@@ -1248,8 +1400,8 @@ body.bulk-on { padding-bottom: 88px; }
         <div class="tbl-wrap">
         <table class="acc">
           <thead><tr>
-            <th>模型</th><th>域</th><th>状态</th><th>可选 / 总数</th>
-            <th>锁定账号</th><th>最早解锁</th><th>全池解锁</th><th>原因</th>
+            <th scope="col">模型</th><th scope="col">域</th><th scope="col">状态</th><th scope="col">可选 / 总数</th>
+            <th scope="col">锁定账号</th><th scope="col">最早解锁</th><th scope="col">全池解锁</th><th scope="col">原因</th>
           </tr></thead>
           <tbody id="mlBody"></tbody>
         </table>
@@ -1275,7 +1427,7 @@ body.bulk-on { padding-bottom: 88px; }
           <span class="note" id="qProgText"></span>
         </div>
         <div class="tc-empty" id="tcEmpty">
-          <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+          <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" aria-hidden="true">
             <rect x="8" y="6" width="24" height="36" rx="3"/>
             <path d="M14 16h12M14 24h12M14 32h7" opacity=".45"/>
             <circle cx="35" cy="33" r="8"/><path d="m40 38 5 5"/>
@@ -1347,7 +1499,7 @@ body.bulk-on { padding-bottom: 88px; }
         </div>
         <div class="tbl-wrap">
         <table class="acc md">
-          <thead><tr><th class="mark" aria-hidden="true"></th><th>模型 / 功能</th><th>积分倍率</th><th>默认档</th><th>支持的思考档位</th><th>上下文长度</th><th>最大输出</th><th>调试</th></tr></thead>
+          <thead><tr><th scope="col" class="mark" aria-hidden="true"></th><th scope="col">模型 / 功能</th><th scope="col">积分倍率</th><th scope="col">默认档</th><th scope="col">支持的思考档位</th><th scope="col">上下文长度</th><th scope="col">最大输出</th><th scope="col">调试</th></tr></thead>
           <tbody id="mdBody"></tbody>
         </table>
         </div>
@@ -1552,11 +1704,11 @@ body.bulk-on { padding-bottom: 88px; }
       </div>
       <div class="box">
         <header><h3>补号情景测算 <span class="hint">含 20% 安全余量</span></h3></header>
-        <div class="tbl-wrap"><table class="acc zebra"><thead><tr><th>窗口</th><th>情景</th><th>积分缺口</th><th>需补账号</th><th>可用余额</th><th>假设补给</th></tr></thead><tbody id="capForecastBody"></tbody></table></div>
+        <div class="tbl-wrap"><table class="acc zebra"><thead><tr><th scope="col">窗口</th><th scope="col">情景</th><th scope="col">积分缺口</th><th scope="col">需补账号</th><th scope="col">可用余额</th><th scope="col">假设补给</th></tr></thead><tbody id="capForecastBody"></tbody></table></div>
       </div>
       <div class="box">
         <header><h3>模型健康 <span class="hint">逻辑请求口径 · 近 6 小时用于识别恢复</span></h3></header>
-        <div class="tbl-wrap"><table class="acc zebra"><thead><tr><th>模型</th><th>请求</th><th>成功率</th><th>近 6h 成功率</th><th>Credits</th><th>400 / 429 / 503</th></tr></thead><tbody id="capModelsBody"></tbody></table></div>
+        <div class="tbl-wrap"><table class="acc zebra"><thead><tr><th scope="col">模型</th><th scope="col">请求</th><th scope="col">成功率</th><th scope="col">近 6h 成功率</th><th scope="col">Credits</th><th scope="col">400 / 429 / 503</th></tr></thead><tbody id="capModelsBody"></tbody></table></div>
       </div>
       <div class="box"><header><h3>口径与限制</h3></header><div class="pad cap-method" id="capMethod"></div></div>
     </section>
@@ -1823,9 +1975,9 @@ body.bulk-on { padding-bottom: 88px; }
         <div class="tbl-wrap req-wrap">
           <table class="acc req">
             <thead><tr>
-              <th>时间</th><th>结果</th><th>模型</th><th>账号</th>
-              <th>来源 → 出口 IP</th><th>User-Agent</th>
-              <th class="num">耗时</th><th class="num">Token</th><th class="num">积分</th><th>请求 ID</th>
+              <th scope="col">时间</th><th scope="col">结果</th><th scope="col">模型</th><th scope="col">账号</th>
+              <th scope="col">来源 → 出口 IP</th><th scope="col">User-Agent</th>
+              <th scope="col" class="num">耗时</th><th scope="col" class="num">Token</th><th scope="col" class="num">积分</th><th scope="col">请求 ID</th>
             </tr></thead>
             <tbody id="reqBody"></tbody>
           </table>
@@ -1866,7 +2018,7 @@ body.bulk-on { padding-bottom: 88px; }
         <div class="tbl-wrap">
           <table class="acc">
             <thead><tr>
-              <th>时间</th><th>账号</th><th class="num">变动</th><th class="num">变动后余额</th><th>说明</th>
+              <th scope="col">时间</th><th scope="col">账号</th><th scope="col" class="num">变动</th><th scope="col" class="num">变动后余额</th><th scope="col">说明</th>
             </tr></thead>
             <tbody id="creditBody"></tbody>
           </table>
@@ -1890,7 +2042,7 @@ body.bulk-on { padding-bottom: 88px; }
       <div class="state" id="taskState"><span class="dots">加载中</span></div>
       <div class="tbl-wrap">
         <table class="acc md" id="taskTable" hidden>
-          <thead><tr><th class="mark" aria-hidden="true"></th><th>任务</th><th>进度</th><th>奖励</th><th>状态</th><th class="c-acts"></th></tr></thead>
+          <thead><tr><th scope="col" class="mark" aria-hidden="true"></th><th scope="col">任务</th><th scope="col">进度</th><th scope="col">奖励</th><th scope="col">状态</th><th scope="col" class="c-acts"></th></tr></thead>
           <tbody id="taskBody"></tbody>
         </table>
       </div>

@@ -725,6 +725,7 @@ function accSepHtml(n) {
      顺序变化  → insertBefore 移动节点（保留节点身份，滚动/选中/tooltip 都不受影响）。
    行内按钮走 accBody 的事件委托 + data-u，所以重建单行不会丢事件绑定。 */
 function renderAccounts(list) {
+  linkStatFilters();
   const tb = $('accBody');
   if (!tb) return;
   const all = list || [];
@@ -760,7 +761,9 @@ function renderAccounts(list) {
       ? '<tr><td colspan="10"><div class="empty"><div class="big">没有匹配的账号</div>' +
         esc(accFilterHint()) + '，' +
         '<button class="xs ghost" data-filter="all">清除全部筛选</button></div></td></tr>'
-      : '<tr><td colspan="10"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+      : '<tr><td colspan="10"><div class="empty"><div class="big">账号池是空的</div>' +
+        '用浏览器登录一个 WorkBuddy 账号即可开始：' +
+        '<div class="empty-act"><button class="xs primary" data-add-acc="1">添加账号</button></div></div></td></tr>';
     applyFolds();
     return;
   }
@@ -957,6 +960,73 @@ function fmtCredPair(rem, tot) {
   return String(Math.round(rem)) + '/' + String(Math.round(tot));
 }
 
+/* markZeroStats 把「值为 0」的 KPI 卡片标成 .zero，交给 CSS 收回语义色。
+   为什么不在模板里写死类名：.good/.warn/.bad 是**指标性质**（可用/冷却/禁用），
+   与**当前值**无关；满屏 0 时三种颜色同时出现，视觉噪声盖过了「池子是空的」这个
+   唯一有效信息。N 个账号时不染色，0 个账号时才需要一眼看出全空。 */
+function markZeroStats() {
+  ['sTotal', 'sHealthy', 'sCooling', 'sDisabled', 'sPaused', 'sCredits', 'sSticky'].forEach((id) => {
+    const el = $(id);
+    if (!el) return;
+    const tile = el.closest('.stat');
+    if (!tile) return;
+    const raw = (el.textContent || '').trim();
+    // 支持 "0"、"0/0"、"0K/0K"、以及未知的 "-"（未知同样不该染色）
+    const parts = raw.split('/').map((x) => x.replace(/[^\d.]/g, '')).filter(Boolean);
+    const allZero = raw === '-' || (parts.length > 0 && parts.every((x) => Number(x) === 0));
+    tile.classList.toggle('zero', allZero);
+  });
+}
+
+/* linkStatFilters 让「账号总数/可用/冷却中/已禁用」四个 KPI 变成筛选入口。
+   为什么值得做：这四张卡是页面上最大的数字，此前只能看不能点；而下面的状态
+   chips 是 11px 小字。把「看到异常 → 定位到那几行」压成一次点击。
+   不联动积分/粘性会话：那两个没有对应筛选维度，可点了没反应更糟。 */
+const STAT_FILTER = { sTotal: 'all', sHealthy: 'all', sCooling: 'cool', sDisabled: 'off' };
+function linkStatFilters() {
+  Object.keys(STAT_FILTER).forEach((id) => {
+    const v = $(id);
+    if (!v) return;
+    const tile = v.closest('.stat');
+    if (!tile) return;
+    const want = STAT_FILTER[id];
+    if (!tile.dataset.linked) {
+      tile.dataset.linked = '1';
+      tile.classList.add('linked');
+      tile.setAttribute('role', 'button');
+      tile.setAttribute('tabindex', '0');
+      tile.title = want === 'all' ? '点击查看全部账号'
+        : want === 'cool' ? '点击只看冷却中的账号' : '点击只看已禁用的账号';
+      const go = () => setAccFilter(accFilter === want ? 'all' : want);
+      tile.addEventListener('click', go);
+      tile.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); }
+      });
+    }
+    tile.classList.toggle('on', want !== 'all' && accFilter === want);
+    tile.setAttribute('aria-pressed', want !== 'all' && accFilter === want ? 'true' : 'false');
+  });
+}
+
+/* foldEmptyCards 空的「积分到期提醒」卡片会白占近 200px 首屏——它比下面的账号表
+   还显眼，却一条数据都没有。expList 有三处渲染路径（overview 快照 / 逐包明细 /
+   查询中），逐个打补丁容易漏，改为监听容器内容：只剩 .empty 占位时就给卡片挂
+   .is-empty，由 CSS 把内容区收起，只留标题行。 */
+function foldEmptyCards() {
+  const pairs = [['expList', 'expBox']];
+  pairs.forEach(([listId, boxId]) => {
+    const list = $(listId), box = $(boxId);
+    if (!list || !box) return;
+    const sync = () => {
+      const kids = list.children;
+      const onlyEmpty = kids.length === 1 && kids[0].classList.contains('empty');
+      box.classList.toggle('is-empty', kids.length === 0 || onlyEmpty);
+    };
+    sync();
+    new MutationObserver(sync).observe(list, { childList: true });
+  });
+}
+
 /* loadOverview(quiet, metricsOnly)
    quiet       — 失败不弹 toast（轮询/切视图用）。
    metricsOnly — 只更新顶部与统计量，跳过账号表 / 模型锁池 / 到期卡的重建。用量页
@@ -993,6 +1063,8 @@ async function loadOverview(quiet, metricsOnly) {
     $('sCredits').textContent = totSum > 0 ? fmtCredPair(remSum, totSum) : fmtCredShort(remSum);
     $('sCredits').parentNode.title = '剩余 ' + remSum + ' / 总额 ' + totSum;
     $('sSticky').textContent = d.sticky_sessions;
+    markZeroStats();
+    if (!foldEmptyCards._done) { foldEmptyCards._done = 1; foldEmptyCards(); }
     // 缓存命中率 / 粘性命中率：分母为 0 时显示 "-"（不是 0%——0% 会被误读成
     // "缓存完全不工作"，而实际只是还没有带 cache 维度的请求）。
     const cm = d.cache || {};
@@ -1383,8 +1455,8 @@ function mdRowHtml(m, pr) {
   const typeNames = { chat: '聊天', image: '图片', video: '视频', search: '搜索', fetch: '抓取' };
   caps.push('<span class="tag ok">' + esc(typeNames[type] || type) + '</span>');
   if (m.is_default) caps.push('<span class="tag ok">默认</span>');
-  if (m.supports_tool_call) caps.push('<span class="tag warn">工具</span>');
-  if (m.supports_images && type === 'chat') caps.push('<span class="tag warn">视觉</span>');
+  if (m.supports_tool_call) caps.push('<span class="tag mute">工具</span>');
+  if (m.supports_images && type === 'chat') caps.push('<span class="tag mute">视觉</span>');
   if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag warn">思考常开</span>');
   const capHtml = '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>';
   const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
@@ -2098,6 +2170,15 @@ $('cfgForm').onsubmit = async ev => {
 };
 
 /* ── 添加账号 ─────────────────────────────────────────────────────── */
+/* 空态里的「添加账号」按钮由 innerHTML 重建，绑定会丢，统一走一次委托。
+   CSP 是 script-src 'self'，所以不能用 onclick 属性。 */
+document.addEventListener('click', (e) => {
+  const b = e.target.closest && e.target.closest('[data-add-acc]');
+  if (!b) return;
+  e.preventDefault();
+  openAdd();
+});
+
 function openAdd() {
   $('addVeil').classList.add('on');
   // 重置到登录标签
@@ -2277,7 +2358,7 @@ function renderCompensation(d) {
     return '<div class="comp-row"><span>' + name + '</span>' +
       (done
         ? '<span class="tag ok">已领取</span>'
-        : '<span class="tag warn">待领取</span>' +
+        : '<span class="tag ok">待领取</span>' +
           '<span class="tag' + (dl.urgent ? ' bad' : ' mute') + '">' + esc(dl.text) + '</span>') +
       '<span class="tag mute">' + esc(fmtTok(s.credit_num || 0)) + ' 积分</span>' +
       (done ? '' : '<button class="xs" data-comp-uid="' + esc(r.uid) + '">领取</button>') +
@@ -2507,7 +2588,7 @@ async function loadTasks() {
       if (t.reward_buddy) parts.push('Buddy');
       const reward = parts.length ? parts.join(' ') : '—';
       const badge = t.claimed ? '<span class="tag ok">已领取</span>'
-        : t.claimable ? '<span class="tag warn">可领取</span>'
+        : t.claimable ? '<span class="tag ok">可领取</span>'
         : t.locked ? '<span class="tag mute">未解锁</span>'
         : t.accept_status === 'accepted' ? '<span class="tag mute">进行中</span>'
         : '<span class="tag mute">未接受</span>';
@@ -2884,7 +2965,7 @@ function qrowHTML(it) {
   const title = isSchool ? '开学季闭环' : (GROWTH_TITLES[it.code] || it.code);
   const dotCls = it.status === 'scan' ? 'wait' : it.status === 'running' ? 'run' : it.status === 'error' ? 'err' : (it.status === 'skipped' || it.status === 'blocked') ? 'skip' : it.status === 'done' ? 'done' : 'wait';
   const stWord = it.status === 'scan' ? '待执行' : (ST_WORDS[it.status] || it.status);
-  const tags = (it.isNew ? '<span class="tag warn">新</span>' : '') +
+  const tags = (it.isNew ? '<span class="tag new">新</span>' : '') +
     (it.auto === false ? '<span class="tag mute">未适配</span>' : '');
   return '<div class="qrow" title="' + esc(it.message || '') + '">' +
     '<span class="code">' + esc(it.code) + '</span>' +
@@ -3093,13 +3174,13 @@ function usSortRows(rows, sort) {
 
 function usDimHead(dim) {
   const m = US_DIMS[dim] || US_DIMS.account;
-  return '<tr><th class="mark" aria-hidden="true"></th><th>' + esc(m.title) + '</th>' +
-    (m.withRealm ? '<th>域</th>' : '') +
-    '<th class="num">请求</th><th class="num">失败</th>' +
-    '<th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>' +
-    '<th class="num">缓存命中</th>' +
-    '<th class="num">工具跳过</th>' +
-    (m.withPerf ? '<th class="num">均延迟</th><th class="num">均速率</th>' : '') +
+  return '<tr><th scope="col" class="mark" aria-hidden="true"></th><th scope="col">' + esc(m.title) + '</th>' +
+    (m.withRealm ? '<th scope="col">域</th>' : '') +
+    '<th scope="col" class="num">请求</th><th scope="col" class="num">失败</th>' +
+    '<th scope="col" class="num">Prompt</th><th scope="col" class="num">Completion</th><th scope="col" class="num">合计</th>' +
+    '<th scope="col" class="num">缓存命中</th>' +
+    '<th scope="col" class="num">工具跳过</th>' +
+    (m.withPerf ? '<th scope="col" class="num">均延迟</th><th scope="col" class="num">均速率</th>' : '') +
     '</tr>';
 }
 
@@ -3141,12 +3222,12 @@ function renderUsageDim() {
 /* 积分扣除：按账号 / 按模型两个维度共用一张表（同上，两个 box 合成一个）。 */
 function usCreditHead(dim) {
   return dim === 'model'
-    ? '<tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th>' +
-      '<th class="num">请求</th><th class="num">扣除积分</th>' +
-      '<th class="num">有效样本 Token</th><th class="num">积分 / 1M Token</th><th class="num">缓存命中率</th></tr>'
-    : '<tr><th class="mark" aria-hidden="true"></th><th>账号</th>' +
-      '<th class="num">请求</th><th class="num">扣除积分</th>' +
-      '<th class="num">有效样本 Token</th><th class="num">积分 / 1M Token</th><th class="num">缓存命中率</th></tr>';
+    ? '<tr><th scope="col" class="mark" aria-hidden="true"></th><th scope="col">模型</th><th scope="col">积分倍率</th>' +
+      '<th scope="col" class="num">请求</th><th scope="col" class="num">扣除积分</th>' +
+      '<th scope="col" class="num">有效样本 Token</th><th scope="col" class="num">积分 / 1M Token</th><th scope="col" class="num">缓存命中率</th></tr>'
+    : '<tr><th scope="col" class="mark" aria-hidden="true"></th><th scope="col">账号</th>' +
+      '<th scope="col" class="num">请求</th><th scope="col" class="num">扣除积分</th>' +
+      '<th scope="col" class="num">有效样本 Token</th><th scope="col" class="num">积分 / 1M Token</th><th scope="col" class="num">缓存命中率</th></tr>';
 }
 
 /* 缓存命中率（issue #92）：颜色即健康度——≥90% 绿 / 80–90% 黄 / <80% 红，
@@ -4173,9 +4254,9 @@ function renderPackages(d, detailLimit) {
       ' · 默认展示最早到期 ' + pkDetailLimitValue(detailLimit) + ' 条（' +
       esc(PK_SORT_LABELS[pkSortMode] || '') + '）</span>' +
       '</header><div class="tbl-wrap"><table class="acc"><thead><tr>' +
-      '<th class="mark" aria-hidden="true"></th><th>包名 / 来源</th>' +
-      '<th class="num">面额</th><th class="num">剩余</th><th class="num">已用</th>' +
-      '<th class="num">发放</th><th class="num">到期</th>' +
+      '<th scope="col" class="mark" aria-hidden="true"></th><th scope="col">包名 / 来源</th>' +
+      '<th scope="col" class="num">面额</th><th scope="col" class="num">剩余</th><th scope="col" class="num">已用</th>' +
+      '<th scope="col" class="num">发放</th><th scope="col" class="num">到期</th>' +
       '</tr></thead><tbody>' + rows + restSummary + usedSummary + '</tbody></table></div></div>';
   }).join('');
 }
