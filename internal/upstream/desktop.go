@@ -26,11 +26,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -98,6 +101,34 @@ func desktopFingerprint(a *auth.Auth) map[string]any {
 	}
 }
 
+// reportPartialRe 匹配上游 events 批上报的「部分成功」文案：
+//
+//	"partial success: kept=4 events, dropped=1 events by format validation"
+//
+// 只认这条固定文案 + 两个数字，**不解析整段 JSON**：doJSON 会把 body 截到 200
+// 字符（data/requestId/traceId 挤在一起），`invalidIndices` 段经常正好被截断，
+// 靠 JSON 解析不可靠；文案里的 kept/dropped 在开头，永远完整。
+var reportPartialRe = regexp.MustCompile(`partial success: kept=(\d+) events, dropped=(\d+) events`)
+
+// reportPartialSuccess 判定 err 是否属于「部分成功」，返回 kept/dropped。
+//
+// 上游自 2026-11-10 起对 /v2/report 的 events 做**逐条 schema 校验**：不合规的
+// 条目单独丢弃、其余照常入库，但整批仍回 HTTP 400 + code=10001。语义上这不是
+// 失败——把整单当失败会让补给白退避 45m，且重复补报已入库的条目。
+func reportPartialSuccess(err error) (kept, dropped int, ok bool) {
+	var ue *Error
+	if !errors.As(err, &ue) || ue.Status != http.StatusBadRequest {
+		return 0, 0, false
+	}
+	m := reportPartialRe.FindStringSubmatch(ue.Msg)
+	if m == nil {
+		return 0, 0, false
+	}
+	kept, _ = strconv.Atoi(m[1])
+	dropped, _ = strconv.Atoi(m[2])
+	return kept, dropped, true
+}
+
 // ReportDesktopEvent 以桌面客户端指纹向 copilot.tencent.com/v2/report 批量上报事件。
 // events 为业务载荷（eventCode 等字段由调用方给出）；公共指纹自动注入，
 // 业务字段优先（可用于覆盖 qimei36/machineId 等设备标识做真实设备对齐）。
@@ -138,6 +169,16 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 		req.Header.Set("X-User-Id", a.UID)
 	}
 	_, err = c.doJSON(a, req)
+	// events 批上报的「部分成功」不是失败：kept>0 说明剩余条目已经入库（事件是
+	// 追加写入，重复补报无益）。放行并留一行日志；kept==0 才是整批被拒，仍按
+	// 错误上抛给调用方。
+	// 注意这**不保证判据事件命中**——丢哪条由上游 schema 决定，调用方要确认进度
+	// 只能回读任务（autotask 的 runAction 本来就做回读验证）。
+	if kept, dropped, ok := reportPartialSuccess(err); ok && kept > 0 {
+		log.Printf("upstream: desktop report 部分成功 kept=%d dropped=%d（已入库，按成功处理）: %v",
+			kept, dropped, err)
+		return nil
+	}
 	return err
 }
 
@@ -258,7 +299,13 @@ func DesktopBuddyAppSequence(buddyID, buddyName string) []DesktopEvent {
 	return []DesktopEvent{
 		mk("buddyapp_discover_click", nil),
 		mk("buddyapp_show", map[string]any{"elementId": buddyID, "elementName": buddyName, "position": 2}),
-		mk("buddyapp_enter_click", map[string]any{"elementId": buddyID, "elementName": buddyName, "position": 2, "isFirstPage": "1"}),
+		// isFirstPage 必须是**布尔**：客户端源码
+		// reportBuddyAppEnterClick(c, {...r, position: t, isFirstPage: toBuddyAppFirstEnter(e)})，
+		// 而 toBuddyAppFirstEnter = e => !e（返回 bool）；另一处调用点直接写 isFirstPage: !1。
+		// 早期这里发字符串 "1"，2026-11-10 起上游按 schema 逐条校验 events，
+		// 该条被判格式不合法丢弃（400 code=10001 "partial success: kept=4 events,
+		// dropped=1 events", invalidIndices:[2]），Buddy_App 因此恒不点亮。
+		mk("buddyapp_enter_click", map[string]any{"elementId": buddyID, "elementName": buddyName, "position": 2, "isFirstPage": true}),
 		mk("buddyapp_auth_confirm_click", map[string]any{"elementId": buddyID, "elementName": buddyName}),
 		mk("buddyapp_bindaccount_skip_click", map[string]any{"elementId": buddyID, "elementName": buddyName}),
 	}

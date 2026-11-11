@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -95,6 +96,37 @@ func TestDesktopChatSequenceShape(t *testing.T) {
 	}
 }
 
+// TestDesktopBuddyAppSequenceShape 断言 buddyapp 五连事件形状。
+//
+// isFirstPage 的**类型**是硬契约：上游 2026-11-10 起按 schema 逐条校验 /v2/report
+// 的 events，字符串 "1" 会被判格式不合法单独丢弃，整批回 400 code=10001
+// "partial success: kept=4 dropped=1, invalidIndices:[2]" —— 现象是 Buddy_App 恒不点亮。
+// 客户端源码里该字段由 toBuddyAppFirstEnter(= e => !e) 产出，即 bool。
+func TestDesktopBuddyAppSequenceShape(t *testing.T) {
+	events := DesktopBuddyAppSequence("cb_x", "企鹅教师助手")
+	wantCodes := []string{
+		"buddyapp_discover_click", "buddyapp_show", "buddyapp_enter_click",
+		"buddyapp_auth_confirm_click", "buddyapp_bindaccount_skip_click",
+	}
+	if len(events) != len(wantCodes) {
+		t.Fatalf("events=%d want %d", len(events), len(wantCodes))
+	}
+	for i, want := range wantCodes {
+		if events[i]["eventCode"] != want {
+			t.Errorf("events[%d].eventCode=%v want %v", i, events[i]["eventCode"], want)
+		}
+	}
+	enter := events[2]
+	if v, ok := enter["isFirstPage"].(bool); !ok {
+		t.Fatalf("buddyapp_enter_click.isFirstPage=%#v want bool（字符串会被上游 format validation 丢弃）", enter["isFirstPage"])
+	} else if v != true {
+		t.Errorf("isFirstPage=%v want true", v)
+	}
+	if _, ok := enter["position"].(int); !ok {
+		t.Errorf("position=%#v want int", enter["position"])
+	}
+}
+
 // TestSetAppearanceTheme 断言主题设置端点形状（点亮 Hp_Appearance 的 API）。
 func TestSetAppearanceTheme(t *testing.T) {
 	var got map[string]any
@@ -157,5 +189,44 @@ func TestMarketExpertSearchUsesKeyword(t *testing.T) {
 	}
 	if len(experts) != 1 || experts[0].ExpertID != "ex_xQHHD1u5Jkua" {
 		t.Errorf("experts=%+v want Valorant expert", experts)
+	}
+}
+
+// TestReportDesktopEventPartialSuccess 断言 events 批上报的「部分成功」语义：
+// 上游逐条 schema 校验后 kept>0、整批仍回 400 code=10001 —— 数据已入库，
+// 不许当失败（否则补给白退避 45m 并重复补报）。
+func TestReportDesktopEventPartialSuccess(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"code":10001,"msg":"partial success: kept=4 events, dropped=1 events by format validation","requestId":"r1","data":{"dropped":1,"invalidIndices":[2],"kept":4}}`))
+	}))
+	defer srv.Close()
+
+	c := &Client{HTTP: srv.Client(), ChatBaseCN: srv.URL}
+	err := c.ReportDesktopEvent(&auth.Auth{AccessToken: "at", UID: "u-dt"},
+		DesktopEvent{"eventCode": "a"}, DesktopEvent{"eventCode": "b"})
+	if err != nil {
+		t.Fatalf("kept>0 的部分成功应放行，得到错误: %v", err)
+	}
+}
+
+// TestReportDesktopEventAllDroppedIsError 断言整批被拒（kept=0）仍是错误：
+// 一条都没入库，调用方必须能重试，不能被「partial success」文案一起放过。
+func TestReportDesktopEventAllDroppedIsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"code":10001,"msg":"partial success: kept=0 events, dropped=2 events by format validation","data":{"dropped":2,"invalidIndices":[0,1],"kept":0}}`))
+	}))
+	defer srv.Close()
+
+	c := &Client{HTTP: srv.Client(), ChatBaseCN: srv.URL}
+	err := c.ReportDesktopEvent(&auth.Auth{AccessToken: "at", UID: "u-dt"},
+		DesktopEvent{"eventCode": "a"}, DesktopEvent{"eventCode": "b"})
+	if err == nil {
+		t.Fatal("kept=0 必须返回错误")
+	}
+	var ue *Error
+	if !errors.As(err, &ue) || ue.Kind != ErrClient {
+		t.Fatalf("err=%v want *Error(ErrClient)", err)
 	}
 }
