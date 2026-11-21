@@ -34,6 +34,8 @@ docs/
 # 设计/计划文档（但 README.md 必须进版本库）
 *.md
 !README.md
+# 部署单元的说明书属于运维必需，随单元一起进库
+!deploy/login-remote/README.md
 
 # Windows binaries
 /wb2api.exe
@@ -53,3 +55,6 @@ scripts/package-lock.json
 # 本地编译产物 / 工具目录
 /server
 /.workbuddy/
+
+# Python 虚拟环境（deploy/login-remote 本地验证用，由 uv 生成）
+.venv/

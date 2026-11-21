@@ -171,6 +171,16 @@ func main() {
 		log.Fatalf("egress config: %v", err)
 	}
 	eg := egress.New(egressCfg)
+	// 出口租约：登录时写、启动时读回。放在 SetEgress 之前，首个请求就能用上。
+	leasePath := stateSibling(cfg.StateFile, "egress_leases.json")
+	if leases, lerr := egress.LoadLeaseFile(leasePath); lerr != nil {
+		log.Printf("[egress] 租约文件读取失败（按无租约启动）：%v", lerr)
+	} else if len(leases) > 0 {
+		if serr := eg.SetLeases(leases); serr != nil {
+			log.Printf("[egress] 租约部分无效：%v", serr)
+		}
+		log.Printf("[egress] 已加载 %d 条出口租约（登录即固定，优先于哈希）", eg.LeaseCount())
+	}
 	up.SetEgress(eg)
 	// 面板/状态接口的「出口」列：把 upstream 的出口解析器接进 pool（只读透出，不参与选号）。
 	// 不接也不会报错——只是 /status 里没有 egress 字段、面板那行不显示。
@@ -374,6 +384,18 @@ func main() {
 		ConfigPath: *cfgPath,
 		// 任务目录（发现新任务）：与 state 同目录，重启不丢。
 		CatalogFile: stateSibling(cfg.StateFile, "task_catalog.json"),
+		// 远程浏览器 sidecar（deploy/login-remote）：只在需要「服务器 IP 上完成
+		// OAuth 登录」时配置（账号有 IP 风控的场景）。未配置则相关入口返回 501，
+		// 普通「复制链接登录」不受影响。用 env 而非 config.json：属部署期固定
+		// 拓扑，改了要重建容器，放进热改配置只会误导。
+		LoginRemoteURL:   os.Getenv("WB2API_LOGIN_REMOTE_URL"),
+		LoginRemoteToken: os.Getenv("WB2API_LOGIN_REMOTE_TOKEN"),
+		// 远程浏览器重登老号时按槽位绑源 IP（egress.mode=local）。
+		Egress: eg,
+		// 新号登录按 IP 顺序轮转的游标：与 state 同目录，重启不回到第一个出口。
+		LoginIPCursorFile: stateSibling(cfg.StateFile, "login_ip_cursor.json"),
+		// 出口租约：登录成功写入该 uid 的固定出口，重启读回。
+		EgressLeaseFile: leasePath,
 		LoadConfig: func() (any, error) {
 			return Load(*cfgPath)
 		},

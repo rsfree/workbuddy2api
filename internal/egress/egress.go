@@ -33,6 +33,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -192,7 +193,16 @@ type Resolver struct {
 
 	mu   sync.Mutex
 	fail map[string]*failState
+
+	// leases 显式出口租约（uid → 源地址），优先于哈希。
+	// 用「整体替换 + 原子读」而不是锁 map：bindFor 是每请求热路径，
+	// 读路径必须零锁。写只在登录成功/运维操作时发生。
+	leases  atomic.Pointer[leaseTable]
+	leaseMu sync.Mutex // 串行化写入（读不加锁）
 }
+
+// leaseTable 租约快照（只读共享，写入时整体复制）。
+type leaseTable map[string]net.IP
 
 type failState struct {
 	consecutive int
@@ -411,6 +421,17 @@ func (r *Resolver) bindFor(b Binding, uid, nickname, authGroup string) (Binding,
 		n := len(r.localIPs)
 		if n == 0 {
 			return b, ErrNoLocalIP
+		}
+		// 显式租约优先：账号一旦租用了某个出口，登录 IP 与使用 IP 才可能真正一致。
+		// 冷却期仍然顺延（坏出口不能被租约钉死），恢复后自动回到租约地址。
+		if ip, ok := r.LeaseOf(uid); ok {
+			r.mu.Lock()
+			cooling := r.coolingLocked("local|"+ip.String(), time.Now())
+			r.mu.Unlock()
+			if !cooling {
+				b.LocalIP = ip
+				return b, nil
+			}
 		}
 		start := r.LocalSlot(uid, nickname, authGroup)
 		// 出口冷却顺延：首选地址连续失败后，先借下一个地址顶上，避免整个账号

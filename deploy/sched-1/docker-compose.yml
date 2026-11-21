@@ -26,6 +26,10 @@ services:
     user: "${PUID:-10001}:${PGID:-10001}"
     environment:
       - TZ=Asia/Shanghai
+      # 远程浏览器（服务器 IP 上完成 OAuth 登录）：启用前先按 README 起 login-remote。
+      # 不启用时留空 —— 面板的「在服务器浏览器中登录」入口会自动隐藏。
+      # - WB2API_LOGIN_REMOTE_URL=http://127.0.0.1:8099
+      # - WB2API_LOGIN_REMOTE_TOKEN=${WB2API_LOGIN_REMOTE_TOKEN}
     # 🔴 host 网络下不能再用 ports 映射；对外只经 nginx，程序监听 127.0.0.1:39017
     # （config.json 的 "listen": "127.0.0.1:39017"），nginx 的 proxy_pass 保持不变。
     volumes:
@@ -36,3 +40,30 @@ services:
       # 但前提是它能以文件形式写入 —— 挂载目录会挡住这条路径）。
       # 不挂 :ro：面板「配置」页需要写回此文件（保存后热生效）。
       - ./config.json:/app/config.json
+
+  # 远程浏览器 sidecar（可选，默认不启动）：
+  #   1) 在服务器目录下准备 .env：WB2API_LOGIN_REMOTE_TOKEN=<随机串>
+  #   2) docker compose --profile login-remote up -d login-remote
+  #   3) 主服务 environment 取消两行注释后 docker compose up -d wb2api
+  #
+  # 为什么 host 网络：主服务本身是 host（egress 要枚举 32 个公网 IP 做出口隔离），
+  # 这里跟它同栈最省事；HOST=127.0.0.1 保证只有本机能调，不额外暴露端口。
+  # 🔴 已知边界：浏览器走宿主机默认路由，登录绑定的 IP 是默认出口那一个，
+  #    不是该账号入池后按 uid 哈希分配的那个。要求强一致时需另做源地址绑定。
+  login-remote:
+    profiles: ["login-remote"]
+    # 镜像由 .github/workflows/login-remote-ghcr.yml 构建（仅 amd64）。
+    # 首次启用前先在 Actions 里手动触发一次该 workflow；回滚用 sha-xxxxxxx tag。
+    image: ghcr.io/rsfree/workbuddy2api-login-remote:latest
+    container_name: workbuddy2api-login-remote
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - TZ=Asia/Shanghai
+      - HOST=127.0.0.1
+      - PORT=8099
+      - REMOTE_TOKEN=${WB2API_LOGIN_REMOTE_TOKEN:-}
+      - LOGIN_HOME=https://www.codebuddy.cn
+    shm_size: 1gb
+    security_opt:
+      - no-new-privileges:true

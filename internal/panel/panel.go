@@ -24,6 +24,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/egress"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -83,6 +84,25 @@ type Config struct {
 	// CatalogFile 任务目录文件（taskcatalog.go）：记录上游下发过的任务码，用于
 	// 「发现新任务」。空 = 纯内存（测试场景），不落盘。
 	CatalogFile string
+
+	// LoginRemoteURL 远程浏览器 sidecar 基址（deploy/login-remote），
+	// 如 http://workbuddy2api-login-remote:8099。空 = 未启用（/remote/* 返回 501）。
+	// 只用于「服务器 IP 上完成 OAuth 登录」这一条路：凭据仍由 loginPoll 取回。
+	LoginRemoteURL string
+	// LoginRemoteToken sidecar 共享 token（compose 环境变量 REMOTE_TOKEN 对齐）。
+	LoginRemoteToken string
+
+	// Egress 出口策略（只读使用）：远程浏览器重登老号时，用该账号的槽位源 IP
+	// 出站，避免「重登换出口」。nil 或非 local 模式 = 只能走默认出口。
+	Egress *egress.Resolver
+
+	// LoginIPCursorFile 新号登录出口轮转游标的落盘路径（egress local 生效时）。
+	// 空 = 只存内存（重启从第一个 IP 重来）。
+	LoginIPCursorFile string
+
+	// EgressLeaseFile 出口租约落盘路径。登录成功时把「本次登录用的源 IP」
+	// 写成该 uid 的租约，重启后由 main 读回 —— 保证「登录 IP = 使用 IP」不回退。
+	EgressLeaseFile string
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -97,6 +117,18 @@ type Panel struct {
 	// poll 成功或超时（loginTTL）后剔除；面板常驻进程，容量天然有界。
 	loginMu sync.Mutex
 	logins  map[string]loginSession
+
+	// remoteMu/remoteTickets 远程浏览器的一次性 WS ticket（remote_login.go）。
+	// 与 logins 分开：ticket 生命周期以秒计，state 以分钟计。
+	remoteMu      sync.Mutex
+	remoteTickets map[string]remoteTicket
+
+	// loginIPMu/loginIPCursor 新号登录出口的轮转游标（login_ip.go）。
+	loginIPMu     sync.Mutex
+	loginIPCursor int
+
+	// leaseFileMu 串行化租约文件写入（内存表由 egress 的 leaseMu 保护）。
+	leaseFileMu sync.Mutex
 
 	// taskMu/taskLocks 一键完成任务的 per-account 互斥：同一账号的任务动作
 	// （单任务 / 全量）同时只允许一条在跑。重复点击直接返回 409"仍在执行"，
@@ -176,6 +208,9 @@ const loginTTL = 15 * time.Minute
 type loginSession struct {
 	created time.Time
 	realm   string // "cn" / "global"，缺省 cn
+	// sourceIP 本次登录实际使用的源地址（远程浏览器重登时由 egress 槽位决定）。
+	// poll 用它和入池槽位对比，不一致就在结果里提醒。
+	sourceIP string
 }
 
 // New 构建面板。
@@ -190,6 +225,7 @@ func New(cfg Config) *Panel {
 		logs:    NewRing(500),
 		logins:  map[string]loginSession{},
 	}
+	p.loadLoginIPCursor() // 新号登录出口轮转的起点（与 state 同目录持久化）
 	p.routes()
 	return p
 }
@@ -212,6 +248,13 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
+	p.mux.HandleFunc("GET /panel/api/login/remote/status", p.withAuth(p.loginRemoteStatus))
+	p.mux.HandleFunc("POST /panel/api/login/remote/start", p.withAuth(p.loginRemoteStart))
+	p.mux.HandleFunc("POST /panel/api/login/remote/ticket", p.withAuth(p.loginRemoteTicket))
+	p.mux.HandleFunc("POST /panel/api/login/remote/stop", p.withAuth(p.loginRemoteStop))
+	// WS 不走 withAuth：浏览器无法给 WebSocket 加 Authorization 头。门槛是
+	// start 下发的一次性 ticket（60s），见 remote_login.go。
+	p.mux.HandleFunc("GET /panel/api/login/remote/ws", p.loginRemoteWS)
 	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.withAuth(p.importCockpit))
 	p.mux.HandleFunc("GET /panel/api/onboard", p.withAuth(p.onboardStatus))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))

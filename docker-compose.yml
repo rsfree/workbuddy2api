@@ -13,6 +13,10 @@ services:
     user: "${PUID:-10001}:${PGID:-10001}"
     environment:
       - TZ=Asia/Shanghai
+      # 远程浏览器（服务器 IP 上完成 OAuth 登录）。置空即关闭，面板入口自动隐藏。
+      # sidecar 在同 compose 网络内按服务名解析，不对外暴露端口。
+      - WB2API_LOGIN_REMOTE_URL=http://login-remote:8099
+      - WB2API_LOGIN_REMOTE_TOKEN=${WB2API_LOGIN_REMOTE_TOKEN:-dev-remote-token}
     ports:
       - "7863:7863"
     volumes:
@@ -23,3 +27,23 @@ services:
       # 但前提是它能以文件形式写入 —— 挂载目录会挡住这条路径）。
       # 不挂 :ro：面板「配置」页需要写回此文件（保存后热生效）。
       - ./config.json:/app/config.json
+
+  # 远程浏览器 sidecar：只在「账号有 IP 风控、必须让登录发生在服务器出口 IP 上」
+  # 时才需要。它不认识站点、不抓凭据，只把 Chromium 画面经面板 WS 转给操作者，
+  # 凭据仍由主服务 login/poll 从 state 取回。
+  #
+  # 体积约 600MB（Debian + Chromium + CJK 字体），与主镜像（alpine 80MB）隔离；
+  # 不映射端口，只经主服务的 /panel/api/login/remote/ws 转发。
+  login-remote:
+    build: ./deploy/login-remote
+    container_name: workbuddy2api-login-remote
+    restart: unless-stopped
+    environment:
+      - REMOTE_TOKEN=${WB2API_LOGIN_REMOTE_TOKEN:-dev-remote-token}
+      - PORT=8099
+      # 页面首次打开的站点（真实入口由主服务下发的授权链接决定）
+      - LOGIN_HOME=https://www.codebuddy.cn
+    # Chromium 默认 /dev/shm 64MB 会导致渲染进程崩溃
+    shm_size: 1gb
+    security_opt:
+      - no-new-privileges:true

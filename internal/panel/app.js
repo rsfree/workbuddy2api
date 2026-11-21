@@ -490,7 +490,13 @@ $('btnKey').onclick = async () => {
     start();
   } catch (e) { $('keyErr').hidden = false; }
 };
-$('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
+// 回车提交：必须 preventDefault，否则浏览器默认提交表单会刷新整个面板。
+// （原来靠 onsubmit="return false"，但 CSP script-src 'self' 会拦掉内联事件处理器，
+//   实际是失效的 —— 改由 JS 绑定。）
+$('keyForm').addEventListener('submit', e => e.preventDefault());
+$('keyInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); $('btnKey').click(); }
+});
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
 /* 积分包明细共享缓存：「积分构成」视图与首页「积分到期提醒」卡片共用同一份
@@ -684,6 +690,9 @@ function accRowHtml(s, maxCred) {
       (s.enterprise ? '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '" title="刷新企业版已分配额度（上游 get-enterprise-user-usage）">额度</button>' : '') +
       (s.enterprise ? '' :
         '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>') +
+      // 重登用该账号的槽位出口出站（egress.mode=local 时），避免「重登换 IP」被风控
+      '<button class="xs ghost" data-a="relogin" data-u="' + esc(s.uid) +
+        '" title="用该账号的槽位出口重新登录（保持出口 IP 不变）">重登</button>' +
       (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
               : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
                           : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="' + (s.enterprise ? '退出选号，但照常保活 / 刷新额度' : '退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额') + '">暂停选号</button>')) +
@@ -1157,6 +1166,9 @@ $('accBody').addEventListener('click', async ev => {
       toast('已恢复选号', 'ok');
     } else if (a === 'tasks') {
       openTasks(u);
+    } else if (a === 'relogin') {
+      const acc = ((overviewData && overviewData.accounts) || []).find(x => x.uid === u) || {};
+      startRemoteLogin({ uid: u, realm: acc.realm === 'global' ? 'global' : 'cn' });
     } else if (a === 'remove') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/remove', { method: 'POST' });
       toast(r.file_error ? '已移除（凭证文件删除失败：' + r.file_error + '）' : '已移除', 'ok');
@@ -2190,6 +2202,7 @@ function openAdd() {
   $('btnCopyUrl').hidden = true; $('btnOpenUrl').hidden = true;
   $('btnStartLogin').hidden = false; $('btnStartLogin').disabled = false;
   stopPoll();
+  probeRemote();   // 只有服务端配了 sidecar 才显示「在服务器浏览器中登录」
 }
 function switchAddTab(tab) {
   document.querySelectorAll('#addTabs .tab').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
@@ -2225,10 +2238,25 @@ async function pollLogin() {
     const r = await api('login/poll?state=' + encodeURIComponent(loginState));
     if (r.done) {
       stopPoll();
+      const detail = '已添加 ' + (r.nickname || r.uid) +
+        (r.realm === 'global' ? '（国际版）' : '') +
+        (r.credits >= 0 ? ' · 积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') +
+        (r.egress_hint ? ' · ' + r.egress_hint : '');
+      // 远程层开着时先让人看到结果（含出口一致性提示），再释放服务器浏览器。
+      // 从账号行「重登」进来时 addVeil 没开，closeAdd 会误关远程层，所以分开处理。
+      const remoteOn = $('remoteVeil').classList.contains('on');
+      if (remoteOn) {
+        $('remoteState').textContent = '登录完成';
+        $('remoteDone').hidden = false;
+        $('remoteDone').textContent = detail;
+        setTimeout(() => { stopRemote(true); closeAdd(); loadOverview(true); }, 4000);
+      } else {
+        stopRemote(true);
+        setTimeout(() => { closeAdd(); loadOverview(true); }, 1600);
+      }
       $('addReady').hidden = true;
       $('addDone').hidden = false;
-      $('addDone').textContent = '已添加 ' + (r.nickname || r.uid) + (r.realm === 'global' ? '（国际版）' : '') + (r.credits >= 0 ? ' · 积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + '，账号已载入池中';
-      setTimeout(() => { closeAdd(); loadOverview(true); }, 1600);
+      $('addDone').textContent = detail + '，账号已载入池中';
     }
   } catch (e) {
     stopPoll();
@@ -2237,7 +2265,7 @@ async function pollLogin() {
     $('addErr').textContent = e.message + '（关闭后重新添加）';
   }
 }
-function closeAdd() { stopPoll(); loginState = null; $('addVeil').classList.remove('on'); }
+function closeAdd() { stopPoll(); stopRemote(true); loginState = null; $('addVeil').classList.remove('on'); }
 $('btnCloseAdd').onclick = closeAdd;
 $('btnStartLogin').onclick = startAddLogin;
 $('btnOpenUrl').onclick = () => open($('addUrl').textContent, '_blank');
@@ -5278,3 +5306,239 @@ document.addEventListener('keydown', ev => {
 });
 
 syncAccControls();
+
+// ---------------------------------------------------------------------------
+// 远程浏览器登录：服务器上的 Chromium 画面投到 canvas，人工点/输入完成授权。
+// 凭据不经过这里 —— 登录成功后仍由 pollLogin 从 state 取回、落盘、进池。
+// ---------------------------------------------------------------------------
+let remoteWS = null;
+let remoteMeta = { width: 1280, height: 800 };
+let remoteSeq = 0;
+let remoteRetry = 0;
+let remoteStopping = false;
+let remoteDrag = false;   // 移动端：滑动是滚动还是拖拽
+let remoteSourceIP = '';  // 本次登录的源地址（空 = 默认出口）
+
+function remoteSend(obj) {
+  if (remoteWS && remoteWS.readyState === WebSocket.OPEN) remoteWS.send(JSON.stringify(obj));
+}
+
+function remotePoint(ev) {
+  const cv = $('remoteCanvas');
+  const r = cv.getBoundingClientRect();
+  const w = Math.max(r.width, 1), h = Math.max(r.height, 1);
+  return {
+    x: Math.round((ev.clientX - r.left) * remoteMeta.width / w),
+    y: Math.round((ev.clientY - r.top) * remoteMeta.height / h),
+  };
+}
+
+async function remoteDraw(buf) {
+  const my = ++remoteSeq;
+  let bmp;
+  try {
+    bmp = await createImageBitmap(new Blob([buf], { type: 'image/jpeg' }));
+  } catch (e) { return; }
+  if (my !== remoteSeq) { bmp.close(); return; }   // 已有更新的帧，丢弃这帧
+  const cv = $('remoteCanvas');
+  const w = remoteMeta.width, h = remoteMeta.height;
+  if (cv.width !== w) cv.width = w;
+  if (cv.height !== h) cv.height = h;
+  cv.getContext('2d').drawImage(bmp, 0, 0, w, h);
+  bmp.close();
+}
+
+function connectRemote(wsPath) {
+  if (remoteWS) { try { remoteWS.close(); } catch (e) { /* 已关 */ } }
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(proto + '//' + location.host + wsPath);
+  ws.binaryType = 'arraybuffer';
+  remoteWS = ws;
+  ws.onmessage = ev => {
+    if (typeof ev.data !== 'string') { remoteDraw(ev.data); return; }
+    let m;
+    try { m = JSON.parse(ev.data); } catch (e) { return; }
+    if (m.type === 'state') {
+      if (m.meta && m.meta.width > 0) remoteMeta = m.meta;
+      const tail = remoteSourceIP ? ' · 出口 ' + remoteSourceIP : '';
+      $('remoteState').textContent = (m.state === 'live'
+        ? '已连接 · 点击画面操作（中文请用下方粘贴框）' : ('状态：' + m.state)) + tail;
+      remoteRetry = 0;
+    } else if (m.type === 'error') {
+      $('remoteState').textContent = m.message || '远程浏览器出错';
+      toast(m.message || '远程浏览器出错', 'err');
+    }
+  };
+  ws.onclose = () => {
+    if (remoteStopping) return;
+    $('remoteState').textContent = '连接断开，正在重连…';
+    if (remoteRetry < 3) setTimeout(reconnectRemote, 700);
+  };
+  ws.onerror = () => { $('remoteState').textContent = '连接失败'; };
+}
+
+// 断线重连：sidecar 会保留页面 90 秒，凭 state 换一张新 ticket 就能接回同一屏。
+async function reconnectRemote() {
+  if (remoteStopping || !loginState) return;
+  remoteRetry++;
+  try {
+    const r = await api('login/remote/ticket', { method: 'POST', body: JSON.stringify({ state: loginState }) });
+    connectRemote(r.ws);
+  } catch (e) {
+    $('remoteState').textContent = '重连失败：' + e.message;
+  }
+}
+
+async function startRemoteLogin(opts) {
+  const o = opts || {};
+  const realm = o.realm || (document.querySelector('input[name="addRealm"]:checked') || {}).value || 'cn';
+  const uid = o.uid || '';
+  remoteStopping = false;
+  remoteRetry = 0;
+  remoteSourceIP = '';
+  $('btnRemoteLogin').disabled = true;
+  $('remoteState').textContent = uid
+    ? '正在用该账号的槽位出口打开登录页…（最多 45 秒）'
+    : '正在服务器上打开登录页…（最多 45 秒）';
+  $('remoteDone').hidden = true;
+  $('remoteVeil').classList.add('on');
+  try {
+    const r = await api('login/remote/start', {
+      method: 'POST',
+      body: JSON.stringify(uid ? { realm, uid } : { realm }),
+    });
+    loginState = r.state;
+    remoteSourceIP = r.source_ip || '';
+    if (r.meta && r.meta.width > 0) remoteMeta = r.meta;
+    if (remoteSourceIP) $('remoteState').textContent = '出口 ' + remoteSourceIP + ' · 正在打开登录页…';
+    connectRemote(r.ws);
+    // 复用既有轮询：登录完成 → 落盘 → 进池 → 签到，与复制链接登录完全同一条链路
+    stopPoll();
+    loginTimer = setInterval(pollLogin, 3000);
+  } catch (e) {
+    $('remoteState').textContent = e.message;
+    toast(e.message, 'err');
+  } finally {
+    $('btnRemoteLogin').disabled = false;
+  }
+}
+
+function stopRemote(notify) {
+  remoteStopping = true;
+  if (remoteWS) { try { remoteWS.close(); } catch (e) { /* 已关 */ } remoteWS = null; }
+  if (notify) api('login/remote/stop', { method: 'POST', body: '{}' }).catch(() => {});
+  $('remoteVeil').classList.remove('on');
+  remoteRetry = 0;
+  // 注意：remoteStopping 保持 true 到下次 startRemoteLogin。
+  // WS 的 onclose 是异步回调，这里若立刻复位会走成「主动关闭 → 触发自动重连」。
+}
+
+function probeRemote() {
+  api('login/remote/status').then(r => { $('remotePick').hidden = !r.enabled; })
+    .catch(() => { $('remotePick').hidden = true; });
+}
+
+if ($('btnRemoteLogin')) {
+  $('btnRemoteLogin').onclick = () => startRemoteLogin();
+  $('btnRemoteStop').onclick = () => stopRemote(true);
+  $('btnRemoteBack').onclick = () => remoteSend({ t: 'back' });
+  $('btnRemoteReload').onclick = () => remoteSend({ t: 'reload' });
+  $('btnRemoteSend').onclick = () => {
+    const v = $('remoteText').value;
+    if (!v) return;
+    remoteSend({ t: 'text', text: v });
+    $('remoteText').value = '';
+    $('remoteCanvas').focus();
+  };
+  $('remoteText').addEventListener('keydown', ev => {
+    if (ev.key === 'Enter') { ev.preventDefault(); $('btnRemoteSend').click(); }
+  });
+
+  const RCV = $('remoteCanvas');
+  let held = 0, lastMove = 0;
+  const sendMouse = (type, ev, buttons, clickCount) => {
+    const p = remotePoint(ev);
+    remoteSend({ t: 'mouse', type, x: p.x, y: p.y, button: type === 'mouseMoved' ? 'none' : 'left', buttons, clickCount });
+  };
+  RCV.addEventListener('mousedown', ev => {
+    ev.preventDefault(); RCV.focus();
+    held = ev.buttons || 1;
+    sendMouse('mousePressed', ev, held, 1);
+  });
+  RCV.addEventListener('mouseup', ev => {
+    sendMouse('mouseReleased', ev, ev.buttons, 1);
+    held = ev.buttons;
+  });
+  RCV.addEventListener('mousemove', ev => {
+    const now = Date.now();
+    if (!held && now - lastMove < 80) return;   // 悬停节流：菜单展开够用，省带宽
+    lastMove = now;
+    sendMouse('mouseMoved', ev, ev.buttons || 0, 0);
+  });
+  RCV.addEventListener('wheel', ev => {
+    ev.preventDefault();
+    const p = remotePoint(ev);
+    remoteSend({ t: 'wheel', x: p.x, y: p.y, deltaX: ev.deltaX, deltaY: ev.deltaY });
+  }, { passive: false });
+  // 移动端：默认单指滑动 = 滚动页面（登录页往往比视口长），轻点 = 点击；
+  // 「拖动模式」下才把滑动当作按住拖拽 —— 滑块验证需要它，滚动则需要相反的行为，
+  // 两者无法自动区分，所以交给用户显式切换。
+  let touchStart = null, touchLastY = 0;
+  RCV.addEventListener('touchstart', ev => {
+    ev.preventDefault(); RCV.focus();
+    const t = ev.touches[0];
+    if (!t) return;
+    touchStart = { x: t.clientX, y: t.clientY, moved: false };
+    touchLastY = t.clientY;
+    if (remoteDrag) sendMouse('mousePressed', t, 1, 1);
+  }, { passive: false });
+  RCV.addEventListener('touchmove', ev => {
+    ev.preventDefault();
+    const t = ev.touches[0];
+    if (!t || !touchStart) return;
+    if (remoteDrag) { touchStart.moved = true; sendMouse('mouseMoved', t, 1, 0); return; }
+    const dy = touchLastY - t.clientY;
+    touchLastY = t.clientY;
+    if (Math.abs(dy) < 1) return;
+    if (Math.abs(t.clientY - touchStart.y) > 6) touchStart.moved = true;
+    const p = remotePoint(t);
+    remoteSend({ t: 'wheel', x: p.x, y: p.y, deltaX: 0, deltaY: dy * 2 });
+  }, { passive: false });
+  RCV.addEventListener('touchend', ev => {
+    ev.preventDefault();
+    const t = ev.changedTouches[0] || { clientX: 0, clientY: 0 };
+    if (remoteDrag) {
+      sendMouse('mouseReleased', t, 0, 1);
+    } else if (touchStart && !touchStart.moved) {
+      sendMouse('mousePressed', t, 1, 1);
+      sendMouse('mouseReleased', t, 0, 1);
+    }
+    touchStart = null;
+  }, { passive: false });
+  $('btnRemoteDrag').onclick = () => {
+    remoteDrag = !remoteDrag;
+    $('btnRemoteDrag').classList.toggle('on', remoteDrag);
+    $('btnRemoteDrag').title = remoteDrag
+      ? '当前：滑动 = 按住拖拽（过滑块用）' : '当前：滑动 = 滚动页面（点一下切换）';
+  };
+
+  const KEYCODE = {
+    Enter: 13, Backspace: 8, Tab: 9, Escape: 27, Delete: 46, ' ': 32,
+    ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40,
+    Home: 36, End: 35, PageUp: 33, PageDown: 34,
+  };
+  RCV.addEventListener('keydown', ev => {
+    if (ev.ctrlKey || ev.metaKey || ev.altKey) return;   // 不劫持浏览器快捷键
+    if (ev.key.length === 1) {
+      remoteSend({ t: 'text', text: ev.key });
+      ev.preventDefault();
+      return;
+    }
+    const kc = KEYCODE[ev.key];
+    if (!kc) return;
+    ev.preventDefault();
+    const code = ev.code || ev.key;
+    remoteSend({ t: 'key', type: 'keyDown', key: ev.key, code, keyCode: kc });
+    remoteSend({ t: 'key', type: 'keyUp', key: ev.key, code, keyCode: kc });
+  });
+}

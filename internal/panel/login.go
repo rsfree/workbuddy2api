@@ -114,9 +114,8 @@ func doJSON(method, fullURL, bearer string, body io.Reader, origin string) (json
 	return env.Data, resp.StatusCode, nil
 }
 
-// loginStart 发起设备授权：POST auth/state 拿授权 URL。
-// body 可带 {"realm":"global"}（缺省 cn）；state 会话记 realm，poll 同 realm 落盘。
-func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
+// parseRealmBody 从 body 读 realm（缺省/非法一律 cn，零回归）。
+func parseRealmBody(r *http.Request) string {
 	realm := "cn"
 	if r.Body != nil {
 		var reqBody struct {
@@ -128,19 +127,23 @@ func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	return realm
+}
+
+// startDeviceAuth 发起设备授权并登记会话，返回 state 与授权链接。
+// 两条登录路径（复制链接 / 远程浏览器）共用，保证 loginPoll 对两者一视同仁。
+func (p *Panel) startDeviceAuth(realm string) (state, authURL string, err error) {
 	epState, _, _, origin := loginEndpoints(realm)
 	data, status, err := doJSON(http.MethodPost, epState, "", bytes.NewReader([]byte("{}")), origin)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, fmt.Sprintf("auth state (upstream %d): %v", status, err))
-		return
+		return "", "", fmt.Errorf("auth state (upstream %d): %v", status, err)
 	}
 	var st struct {
 		State   string `json:"state"`
 		AuthURL string `json:"authUrl"`
 	}
 	if err := json.Unmarshal(data, &st); err != nil || st.State == "" || st.AuthURL == "" {
-		writeErr(w, http.StatusBadGateway, "auth state: missing state or authUrl")
-		return
+		return "", "", fmt.Errorf("auth state: missing state or authUrl")
 	}
 	p.loginMu.Lock()
 	// 顺手回收过期会话，防"开弹窗走开"的 state 滞留。
@@ -151,8 +154,27 @@ func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 	}
 	p.logins[st.State] = loginSession{created: time.Now(), realm: realm}
 	p.loginMu.Unlock()
-	log.Printf("panel: 发起 OAuth 添加账号 realm=%s（state=%s...）", realm, st.State[:min(8, len(st.State))])
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "url": st.AuthURL, "state": st.State, "realm": realm})
+	return st.State, st.AuthURL, nil
+}
+
+// dropLogin 撤回一个 state（远程浏览器启动失败时用，别让它白占 TTL）。
+func (p *Panel) dropLogin(state string) {
+	p.loginMu.Lock()
+	delete(p.logins, state)
+	p.loginMu.Unlock()
+}
+
+// loginStart 发起设备授权：POST auth/state 拿授权 URL。
+// body 可带 {"realm":"global"}（缺省 cn）；state 会话记 realm，poll 同 realm 落盘。
+func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
+	realm := parseRealmBody(r)
+	state, authURL, err := p.startDeviceAuth(realm)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	log.Printf("panel: 发起 OAuth 添加账号 realm=%s（state=%s...）", realm, state[:min(8, len(state))])
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "url": authURL, "state": state, "realm": realm})
 }
 
 // loginPoll 轮询登录态。未完成 → {done:false}；完成 → 建凭证、落盘、热加载、签到。
@@ -246,6 +268,11 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	p.cfg.Pool.Add(a)
 	p.cfg.Pool.Revive(acct.UID) // 全新登录 = 人工恢复口径：清掉旧号遗留的禁用/冷却/熔断
 
+	// 登录即租约：本次登录用的出口成为该号此后固定的出口。
+	// 只有本次确实绑定了源地址（远程浏览器重登 / 新号轮转）才写；
+	// 复制链接登录没有源地址，不凭空编一个。
+	p.leaseOnLogin(acct.UID, sess.sourceIP)
+
 	// 顺带签到 + 余额刷新（幂等；失败不影响登录结果，只体现在返回字段里）。
 	// realm 分支：CN 走 DailyCheckin；global 无 CN 签到体系，改为注册激活 + trial 领取
 	// （D4 门控同 scheduler：CN 任务端点对 global 不发起任何调用）。
@@ -301,6 +328,11 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	if a.IsEnterpriseSession() && !a.IsEnterprise() {
 		log.Printf("panel: WARN uid=%s 的凭证已绑定企业租户：成长任务行为事件会被上游静默丢弃；建议移除该账号，在浏览器退出企业空间（个人身份）后重新登录", acct.UID)
 	}
+	// 出口一致性提示：新号登录时 uid 未知、只能用默认出口，入池后却按槽位走；
+	// 重登老号时应当在槽位出口上完成（sourceIP 非空）。两种情形都在这里落一句话，
+	// 让「登录出口」和「使用出口」的差异当场可见，而不是等被风控了才回头查。
+	egressIP, egressHint := p.egressConsistency(a.UID, a.Nickname, a.Group(), sess.sourceIP)
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"done":            true,
 		"uid":             acct.UID,
@@ -310,7 +342,25 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		"credits_total":   total,
 		"checkin_message": checkinMsg,
 		"onboard_queued":  onboardQueued,
+		"egress_ip":       egressIP,
+		"egress_hint":     egressHint,
 	})
+}
+
+// egressConsistency 判断「登录出口」与「入池槽位出口」是否一致，返回槽位 IP 与提示文案。
+// loginIP 为空 = 走默认出口（新号或未启用远程浏览器）。
+func (p *Panel) egressConsistency(uid, nickname, group, loginIP string) (string, string) {
+	want := p.egressIPFor(uid, nickname, group)
+	switch {
+	case want == "":
+		return "", ""
+	case loginIP == "":
+		return want, "该号入池后固定使用出口 " + want + "；新号登录走默认出口，若该出口与槽位不同，建议用面板「重登」从原出口再登一次"
+	case loginIP != want:
+		return want, "本次登录出口 " + loginIP + " ≠ 该号槽位出口 " + want + "，建议用「重登」从原出口再登一次"
+	default:
+		return want, ""
+	}
 }
 
 // joinMsg 拼接 login 完成后的提示消息（多段用「；」连接，空段跳过）。

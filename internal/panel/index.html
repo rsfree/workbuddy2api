@@ -2094,6 +2094,12 @@ button.xs.danger:hover:not(:disabled) { color: var(--bad); border-color: var(--b
             <label class="realm-opt"><input type="radio" name="addRealm" value="global"> 国际版（Global）</label>
           </div>
           <div class="hint" style="font-size:12px;margin-top:2px">国际版登录后，网关自动完成注册地区、激活与试用额度领取，全程无需手动操作。</div>
+          <!-- 远程浏览器：只在服务端配置了 sidecar 时出现。用于账号有 IP 风控、
+               必须让登录发生在服务器出口 IP 上的场景。 -->
+          <div class="hint" id="remotePick" style="font-size:12px;margin-top:10px" hidden>
+            账号有 IP 风控？让浏览器在服务器上打开，你在下方画面里完成短信/滑块：
+            <button id="btnRemoteLogin" style="margin-left:6px">在服务器浏览器中登录</button>
+          </div>
         </div>
         <div id="addLoad" class="state" hidden><span class="dots">正在获取授权链接</span></div>
         <div id="addReady" hidden>
@@ -2122,6 +2128,36 @@ button.xs.danger:hover:not(:disabled) { color: var(--bad); border-color: var(--b
   </div>
 </div>
 
+<!-- 远程浏览器（服务器上开 Chromium，画面投到这里） -->
+<div class="veil" id="remoteVeil">
+  <div class="dlg" style="width:min(96vw,1100px)">
+    <header>
+      <h3>服务器浏览器 · 远程登录</h3>
+      <div class="hint" id="remoteState" style="font-size:12px">准备中…</div>
+    </header>
+    <div class="body" style="padding:10px">
+      <div id="remoteDone" class="state ok" hidden style="margin-bottom:8px"></div>
+      <!-- 宽高由 canvas 固有比例 + max-height 控制：写死 width:100% 会把粘贴框
+           挤到视口外（1280x800 等比放到容器宽 ≈ 640px 高）。 -->
+      <canvas id="remoteCanvas" tabindex="0"
+        style="max-width:100%;max-height:56vh;width:auto;height:auto;display:block;margin:0 auto;background:#0b0b0c;border-radius:8px;outline:none;cursor:crosshair"></canvas>
+      <div style="display:flex;gap:8px;margin-top:8px;align-items:center">
+        <input id="remoteText" placeholder="中文/长文本：在此粘贴后发送（输入法内容走这里）" style="flex:1"
+               autocomplete="off" autocapitalize="off" spellcheck="false">
+        <button id="btnRemoteSend">发送</button>
+      </div>
+      <div class="hint" style="font-size:12px;margin-top:6px">画面来自服务器，登录成功后自动完成添加，本机浏览器无需操作。10 分钟未完成会自动回收。</div>
+    </div>
+    <footer>
+      <button id="btnRemoteBack">后退</button>
+      <button id="btnRemoteReload">刷新页面</button>
+      <button id="btnRemoteDrag" title="当前：滑动 = 滚动页面（点一下切换）">拖动模式</button>
+      <span class="grow"></span>
+      <button id="btnRemoteStop">结束远程</button>
+    </footer>
+  </div>
+</div>
+
 <!-- 密钥 -->
 <div class="veil" id="keyVeil" data-lock="1">
   <div class="dlg" style="width:420px">
@@ -2130,7 +2166,7 @@ button.xs.danger:hover:not(:disabled) { color: var(--bad); border-color: var(--b
       <div class="hint">该网关已启用 api_key 鉴权，请输入 config.json 中的密钥。</div>
     </header>
     <div class="body">
-      <form style="display:contents" onsubmit="return false"><input type="password" id="keyInput" placeholder="api_key" autocomplete="off"></form>
+      <form style="display:contents" id="keyForm"><input type="password" id="keyInput" placeholder="api_key" autocomplete="off"></form>
       <div class="state err" id="keyErr" hidden style="margin-top:10px">密钥不正确，请重试。</div>
     </div>
     <footer>
