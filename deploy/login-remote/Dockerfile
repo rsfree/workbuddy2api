@@ -12,12 +12,16 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install -r requirements.txt \
- && playwright install --with-deps chromium \
- # CJK 字体：缺了登录页中文全是方块，等于看不见验证提示
- && apt-get update \
- && apt-get install -y --no-install-recommends fonts-wqy-microhei \
+# 🔴 系统依赖必须在 pip 之前装完：
+#   - libatomic1：playwright 自带的 node 驱动依赖它。python:slim 默认没有，
+#     缺了 `playwright install` 会以 exit 127 失败（error while loading shared
+#     libraries: libatomic.so.1）。`--with-deps` 只补浏览器运行库，不补这个。
+#   - fonts-wqy-microhei：缺了登录页中文全是方块，看不见验证提示。
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libatomic1 fonts-wqy-microhei \
  && rm -rf /var/lib/apt/lists/* \
+ && pip install -r requirements.txt \
+ && playwright install --with-deps chromium \
  && chmod -R 755 /ms-playwright
 
 COPY server.py .
