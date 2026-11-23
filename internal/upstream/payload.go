@@ -52,6 +52,7 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	normalizeToolPatterns(obj)
 	normalizeRoles(obj)
 	normalizeImageURL(obj)
+	normalizeStop(obj)
 	dropReasoningContentParts(obj)
 	// tool 配对三步（见 tool_pairing.go）：先合并再重排再清理。所有模型一律执行（独立于
 	// deepseek-only 的 sanitize 开关）。这是「让请求通过」的安全网——不完整配对的
@@ -66,14 +67,12 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 		msgs, _ = mergeAdjacentToolCalls(msgs)
 		msgs, _ = repackToolResultBlocks(msgs)
 		msgs, _ = cleanupOrphanToolCalls(msgs)
-		// 空串 content 收尾修复（见 repairEmptyContent）：必须排在 cleanup 之后——
-		// cleanup 摘掉孤儿 tool_calls 后，一条 content:"" 的 assistant 会变成
-		// 「裸空消息」，正是上游 11151 的触发面（tool_pairing_test.go 的
-		// 「空name带结果」用例就是这条路径）。
-		msgs, _ = repairEmptyContent(msgs)
-		// 无改动时两步都返回原 slice，这里回写等于零操作；任一步重排/删除
+		// 无改动时三步都返回原 slice，这里回写等于零操作；任一步重排/删除
 		// （哪怕后续步骤零改动）也必须落到 obj——不能只在「最后一步改动」时回写，
 		// 否则 repack 单独生效的结果会被原 slice 覆盖丢失。
+		//
+		// 空 content 兜底（repairEmptyContent）**不在这里**跑：它必须排在
+		// sanitizeMessages 之后，见下方统一兜底处的注释。
 		obj["messages"] = msgs
 	}
 	// DeepSeek 思维链开关（见 thinking.go）：注入 thinking.type=enabled + 缺档补默认档。
@@ -89,6 +88,18 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 		if msgs, ok := obj["messages"].([]any); ok {
 			sanitizeMessages(msgs)
 		}
+	}
+	// 空 content 收尾修复（见 repairEmptyContent）：Must 排在 cleanupOrphanToolCalls
+	// 与 sanitizeMessages **两者之后**。
+	//   · cleanup 之后：摘掉孤儿 tool_calls 会留下「裸空 assistant」，
+	//     正是上游 11151 的触发面（tool_pairing_test.go「空name带结果」用例）。
+	//   · sanitize 之后：sanitizeText 末尾 TrimSpace，整段内容都是指纹
+	//     （cc_entrypoint=… 这类尾随 kv、anthropic billing header）时会被洗成空串，
+	//     在旧顺序下等于**重新制造**一个 11151（2026-11-23 线上 24h 429 次
+	//     11151 的候选成因之一）。
+	if msgs, ok := obj["messages"].([]any); ok {
+		msgs, _ = repairEmptyContent(msgs)
+		obj["messages"] = msgs
 	}
 	out, err := json.Marshal(obj)
 	if err != nil {
@@ -376,6 +387,45 @@ func ensureConsoleSystem(body []byte) []byte {
 		return body
 	}
 	return out
+}
+
+// normalizeStop 把 stop 归一化成上游期望的字符串数组。
+//
+// OpenAI 规范 stop 是 `string | string[] | null`，而上游（minimax 后端）的
+// Go struct 是 []string：
+//
+//	400 {"code":11101,"msg":"Unmarshal chat params failed with error:
+//	     json: cannot unmarshal string into Go struct field Request.stop of type []string"}
+//
+// 2026-11-23 线上实测：24h 内 1077 次 400 全部是这个形态（占全部失败的 74%），
+// 且全部集中在 minimax-m3.1-flash —— 其他后端对该字段宽松放行，所以只有它会暴露。
+// 客户端发字符串完全合法，错误在网关没有归一化就透传。
+//
+// 处理口径：
+//   - 非空 string → 单元素数组（唯一需要真正转换的形态）；
+//   - 空串 / null / 缺失 → 删除字段：空 stop 对上游没有任何语义，留着只会被拒；
+//   - 数组（[]any / []string）→ 原样保留：这是上游期望形态，不擅自改语义；
+//   - 其他类型（数字/对象）→ 删除：透传只会换来 11101，而这种取值本身无意义，
+//     替客户端丢掉比让整个请求 400 更符合"让请求通过"的定位。
+func normalizeStop(obj map[string]any) {
+	v, ok := obj["stop"]
+	if !ok {
+		return
+	}
+	switch s := v.(type) {
+	case string:
+		if strings.TrimSpace(s) == "" {
+			delete(obj, "stop")
+			return
+		}
+		obj["stop"] = []string{s}
+	case []any, []string:
+		// 数组形态上游认，原样保留（含空数组：实测放行，不擅自改语义）。
+	case nil:
+		delete(obj, "stop")
+	default:
+		delete(obj, "stop")
+	}
 }
 
 // normalizeToolChoice 按上游 Go struct（string 类型）改写 OpenAI tool_choice。
@@ -695,6 +745,37 @@ func repairEmptyContent(messages []any) ([]any, bool) {
 			changed = true
 		case string:
 			if c == "" {
+				msg["content"] = " "
+				changed = true
+			}
+		case []any:
+			// 多模态数组：仅当「数组非空，且每个 part 都是 text 且文本为空白」时修复。
+			//
+			// 空数组 [] 不在此列——实测上游放行（见上方矩阵），不擅自改语义。
+			// 只要有一个非 text part（image_url 等）或一段非空文本，就说明这条消息
+			// 确实携带了内容，不能动。这是 2026-11-23 补的形态：此前只堵了
+			// ""/null/缺键，`[{"type":"text","text":""}]` 这类"结构化空文本"
+			// 会原样出站，是线上 11151 剩余的候选来源。
+			if len(c) == 0 {
+				continue
+			}
+			allEmptyText := true
+			for _, rawPart := range c {
+				part, ok := rawPart.(map[string]any)
+				if !ok {
+					allEmptyText = false
+					break
+				}
+				if typ, _ := part["type"].(string); typ != "text" {
+					allEmptyText = false
+					break
+				}
+				if txt, _ := part["text"].(string); strings.TrimSpace(txt) != "" {
+					allEmptyText = false
+					break
+				}
+			}
+			if allEmptyText {
 				msg["content"] = " "
 				changed = true
 			}

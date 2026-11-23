@@ -716,6 +716,31 @@ func Classify(status int, body string) ErrKind {
 		if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) {
 			return ErrBadParams
 		}
+		// 「消息含空 content」(11151) 是**确定性请求级错误**：同一个 body 换任何
+		// 账号都会得到同样的 400，换号不改变结果。
+		//
+		// 2026-11-23 线上实测（24h）：11151 出现 429 次尝试级失败，此前全部落到
+		// ErrClient → 换号满 3 轮 → 最终 503（p50 6.1s / p95 31s）。三重代价：
+		//   1. 无效请求被放大 MaxRotate(3) 倍；
+		//   2. 客户端收到「服务过载」语义的 503，真实原因是自己的请求体不合规，
+		//      排障方向被带偏；
+		//   3. 每次给 3 个健康账号喂 NoteFailures 连败计数，可能误触发熔断
+		//      （issue #114 的同款路径；11151 曾因误判 ErrClient 连坐 MaxRotate 个号）。
+		// 归 ErrBadParams 后：不罚号、不轮转、400 透传上游原文（含 requestId），
+		// 与 11101 同口径。真正的修法是上游侧 repairEmptyContent 把 body 补好，
+		// 这里是兜不住时的正确降级。
+		//
+		// 11133 **不并入**：同一业务码既用于「参数被 model provider 拒绝」(1214)，
+		// 也用于「model does not support image」这类**换号/换域可能生效**的能力
+		// 不匹配（client_test.go 的 TestClassify 有守卫）。按 11133 一刀切会把本可
+		// 自愈的请求硬失败成 400。
+		//
+		// 只认结构化业务码（codeMarker 容忍 JSON 空白）：11151 的文案「a message
+		// has empty content」语义唯一，作为 code 缺失时的兜底。
+		if status == http.StatusBadRequest &&
+			(codeMarker(lower, "11151") || strings.Contains(lower, "a message has empty content")) {
+			return ErrBadParams
+		}
 		return ErrClient
 	}
 	// HTTP 200 但业务 code 非 0 且含余额关键词的情况已被上面 hardMarkers 捕获。
